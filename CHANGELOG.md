@@ -48,6 +48,12 @@ own changelog up to the fork point continues below, unchanged.
   agent files, nor upstream's `.kiro/` design notes, which stay in the
   repository.
 
+### Fixes taken from crc-fast's open pull requests
+
+- `no_std` builds for x86_64 compile again: the AVX-512 tier imported
+  `std::arch` rather than `core::arch` (crc-fast#57). From crc-fast#42 by
+  netsbot; crc-fast#49 by onur-ozkan carries the same fix.
+
 ## 1.11.0
 
 The first release of the fork. It is everything in the [Fork](#fork) section
