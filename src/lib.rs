@@ -241,6 +241,7 @@ mod algorithm;
 pub mod arch;
 mod cache;
 mod combine;
+pub use combine::CrcCombine;
 mod consts;
 mod crc16;
 mod crc32;
@@ -1100,6 +1101,36 @@ pub fn checksum_combine_with_params(
     checksum2_len: u64,
 ) -> u64 {
     combine::checksums(checksum1, checksum2, checksum2_len, &params)
+}
+
+impl CrcCombine {
+    /// The operator for appending `len` bytes, for the specified CRC algorithm.
+    ///
+    /// # Panics
+    ///
+    /// For the `Custom` algorithms, which need [`CrcCombine::new_with_params`].
+    pub fn new(algorithm: CrcAlgorithm, len: u64) -> Self {
+        Self::new_with_params(get_calculator_params(algorithm).1, len)
+    }
+}
+
+/// The CRC of `len` zero bytes, computed in a few dozen field multiplies rather than by reading
+/// `len` bytes.
+///
+/// # Examples
+///
+/// ```rust
+/// use crc_turbo::{checksum, checksum_zeros, CrcAlgorithm::Crc64Nvme};
+///
+/// assert_eq!(checksum_zeros(Crc64Nvme, 4096), checksum(Crc64Nvme, &[0; 4096]));
+/// ```
+pub fn checksum_zeros(algorithm: CrcAlgorithm, len: u64) -> u64 {
+    CrcCombine::new(algorithm, len).zeros()
+}
+
+/// The CRC of `len` zero bytes, using custom CRC parameters.
+pub fn checksum_zeros_with_params(params: CrcParams, len: u64) -> u64 {
+    CrcCombine::new_with_params(params, len).zeros()
 }
 
 /// Returns the target used to calculate the CRC checksum for the specified algorithm.

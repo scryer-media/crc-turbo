@@ -248,6 +248,36 @@ let checksum = checksum_combine(Crc32IsoHdlc, checksum_1, checksum_2, 5);
 assert_eq!(checksum, 0xcbf43926);
  ```
 
+### CrcCombine
+
+When the same length is combined many times, as with fixed-size blocks
+hashed in parallel, build the operator once. Each `combine` is then a single
+carry-less multiply. `uncombine` runs it backwards, and `zeros` gives the CRC
+of that many zero bytes without reading them.
+
+```rust
+use crc_turbo::{checksum, CrcAlgorithm::Crc32IsoHdlc, CrcCombine};
+
+let append_five = CrcCombine::new(Crc32IsoHdlc, 5);
+let head = checksum(Crc32IsoHdlc, b"1234");
+let tail = checksum(Crc32IsoHdlc, b"56789");
+
+let whole = append_five.combine(head, tail);
+assert_eq!(whole, 0xcbf43926);
+assert_eq!(append_five.uncombine(whole, tail), Some(head));
+assert_eq!(append_five.zeros(), checksum(Crc32IsoHdlc, &[0; 5]));
+```
+
+### checksum_zeros
+
+The CRC of `len` zero bytes, in time logarithmic in `len`.
+
+```rust
+use crc_turbo::{checksum, checksum_zeros, CrcAlgorithm::Crc64Nvme};
+
+assert_eq!(checksum_zeros(Crc64Nvme, 4096), checksum(Crc64Nvme, &[0; 4096]));
+```
+
 ### checksum_file
 
 Checksums a file, which will chunk through the file optimally, limiting RAM usage and maximizing throughput. Chunk size
