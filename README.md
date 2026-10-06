@@ -449,6 +449,8 @@ It uses the best available acceleration method for the detected CPU features at 
 * `x86_64` and `x86`:
     * `avx512-vpclmulqdq` (preferred, if available)
     * `avx512-pclmulqdq`
+    * `avx2-vpclmulqdq` (`x86_64` CPUs with 256-bit VPCLMULQDQ and no AVX-512: AMD Zen 3, Intel Alder Lake through
+      Arrow Lake)
     * `sse-pclmulqdq`
   
 There is a safe table-based software fallback for other architectures, or if no acceleration features are detected.

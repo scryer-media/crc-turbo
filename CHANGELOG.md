@@ -63,6 +63,24 @@ own changelog up to the fork point continues below, unchanged.
   onur-ozkan, which dropped the extra crate types; the `capi/` package keeps
   the C library.
 
+### x86_64 performance
+
+- A new `x86_64-avx2-vpclmulqdq` tier for CPUs that have 256-bit VPCLMULQDQ
+  but no AVX-512 (AMD Zen 3; Intel Alder Lake through Arrow Lake, where
+  AVX-512 is fused off), which crc-fast runs on its 128-bit SSE tier. It
+  holds the SSE tier's eight 128-bit fold streams in four YMM registers, so
+  each carry-less multiply folds two streams, and byte-reverses forward
+  (non-reflected) CRCs within each 128-bit lane, so no load needs a
+  lane-crossing permute. It reuses the existing fold keys and reduction, so
+  it covers every CRC-16, CRC-32 and CRC-64 algorithm in both bit orders;
+  CRC-32/ISCSI keeps its SSE4.2 fusion path. AVX-512 CPUs keep their tiers.
+  A test forces the tier on any CPU that has it and checks every algorithm
+  against the table-driven implementation from unaligned starts and a
+  carried state. VPCLMULQDQ is now detected on its own rather than only
+  under AVX-512VL. dcbtsla proposed the same tier to crc-fast in
+  crc-fast#56, independently and earlier; the feature-detection model here
+  (VPCLMULQDQ and AVX2 as separate flags) is taken from it.
+
 ## 1.11.0
 
 The first release of the fork. It is everything in the [Fork](#fork) section

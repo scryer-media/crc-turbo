@@ -111,6 +111,10 @@ pub(crate) unsafe fn update(state: u64, bytes: &[u8], params: &CrcParams) -> u64
         ArchOpsInstance::X86_64Avx512Pclmulqdq(ops) => {
             update_x86_64_avx512_pclmulqdq(state, bytes, params, *ops)
         }
+        #[cfg(target_arch = "x86_64")]
+        ArchOpsInstance::X86_64Avx2Vpclmulqdq(ops) => {
+            update_x86_64_avx2_vpclmulqdq(state, bytes, params, *ops)
+        }
         ArchOpsInstance::X86SsePclmulqdq(ops) => {
             update_x86_sse_pclmulqdq(state, bytes, params, *ops)
         }
@@ -160,6 +164,23 @@ unsafe fn update_x86_64_avx512_vpclmulqdq(
     bytes: &[u8],
     params: &CrcParams,
     ops: crate::arch::x86_64::avx512_vpclmulqdq::X86_64Avx512VpclmulqdqOps,
+) -> u64 {
+    match params.width {
+        64 => algorithm::update::<_, Width64>(state, bytes, params, &ops),
+        32 => algorithm::update::<_, Width32>(state as u32, bytes, params, &ops) as u64,
+        16 => algorithm::update::<_, Width16>(state as u16, bytes, params, &ops) as u64,
+        _ => panic!("Unsupported CRC width: {}", params.width),
+    }
+}
+
+#[inline]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,vpclmulqdq,sse4.1,pclmulqdq")]
+unsafe fn update_x86_64_avx2_vpclmulqdq(
+    state: u64,
+    bytes: &[u8],
+    params: &CrcParams,
+    ops: crate::arch::x86_64::avx2_vpclmulqdq::X86_64Avx2VpclmulqdqOps,
 ) -> u64 {
     match params.width {
         64 => algorithm::update::<_, Width64>(state, bytes, params, &ops),
@@ -427,6 +448,61 @@ mod tests {
             // Test ~1 MiB just before, at, and just after the folding boundaries
             for len in 1048575..=1048577 {
                 test_length(len, config);
+            }
+        }
+    }
+
+    /// Forces the AVX2 + VPCLMULQDQ tier on any CPU that has the features (including AVX-512
+    /// parts, where dispatch prefers the 512-bit tier) and checks every algorithm, both bit
+    /// orders, against the table-driven software implementation across the fold loop, the
+    /// stream collapse and the unaligned head and tail, from the init state and a carried state.
+    #[test]
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    #[cfg_attr(miri, ignore)]
+    fn test_avx2_vpclmulqdq_tier_matches_software() {
+        use crate::arch::x86_64::avx2_vpclmulqdq::X86_64Avx2VpclmulqdqOps;
+
+        if !(is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("vpclmulqdq")
+            && is_x86_feature_detected!("pclmulqdq")
+            && is_x86_feature_detected!("sse4.1"))
+        {
+            eprintln!("skipping test_avx2_vpclmulqdq_tier_matches_software: no AVX2 + VPCLMULQDQ");
+            return;
+        }
+
+        let ops = X86_64Avx2VpclmulqdqOps::new();
+        let mut data = vec![0u8; 8192 + 64];
+        rng().fill(&mut data[..]);
+
+        let mut lengths: Vec<usize> = (0..=64).collect();
+        lengths.extend(120..=400);
+        lengths.extend([511, 512, 513, 1023, 1024, 1025, 4095, 4096, 4097, 8192]);
+
+        for config in TEST_ALL_CONFIGS {
+            let params = config.get_params();
+            let init = config.get_init_algorithm();
+            let carried = crate::arch::software::update(init, &data[8192..8192 + 7], params);
+
+            for offset in [0usize, 1, 15, 33] {
+                for &len in &lengths {
+                    let input = &data[offset..offset + len];
+                    for state in [init, carried] {
+                        let expected = crate::arch::software::update(state, input, params);
+                        let actual =
+                            unsafe { update_x86_64_avx2_vpclmulqdq(state, input, params, ops) };
+
+                        assert_eq!(
+                            actual,
+                            expected,
+                            "{} offset {} len {} state {:#x}",
+                            config.get_name(),
+                            offset,
+                            len,
+                            state
+                        );
+                    }
+                }
             }
         }
     }

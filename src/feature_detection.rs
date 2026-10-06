@@ -54,6 +54,7 @@ pub enum PerformanceTier {
     // x86_64 tiers
     X86_64Avx512Vpclmulqdq,
     X86_64Avx512Pclmulqdq,
+    X86_64Avx2Vpclmulqdq,
     X86_64SsePclmulqdq,
 
     // x86 tiers
@@ -78,6 +79,7 @@ pub struct ArchCapabilities {
     pub has_pclmulqdq: bool,
     pub has_avx512vl: bool, // implicitly enables avx512f, has XOR3 operations
     pub has_vpclmulqdq: bool,
+    pub has_avx2: bool, // with vpclmulqdq and no avx512vl, enables the 256-bit tier
 }
 
 /// Helper function to convert a performance tier to a human-readable target string
@@ -96,6 +98,7 @@ fn tier_to_target_string(tier: PerformanceTier) -> String {
         PerformanceTier::AArch64Aes => "aarch64-neon-pmull".to_string(),
         PerformanceTier::X86_64Avx512Vpclmulqdq => "x86_64-avx512-vpclmulqdq".to_string(),
         PerformanceTier::X86_64Avx512Pclmulqdq => "x86_64-avx512-pclmulqdq".to_string(),
+        PerformanceTier::X86_64Avx2Vpclmulqdq => "x86_64-avx2-vpclmulqdq".to_string(),
         PerformanceTier::X86_64SsePclmulqdq => "x86_64-sse-pclmulqdq".to_string(),
         PerformanceTier::X86SsePclmulqdq => "x86-sse-pclmulqdq".to_string(),
         PerformanceTier::SoftwareTable => "software-fallback-tables".to_string(),
@@ -130,6 +133,7 @@ unsafe fn detect_arch_capabilities() -> ArchCapabilities {
             has_pclmulqdq: false,
             has_avx512vl: false,
             has_vpclmulqdq: false,
+            has_avx2: false,
         }
     }
 }
@@ -162,6 +166,7 @@ unsafe fn detect_aarch64_features() -> ArchCapabilities {
         has_pclmulqdq: false,
         has_avx512vl: false,
         has_vpclmulqdq: false,
+        has_avx2: false,
     }
 }
 
@@ -177,6 +182,7 @@ unsafe fn detect_aarch64_features() -> ArchCapabilities {
         has_pclmulqdq: false,
         has_avx512vl: false,
         has_vpclmulqdq: false,
+        has_avx2: false,
     }
 }
 
@@ -191,7 +197,10 @@ unsafe fn detect_x86_features() -> ArchCapabilities {
     let has_pclmulqdq = has_sse41 && is_x86_feature_detected!("pclmulqdq");
 
     let has_avx512vl = has_pclmulqdq && is_x86_feature_detected!("avx512vl");
-    let has_vpclmulqdq = has_avx512vl && is_x86_feature_detected!("vpclmulqdq");
+    // VPCLMULQDQ is its own CPUID feature, not part of AVX-512: AMD Zen 3 and Intel Alder Lake
+    // through Arrow Lake have it with AVX2 and no AVX-512, and use the 256-bit tier.
+    let has_vpclmulqdq = has_pclmulqdq && is_x86_feature_detected!("vpclmulqdq");
+    let has_avx2 = is_x86_feature_detected!("avx2");
     // SSE 4.2 provides native CRC32C instructions for fusion techniques
     let has_sse42 = is_x86_feature_detected!("sse4.2");
 
@@ -204,6 +213,7 @@ unsafe fn detect_x86_features() -> ArchCapabilities {
         has_pclmulqdq,
         has_avx512vl,
         has_vpclmulqdq,
+        has_avx2,
     }
 }
 
@@ -214,7 +224,8 @@ unsafe fn detect_x86_features() -> ArchCapabilities {
     let has_sse42 = cfg!(target_feature = "sse4.2");
     let has_pclmulqdq = has_sse41 && cfg!(target_feature = "pclmulqdq");
     let has_avx512vl = has_pclmulqdq && cfg!(target_feature = "avx512vl");
-    let has_vpclmulqdq = has_avx512vl && cfg!(target_feature = "vpclmulqdq");
+    let has_vpclmulqdq = has_pclmulqdq && cfg!(target_feature = "vpclmulqdq");
+    let has_avx2 = cfg!(target_feature = "avx2");
 
     ArchCapabilities {
         has_aes: false,
@@ -225,6 +236,7 @@ unsafe fn detect_x86_features() -> ArchCapabilities {
         has_pclmulqdq,
         has_avx512vl,
         has_vpclmulqdq,
+        has_avx2,
     }
 }
 
@@ -245,11 +257,14 @@ pub(crate) fn select_performance_tier(capabilities: &ArchCapabilities) -> Perfor
 
     #[cfg(target_arch = "x86_64")]
     {
-        if capabilities.has_vpclmulqdq {
+        if capabilities.has_vpclmulqdq && capabilities.has_avx512vl {
             return PerformanceTier::X86_64Avx512Vpclmulqdq;
         }
         if capabilities.has_avx512vl {
             return PerformanceTier::X86_64Avx512Pclmulqdq;
+        }
+        if capabilities.has_vpclmulqdq && capabilities.has_avx2 {
+            return PerformanceTier::X86_64Avx2Vpclmulqdq;
         }
         if capabilities.has_pclmulqdq {
             return PerformanceTier::X86_64SsePclmulqdq;
@@ -282,6 +297,8 @@ pub enum ArchOpsInstance {
     X86_64Avx512Pclmulqdq(crate::arch::x86_64::avx512::X86_64Avx512PclmulqdqOps),
     #[cfg(target_arch = "x86_64")]
     X86_64Avx512Vpclmulqdq(crate::arch::x86_64::avx512_vpclmulqdq::X86_64Avx512VpclmulqdqOps),
+    #[cfg(target_arch = "x86_64")]
+    X86_64Avx2Vpclmulqdq(crate::arch::x86_64::avx2_vpclmulqdq::X86_64Avx2VpclmulqdqOps),
     /// Software fallback - no ArchOps struct needed
     SoftwareFallback,
 }
@@ -302,6 +319,8 @@ impl ArchOpsInstance {
             ArchOpsInstance::X86_64Avx512Pclmulqdq(_) => PerformanceTier::X86_64Avx512Pclmulqdq,
             #[cfg(target_arch = "x86_64")]
             ArchOpsInstance::X86_64Avx512Vpclmulqdq(_) => PerformanceTier::X86_64Avx512Vpclmulqdq,
+            #[cfg(target_arch = "x86_64")]
+            ArchOpsInstance::X86_64Avx2Vpclmulqdq(_) => PerformanceTier::X86_64Avx2Vpclmulqdq,
             ArchOpsInstance::SoftwareFallback => PerformanceTier::SoftwareTable,
         }
     }
@@ -375,6 +394,11 @@ fn create_arch_ops_from_tier(tier: PerformanceTier) -> ArchOpsInstance {
             use crate::arch::x86_64::avx512::X86_64Avx512PclmulqdqOps;
             ArchOpsInstance::X86_64Avx512Pclmulqdq(X86_64Avx512PclmulqdqOps::new())
         }
+        #[cfg(target_arch = "x86_64")]
+        PerformanceTier::X86_64Avx2Vpclmulqdq => {
+            use crate::arch::x86_64::avx2_vpclmulqdq::X86_64Avx2VpclmulqdqOps;
+            ArchOpsInstance::X86_64Avx2Vpclmulqdq(X86_64Avx2VpclmulqdqOps::new())
+        }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         PerformanceTier::X86_64SsePclmulqdq | PerformanceTier::X86SsePclmulqdq => {
             create_x86_sse_pclmulqdq_ops()
@@ -419,6 +443,15 @@ pub fn select_performance_tier_for_test(capabilities: &ArchCapabilities) -> Perf
         return PerformanceTier::X86_64Avx512Pclmulqdq;
     }
 
+    // 256-bit VPCLMULQDQ with AVX2 requires PCLMULQDQ and SSE4.1
+    if capabilities.has_vpclmulqdq
+        && capabilities.has_avx2
+        && capabilities.has_pclmulqdq
+        && capabilities.has_sse41
+    {
+        return PerformanceTier::X86_64Avx2Vpclmulqdq;
+    }
+
     // PCLMULQDQ requires SSE4.1
     if capabilities.has_pclmulqdq && capabilities.has_sse41 {
         return PerformanceTier::X86_64SsePclmulqdq;
@@ -446,6 +479,7 @@ mod tests {
             has_pclmulqdq: false,
             has_avx512vl: false,
             has_vpclmulqdq: false,
+            has_avx2: false,
         };
         assert_eq!(
             select_performance_tier_for_test(&capabilities_sha3),
@@ -462,6 +496,7 @@ mod tests {
             has_pclmulqdq: false,
             has_avx512vl: false,
             has_vpclmulqdq: false,
+            has_avx2: false,
         };
         assert_eq!(
             select_performance_tier_for_test(&capabilities_aes),
@@ -478,6 +513,7 @@ mod tests {
             has_pclmulqdq: false,
             has_avx512vl: false,
             has_vpclmulqdq: false,
+            has_avx2: false,
         };
         assert_eq!(
             select_performance_tier_for_test(&capabilities_no_aes),
@@ -501,6 +537,7 @@ mod tests {
             has_pclmulqdq: false,
             has_avx512vl: false,
             has_vpclmulqdq: false,
+            has_avx2: false,
         };
 
         // AES support means we have PMULL instructions available for CRC calculations
@@ -516,10 +553,98 @@ mod tests {
             has_pclmulqdq: false,
             has_avx512vl: false,
             has_vpclmulqdq: false,
+            has_avx2: false,
         };
 
         assert!(capabilities_with_sha3.has_aes);
         assert!(capabilities_with_sha3.has_sha3);
+    }
+
+    /// The x86_64 tier each CPU family gets, from the CPUID features it reports. VPCLMULQDQ is
+    /// its own feature, not part of AVX-512, so it selects the 256-bit tier on parts with AVX2
+    /// and no AVX-512VL, and the 512-bit tier on parts with both.
+    #[test]
+    fn test_x86_64_tier_selection_by_cpu() {
+        let x86 = |avx2: bool, avx512vl: bool, vpclmulqdq: bool| ArchCapabilities {
+            has_aes: false,
+            has_crc: false,
+            has_sha3: false,
+            has_sse41: true,
+            has_sse42: true,
+            has_pclmulqdq: true,
+            has_avx512vl: avx512vl,
+            has_vpclmulqdq: vpclmulqdq,
+            has_avx2: avx2,
+        };
+
+        let cpus = [
+            // Westmere through Ivy Bridge: PCLMULQDQ, no AVX2
+            (
+                "Westmere",
+                x86(false, false, false),
+                PerformanceTier::X86_64SsePclmulqdq,
+            ),
+            // Haswell through Comet Lake, Zen 1 and Zen 2: AVX2, no VPCLMULQDQ
+            (
+                "Haswell",
+                x86(true, false, false),
+                PerformanceTier::X86_64SsePclmulqdq,
+            ),
+            (
+                "Zen 2",
+                x86(true, false, false),
+                PerformanceTier::X86_64SsePclmulqdq,
+            ),
+            // Skylake-SP and Cascade Lake: AVX-512VL without VPCLMULQDQ
+            (
+                "Skylake-SP",
+                x86(true, true, false),
+                PerformanceTier::X86_64Avx512Pclmulqdq,
+            ),
+            // Zen 3, and Alder Lake through Arrow Lake with AVX-512 fused off: 256-bit VPCLMULQDQ
+            (
+                "Zen 3",
+                x86(true, false, true),
+                PerformanceTier::X86_64Avx2Vpclmulqdq,
+            ),
+            (
+                "Alder Lake",
+                x86(true, false, true),
+                PerformanceTier::X86_64Avx2Vpclmulqdq,
+            ),
+            (
+                "Arrow Lake",
+                x86(true, false, true),
+                PerformanceTier::X86_64Avx2Vpclmulqdq,
+            ),
+            // Ice Lake-SP onward, Zen 4 and Zen 5: AVX-512VL and VPCLMULQDQ
+            (
+                "Ice Lake-SP",
+                x86(true, true, true),
+                PerformanceTier::X86_64Avx512Vpclmulqdq,
+            ),
+            (
+                "Zen 4",
+                x86(true, true, true),
+                PerformanceTier::X86_64Avx512Vpclmulqdq,
+            ),
+            // A hypervisor that passes VPCLMULQDQ through but masks AVX2 and AVX-512
+            (
+                "masked",
+                x86(false, false, true),
+                PerformanceTier::X86_64SsePclmulqdq,
+            ),
+        ];
+
+        for (cpu, capabilities, tier) in cpus {
+            assert_eq!(
+                select_performance_tier_for_test(&capabilities),
+                tier,
+                "{cpu}"
+            );
+            #[cfg(target_arch = "x86_64")]
+            assert_eq!(select_performance_tier(&capabilities), tier, "{cpu}");
+        }
     }
 
     #[test]
@@ -537,6 +662,7 @@ mod tests {
             has_pclmulqdq: true,
             has_avx512vl: true,
             has_vpclmulqdq: true,
+            has_avx2: false,
         };
         assert_eq!(
             select_performance_tier_for_test(&capabilities_vpclmulqdq),
@@ -553,6 +679,7 @@ mod tests {
             has_pclmulqdq: true,
             has_avx512vl: true,
             has_vpclmulqdq: false,
+            has_avx2: false,
         };
         assert_eq!(
             select_performance_tier_for_test(&capabilities_avx512),
@@ -569,6 +696,7 @@ mod tests {
             has_pclmulqdq: true,
             has_avx512vl: false,
             has_vpclmulqdq: false,
+            has_avx2: false,
         };
         assert_eq!(
             select_performance_tier_for_test(&capabilities_sse),
@@ -585,6 +713,7 @@ mod tests {
             has_pclmulqdq: false,
             has_avx512vl: false,
             has_vpclmulqdq: false,
+            has_avx2: false,
         };
         assert_eq!(
             select_performance_tier_for_test(&capabilities_no_pclmul),
@@ -607,6 +736,7 @@ mod tests {
             has_pclmulqdq: true,
             has_avx512vl: false,
             has_vpclmulqdq: false,
+            has_avx2: false,
         };
         assert_eq!(
             select_performance_tier_for_test(&capabilities_sse),
@@ -624,6 +754,7 @@ mod tests {
             has_pclmulqdq: true,
             has_avx512vl: false, // No AVX512 on 32-bit x86
             has_vpclmulqdq: false,
+            has_avx2: false,
         };
         // This should select x86_64 tier since we're testing the general case
         assert_eq!(
@@ -641,6 +772,7 @@ mod tests {
             has_pclmulqdq: false,
             has_avx512vl: false,
             has_vpclmulqdq: false,
+            has_avx2: false,
         };
         assert_eq!(
             select_performance_tier_for_test(&capabilities_no_pclmul),
@@ -665,6 +797,7 @@ mod tests {
             has_pclmulqdq: true,
             has_avx512vl: true,
             has_vpclmulqdq: true,
+            has_avx2: false,
         };
 
         // All x86 features should be available when hierarchy is satisfied
@@ -692,6 +825,7 @@ mod tests {
                 has_pclmulqdq: false,
                 has_avx512vl: false,
                 has_vpclmulqdq: false,
+                has_avx2: false,
             };
 
             // Should fall back to software since AES is required for SHA3
@@ -710,6 +844,7 @@ mod tests {
                 has_pclmulqdq: true,
                 has_avx512vl: false,  // Missing required dependency
                 has_vpclmulqdq: true, // This should be impossible in real detection
+                has_avx2: false,
             };
 
             // Should fall back to SSE tier since AVX512VL is required for VPCLMULQDQ
@@ -738,6 +873,7 @@ mod tests {
                 has_pclmulqdq: false,
                 has_avx512vl: false,
                 has_vpclmulqdq: false,
+                has_avx2: false,
             };
             assert_eq!(
                 select_performance_tier_for_test(&no_features),
@@ -754,6 +890,7 @@ mod tests {
                 has_pclmulqdq: false,
                 has_avx512vl: false,
                 has_vpclmulqdq: false,
+                has_avx2: false,
             };
             assert_eq!(
                 select_performance_tier_for_test(&aes_only),
@@ -770,6 +907,7 @@ mod tests {
                 has_pclmulqdq: false,
                 has_avx512vl: false,
                 has_vpclmulqdq: false,
+                has_avx2: false,
             };
             assert_eq!(
                 select_performance_tier_for_test(&aes_sha3),
@@ -791,6 +929,7 @@ mod tests {
                 has_pclmulqdq: false,
                 has_avx512vl: false,
                 has_vpclmulqdq: false,
+                has_avx2: false,
             };
             assert_eq!(
                 select_performance_tier_for_test(&no_features),
@@ -807,6 +946,7 @@ mod tests {
                 has_pclmulqdq: false,
                 has_avx512vl: false,
                 has_vpclmulqdq: false,
+                has_avx2: false,
             };
             assert_eq!(
                 select_performance_tier_for_test(&sse_only),
@@ -823,6 +963,7 @@ mod tests {
                 has_pclmulqdq: true,
                 has_avx512vl: false,
                 has_vpclmulqdq: false,
+                has_avx2: false,
             };
             assert_eq!(
                 select_performance_tier_for_test(&sse_pclmul),
@@ -839,6 +980,7 @@ mod tests {
                 has_pclmulqdq: true,
                 has_avx512vl: true,
                 has_vpclmulqdq: false,
+                has_avx2: false,
             };
             assert_eq!(
                 select_performance_tier_for_test(&avx512_pclmul_new_rust),
@@ -855,6 +997,7 @@ mod tests {
                 has_pclmulqdq: true,
                 has_avx512vl: true,
                 has_vpclmulqdq: true,
+                has_avx2: false,
             };
             assert_eq!(
                 select_performance_tier_for_test(&all_features_new_rust),
@@ -876,6 +1019,7 @@ mod tests {
                 has_pclmulqdq: false,
                 has_avx512vl: false,
                 has_vpclmulqdq: false,
+                has_avx2: false,
             };
             assert_eq!(
                 select_performance_tier_for_test(&no_features),
@@ -893,6 +1037,7 @@ mod tests {
                 has_pclmulqdq: true,
                 has_avx512vl: false, // AVX512 not available on 32-bit x86
                 has_vpclmulqdq: false,
+                has_avx2: false,
             };
             // The test function will return x86_64 tier since it doesn't distinguish architectures
             assert_eq!(
@@ -915,6 +1060,10 @@ mod tests {
                 (
                     PerformanceTier::X86_64Avx512Pclmulqdq,
                     "x86_64-avx512-pclmulqdq",
+                ),
+                (
+                    PerformanceTier::X86_64Avx2Vpclmulqdq,
+                    "x86_64-avx2-vpclmulqdq",
                 ),
                 (PerformanceTier::X86_64SsePclmulqdq, "x86_64-sse-pclmulqdq"),
                 (PerformanceTier::X86SsePclmulqdq, "x86-sse-pclmulqdq"),
@@ -945,6 +1094,7 @@ mod tests {
                 has_pclmulqdq: false,
                 has_avx512vl: false,
                 has_vpclmulqdq: false,
+                has_avx2: false,
             };
 
             // Should select highest tier
@@ -982,6 +1132,7 @@ mod tests {
                 has_pclmulqdq: true,
                 has_avx512vl: true,
                 has_vpclmulqdq: true,
+                has_avx2: false,
             };
 
             // Should select highest tier
@@ -1033,6 +1184,7 @@ mod tests {
                 has_pclmulqdq: false,
                 has_avx512vl: false,
                 has_vpclmulqdq: false,
+                has_avx2: false,
             };
             // Should fall back to software since AES is required for SHA3
             assert_eq!(
@@ -1050,6 +1202,7 @@ mod tests {
                 has_pclmulqdq: true,
                 has_avx512vl: false,
                 has_vpclmulqdq: true, // This would be impossible in real detection
+                has_avx2: false,
             };
             // Should fall back to SSE tier since AVX512VL is required for VPCLMULQDQ
             assert_eq!(
@@ -1075,6 +1228,7 @@ mod software_fallback_tests {
             has_pclmulqdq: false,
             has_avx512vl: false,
             has_vpclmulqdq: false,
+            has_avx2: false,
         };
 
         let tier = select_performance_tier_for_test(&capabilities_no_aes);
@@ -1097,6 +1251,7 @@ mod software_fallback_tests {
             has_pclmulqdq: false, // But PCLMULQDQ not available
             has_avx512vl: false,
             has_vpclmulqdq: false,
+            has_avx2: false,
         };
 
         let tier = select_performance_tier_for_test(&capabilities_no_pclmul);
@@ -1116,6 +1271,7 @@ mod software_fallback_tests {
             has_pclmulqdq: false, // PCLMULQDQ requires SSE4.1
             has_avx512vl: false,
             has_vpclmulqdq: false,
+            has_avx2: false,
         };
 
         let tier = select_performance_tier_for_test(&capabilities_no_sse);

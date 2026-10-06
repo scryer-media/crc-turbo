@@ -30,7 +30,8 @@ taken. Each commit that carries one names its author.
   (crc-fast#50, #51, #55, #46).
 - **dcbtsla**: an AVX2 + VPCLMULQDQ tier for CPUs without AVX-512
   (crc-fast#56), written independently of and before the one this crate
-  ships, and precomputed combine operators (crc-fast#60).
+  ships, whose feature-detection model this crate adopts; and precomputed
+  combine keys (crc-fast#60).
 
 ## This fork
 

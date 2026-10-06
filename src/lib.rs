@@ -1110,7 +1110,8 @@ pub fn checksum_combine_with_params(
 ///
 /// The performance tier system provides graceful degradation across different hardware capabilities:
 /// - **AArch64**: `aarch64-aes-sha3` (highest) → `aarch64-aes-pmull` (baseline)
-/// - **x86_64**: `x86_64-avx512-vpclmulqdq` (highest) → `x86_64-avx512-pclmulqdq` (mid) → `x86_64-sse-pclmulqdq` (baseline)
+/// - **x86_64**: `x86_64-avx512-vpclmulqdq` (highest) → `x86_64-avx512-pclmulqdq` (mid) →
+///   `x86_64-avx2-vpclmulqdq` (VPCLMULQDQ without AVX-512) → `x86_64-sse-pclmulqdq` (baseline)
 /// - **x86**: `x86-sse-pclmulqdq` (baseline) → `software-fallback-tables` (fallback)
 /// - **Other architectures**: `software-fallback-tables`
 ///
@@ -1313,6 +1314,7 @@ fn crc32_iscsi_calculator(state: u64, data: &[u8], _params: &CrcParams) -> u64 {
         match arch_ops.get_tier() {
             PerformanceTier::X86_64Avx512Vpclmulqdq
             | PerformanceTier::X86_64Avx512Pclmulqdq
+            | PerformanceTier::X86_64Avx2Vpclmulqdq
             | PerformanceTier::X86_64SsePclmulqdq
             | PerformanceTier::X86SsePclmulqdq => {
                 // fusion path requires both pclmulqdq (checked by tier) and sse4.2 (for CRC32 instructions)
