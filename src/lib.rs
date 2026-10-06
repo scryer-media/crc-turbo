@@ -242,6 +242,7 @@ pub mod arch;
 mod cache;
 mod combine;
 pub use combine::CrcCombine;
+pub use feature_detection::TIER_ENV;
 mod consts;
 mod crc16;
 mod crc32;

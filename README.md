@@ -500,6 +500,19 @@ cargo run arch-check
 cargo build --release
 ```
 
+### Pinning a tier
+
+With the `std` feature, the `CRC_TURBO_TIER` environment variable pins the tier, for comparing one
+tier against another on the same binary or running a narrower tier than the CPU would select. Its
+value is a target string as `arch-check` and `get_calculator_target` report it, such as
+`x86_64-avx2-vpclmulqdq`, `x86_64-sse-pclmulqdq` or `software-fallback-tables`. It is read once,
+when the first CRC is computed. It only ever narrows the choice: a tier the CPU cannot run, or a
+value that names no tier, is ignored.
+
+```
+CRC_TURBO_TIER=x86_64-sse-pclmulqdq cargo bench
+```
+
 ## Minimum Supported Rust Version (MSRV)
 
 This crate targets a `stable-2` policy (ie, the latest stable Rust version minus 2 minor versions) as the Minimum

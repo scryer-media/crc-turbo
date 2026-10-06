@@ -4,9 +4,6 @@
 //!
 //! It dispatches to the appropriate architecture-specific implementation
 
-#[cfg(all(target_arch = "aarch64", feature = "std"))]
-use std::arch::is_aarch64_feature_detected;
-
 use crate::CrcParams;
 
 #[cfg(target_arch = "aarch64")]
@@ -38,24 +35,8 @@ pub(crate) unsafe fn update(state: u64, bytes: &[u8], params: &CrcParams) -> u64
     match get_arch_ops() {
         ArchOpsInstance::Aarch64AesSha3(ops) => update_aarch64_aes_sha3(state, bytes, params, *ops),
         ArchOpsInstance::Aarch64Aes(ops) => update_aarch64_aes(state, bytes, params, *ops),
-        ArchOpsInstance::SoftwareFallback => {
-            #[cfg(feature = "std")]
-            let has_features =
-                is_aarch64_feature_detected!("aes") && is_aarch64_feature_detected!("neon");
-            #[cfg(not(feature = "std"))]
-            let has_features = cfg!(target_feature = "aes") && cfg!(target_feature = "neon");
-
-            if !has_features {
-                #[cfg(any(not(target_feature = "aes"), not(target_feature = "neon")))]
-                {
-                    // Use software implementation when no SIMD support is available
-                    return crate::arch::software::update(state, bytes, params);
-                }
-            }
-
-            // This should likely never happen, but just in case
-            panic!("aarch64 features missing (NEON and/or AES)");
-        }
+        // Detected when the CPU has no PMULL, or forced through `CRC_TURBO_TIER`.
+        ArchOpsInstance::SoftwareFallback => crate::arch::software::update(state, bytes, params),
     }
 }
 

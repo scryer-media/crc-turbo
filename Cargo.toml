@@ -158,3 +158,8 @@ rustdoc-args = ["--cfg", "docsrs"]
 name = "checksum_integration_tests"
 path = "tests/checksum_integration_tests.rs"
 required-features = ["cli"]
+
+[[test]]
+name = "forced_tier"
+path = "tests/forced_tier.rs"
+required-features = ["cli"]

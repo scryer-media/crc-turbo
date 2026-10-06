@@ -365,9 +365,76 @@ pub fn get_arch_ops() -> &'static ArchOpsInstance {
 #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
 fn create_arch_ops() -> ArchOpsInstance {
     let capabilities = unsafe { detect_arch_capabilities() };
-    let tier = select_performance_tier(&capabilities);
 
-    create_arch_ops_from_tier(tier)
+    #[cfg(feature = "std")]
+    let forced_owned = std::env::var(TIER_ENV).ok();
+    #[cfg(feature = "std")]
+    let forced = forced_owned.as_deref();
+    #[cfg(not(feature = "std"))]
+    let forced: Option<&str> = None;
+
+    create_arch_ops_from_tier(choose_tier(&capabilities, forced))
+}
+
+/// The environment variable that pins the performance tier, read once when the first CRC is
+/// computed, and only with the `std` feature.
+///
+/// Its value is a target string as [`crate::get_calculator_target`] reports it, such as
+/// `x86_64-sse-pclmulqdq` or `software-fallback-tables`. It exists to measure one tier against
+/// another on the same binary and to run a tier on a CPU that would select a wider one. It only
+/// ever narrows the choice: a tier this CPU lacks the instructions for is ignored, as is a value
+/// that names no tier, and detection decides as if the variable were unset.
+pub const TIER_ENV: &str = "CRC_TURBO_TIER";
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
+/// The tier a target string names, if any.
+fn tier_from_target(target: &str) -> Option<PerformanceTier> {
+    Some(match target.trim() {
+        "aarch64-neon-pmull-sha3" => PerformanceTier::AArch64AesSha3,
+        "aarch64-neon-pmull" => PerformanceTier::AArch64Aes,
+        "x86_64-avx512-vpclmulqdq" => PerformanceTier::X86_64Avx512Vpclmulqdq,
+        "x86_64-avx512-pclmulqdq" => PerformanceTier::X86_64Avx512Pclmulqdq,
+        "x86_64-avx2-vpclmulqdq" => PerformanceTier::X86_64Avx2Vpclmulqdq,
+        "x86_64-sse-pclmulqdq" => PerformanceTier::X86_64SsePclmulqdq,
+        "x86-sse-pclmulqdq" => PerformanceTier::X86SsePclmulqdq,
+        "software-fallback-tables" => PerformanceTier::SoftwareTable,
+        _ => return None,
+    })
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
+/// Whether this build can run `tier` on a CPU with `capabilities`.
+fn tier_supported(tier: PerformanceTier, capabilities: &ArchCapabilities) -> bool {
+    match tier {
+        PerformanceTier::AArch64AesSha3 => {
+            cfg!(target_arch = "aarch64") && capabilities.has_aes && capabilities.has_sha3
+        }
+        PerformanceTier::AArch64Aes => cfg!(target_arch = "aarch64") && capabilities.has_aes,
+        PerformanceTier::X86_64Avx512Vpclmulqdq => {
+            cfg!(target_arch = "x86_64") && capabilities.has_avx512vl && capabilities.has_vpclmulqdq
+        }
+        PerformanceTier::X86_64Avx512Pclmulqdq => {
+            cfg!(target_arch = "x86_64") && capabilities.has_avx512vl
+        }
+        PerformanceTier::X86_64Avx2Vpclmulqdq => {
+            cfg!(target_arch = "x86_64") && capabilities.has_avx2 && capabilities.has_vpclmulqdq
+        }
+        // Both names select the one SSE implementation, which runs on either x86 target.
+        PerformanceTier::X86_64SsePclmulqdq | PerformanceTier::X86SsePclmulqdq => {
+            cfg!(any(target_arch = "x86", target_arch = "x86_64")) && capabilities.has_pclmulqdq
+        }
+        PerformanceTier::SoftwareTable => true,
+    }
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
+/// The tier to run: the forced one when it names a tier this CPU can run, otherwise the one
+/// detection selects.
+fn choose_tier(capabilities: &ArchCapabilities, forced: Option<&str>) -> PerformanceTier {
+    forced
+        .and_then(tier_from_target)
+        .filter(|&tier| tier_supported(tier, capabilities))
+        .unwrap_or_else(|| select_performance_tier(capabilities))
 }
 
 /// Helper function to create ArchOpsInstance from a performance tier
@@ -1302,5 +1369,125 @@ mod software_fallback_tests {
 
         // For x86_64, software fallback should not be needed since SSE4.1/PCLMULQDQ are always available
         // But it may still be compiled for testing purposes
+    }
+}
+
+#[cfg(all(
+    test,
+    any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+))]
+mod forced_tier_tests {
+    use super::*;
+
+    const NONE: ArchCapabilities = ArchCapabilities {
+        has_aes: false,
+        has_crc: false,
+        has_sha3: false,
+        has_sse41: false,
+        has_sse42: false,
+        has_pclmulqdq: false,
+        has_avx512vl: false,
+        has_vpclmulqdq: false,
+        has_avx2: false,
+    };
+
+    #[test]
+    fn every_tier_string_round_trips() {
+        for tier in [
+            PerformanceTier::AArch64AesSha3,
+            PerformanceTier::AArch64Aes,
+            PerformanceTier::X86_64Avx512Vpclmulqdq,
+            PerformanceTier::X86_64Avx512Pclmulqdq,
+            PerformanceTier::X86_64Avx2Vpclmulqdq,
+            PerformanceTier::X86_64SsePclmulqdq,
+            PerformanceTier::X86SsePclmulqdq,
+            PerformanceTier::SoftwareTable,
+        ] {
+            assert_eq!(tier_from_target(&tier_to_target_string(tier)), Some(tier));
+        }
+        assert_eq!(tier_from_target("x86_64-avx3"), None);
+        assert_eq!(tier_from_target(""), None);
+    }
+
+    #[test]
+    fn forcing_narrows_and_never_widens() {
+        // software is always available, and an unknown value is ignored
+        assert_eq!(
+            choose_tier(&NONE, Some("software-fallback-tables")),
+            PerformanceTier::SoftwareTable
+        );
+        assert_eq!(
+            choose_tier(&NONE, Some("bogus")),
+            select_performance_tier(&NONE)
+        );
+        // a tier the CPU lacks is ignored
+        assert_eq!(
+            choose_tier(&NONE, Some("x86_64-avx512-vpclmulqdq")),
+            PerformanceTier::SoftwareTable
+        );
+        assert_eq!(
+            choose_tier(&NONE, Some("aarch64-neon-pmull-sha3")),
+            PerformanceTier::SoftwareTable
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn forcing_selects_any_tier_the_x86_64_cpu_has() {
+        let zen4 = ArchCapabilities {
+            has_sse41: true,
+            has_sse42: true,
+            has_pclmulqdq: true,
+            has_avx512vl: true,
+            has_vpclmulqdq: true,
+            has_avx2: true,
+            ..NONE
+        };
+        assert_eq!(
+            choose_tier(&zen4, None),
+            PerformanceTier::X86_64Avx512Vpclmulqdq
+        );
+        for tier in [
+            PerformanceTier::X86_64Avx512Pclmulqdq,
+            PerformanceTier::X86_64Avx2Vpclmulqdq,
+            PerformanceTier::X86_64SsePclmulqdq,
+            PerformanceTier::SoftwareTable,
+        ] {
+            assert_eq!(choose_tier(&zen4, Some(&tier_to_target_string(tier))), tier);
+        }
+        // an aarch64 tier on x86_64 is ignored
+        assert_eq!(
+            choose_tier(&zen4, Some("aarch64-neon-pmull")),
+            PerformanceTier::X86_64Avx512Vpclmulqdq
+        );
+
+        let arrow_lake = ArchCapabilities {
+            has_avx512vl: false,
+            ..zen4
+        };
+        assert_eq!(
+            choose_tier(&arrow_lake, Some("x86_64-avx512-pclmulqdq")),
+            PerformanceTier::X86_64Avx2Vpclmulqdq
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn forcing_selects_any_tier_the_aarch64_cpu_has() {
+        let sha3 = ArchCapabilities {
+            has_aes: true,
+            has_crc: true,
+            has_sha3: true,
+            ..NONE
+        };
+        assert_eq!(choose_tier(&sha3, None), PerformanceTier::AArch64AesSha3);
+        assert_eq!(
+            choose_tier(&sha3, Some("aarch64-neon-pmull")),
+            PerformanceTier::AArch64Aes
+        );
+        assert_eq!(
+            choose_tier(&sha3, Some("x86_64-sse-pclmulqdq")),
+            PerformanceTier::AArch64AesSha3
+        );
     }
 }

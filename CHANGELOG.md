@@ -81,6 +81,15 @@ own changelog up to the fork point continues below, unchanged.
   crc-fast#56, independently and earlier; the feature-detection model here
   (VPCLMULQDQ and AVX2 as separate flags) is taken from it.
 
+### Tier selection
+
+- The `CRC_TURBO_TIER` environment variable (exported as `TIER_ENV`, `std`
+  only) pins the tier to a target string such as `x86_64-sse-pclmulqdq`, to
+  compare tiers on one binary. It never selects a tier the CPU cannot run.
+  An integration test runs the CLI tools under every tier string and checks
+  the check values and the selection rule.
+- Forcing the software tier on an aarch64 CPU with PMULL no longer panics.
+
 ### Combine
 
 - `checksum_combine` and `checksum_combine_with_params` compute the shift
