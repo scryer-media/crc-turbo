@@ -1,7 +1,7 @@
 // Copyright 2025 Don MacAskill. Licensed under MIT or Apache-2.0.
 
-use crc_fast::checksum;
-use crc_fast::CrcAlgorithm;
+use crc_turbo::checksum;
+use crc_turbo::CrcAlgorithm;
 use criterion::*;
 use rand::{rng, RngCore};
 use std::hint::black_box;
@@ -80,7 +80,7 @@ fn bench_crc32(c: &mut Criterion) {
 
     println!(
         "Acceleration target: {}",
-        crc_fast::get_calculator_target(CrcAlgorithm::Crc32Iscsi)
+        crc_turbo::get_calculator_target(CrcAlgorithm::Crc32Iscsi)
     );
 
     for (size_name, size) in SIZES {
@@ -111,7 +111,7 @@ fn bench_crc32(c: &mut Criterion) {
             group.bench_function(BenchmarkId::new(bench_name, size_name), |b| {
                 b.iter(|| {
                     black_box({
-                        let mut digest = crc_fast::Digest::new(*algorithm);
+                        let mut digest = crc_turbo::Digest::new(*algorithm);
                         digest.update(part1);
                         digest.update(part2);
                         digest.update(part3);
@@ -128,7 +128,7 @@ fn bench_crc32(c: &mut Criterion) {
 fn bench_crc64(c: &mut Criterion) {
     println!(
         "Acceleration target: {}",
-        crc_fast::get_calculator_target(CrcAlgorithm::Crc64Nvme)
+        crc_turbo::get_calculator_target(CrcAlgorithm::Crc64Nvme)
     );
 
     let mut group = c.benchmark_group("CRC-64");
@@ -161,7 +161,7 @@ fn bench_crc64(c: &mut Criterion) {
             group.bench_function(BenchmarkId::new(bench_name, size_name), |b| {
                 b.iter(|| {
                     black_box({
-                        let mut digest = crc_fast::Digest::new(*algorithm);
+                        let mut digest = crc_turbo::Digest::new(*algorithm);
                         digest.update(part1);
                         digest.update(part2);
                         digest.update(part3);

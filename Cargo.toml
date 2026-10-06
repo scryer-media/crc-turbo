@@ -1,14 +1,17 @@
 [package]
-name = "crc-fast"
-version = "1.10.0"
+name = "crc-turbo"
+version = "1.11.0"
 edition = "2021"
-authors = ["Don MacAskill"]
+authors = ["Don MacAskill", "NZB Man"]
 license = "MIT OR Apache-2.0"
 keywords = ["crc", "checksum", "simd", "accelerated", "fast"]
 categories = ["algorithms", "encoding", "hardware-support"]
-repository = "https://github.com/awesomized/crc-fast-rust"
-description = "World's fastest generic CRC16, CRC32, and CRC64 calculator using SIMD. Supplies a C-compatible shared library for use in other languages."
+homepage = "https://github.com/scryer-media/crc-turbo"
+repository = "https://github.com/scryer-media/crc-turbo"
+description = "SIMD-accelerated CRC-16, CRC-32 and CRC-64 for every known variant, with a C-compatible library; a maintained fork of crc-fast"
 readme = "README.md"
+# Repository scaffolding that has no business in the crate archive.
+exclude = [".github/", ".githooks/", ".gitleaks.toml", ".gitattributes", ".kiro/", "renovate.json", "AGENTS.md", ".cargo/", "xtask/", "fuzz/", "rust-toolchain.toml"]
 
 # important intrinsics stabilization notes:
 # 1.69.0 added VPCLMULQDQ x86 detection support
@@ -17,7 +20,7 @@ readme = "README.md"
 rust-version = "1.89"
 
 [lib]
-name = "crc_fast"
+name = "crc_turbo"
 crate-type = ["lib", "cdylib", "staticlib"]
 bench = true
 

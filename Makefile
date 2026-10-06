@@ -1,4 +1,4 @@
-PROJECT_NAME := crc_fast
+PROJECT_NAME := crc_turbo
 
 # Detect operating system
 UNAME_S := $(shell uname -s)

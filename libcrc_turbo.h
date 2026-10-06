@@ -1,8 +1,8 @@
-/* crc_fast library C/C++ API - Copyright 2025 Don MacAskill */
+/* crc_turbo library C/C++ API - Copyright 2025 Don MacAskill */
 /* This header is auto-generated. Do not edit directly. */
 
-#ifndef CRC_FAST_H
-#define CRC_FAST_H
+#ifndef CRC_TURBO_H
+#define CRC_TURBO_H
 
 #include <stdarg.h>
 #include <stdbool.h>
@@ -12,7 +12,7 @@
 /**
  * Error codes for FFI operations
  */
-typedef enum CrcFastError {
+typedef enum CrcTurboError {
   /**
    * Operation completed successfully
    */
@@ -45,12 +45,12 @@ typedef enum CrcFastError {
    * Internal string conversion error
    */
   StringConversionError = 7,
-} CrcFastError;
+} CrcTurboError;
 
 /**
  * The supported CRC algorithms
  */
-typedef enum CrcFastAlgorithm {
+typedef enum CrcTurboAlgorithm {
   CrcCustom,
   Crc16Arc,
   Crc16Cdma2000,
@@ -104,7 +104,7 @@ typedef enum CrcFastAlgorithm {
   Crc64Redis,
   Crc64We,
   Crc64Xz,
-} CrcFastAlgorithm;
+} CrcTurboAlgorithm;
 
 /**
  * Represents a CRC Digest, which is used to compute CRC checksums.
@@ -113,20 +113,20 @@ typedef enum CrcFastAlgorithm {
  * the current state, the amount of data processed, the CRC parameters, and
  * the calculator function used to perform the CRC calculation.
  */
-typedef struct CrcFastDigest CrcFastDigest;
+typedef struct CrcTurboDigest CrcTurboDigest;
 
 /**
  * A handle to the Digest object
  */
-typedef struct CrcFastDigestHandle {
-  struct CrcFastDigest *_0;
-} CrcFastDigestHandle;
+typedef struct CrcTurboDigestHandle {
+  struct CrcTurboDigest *_0;
+} CrcTurboDigestHandle;
 
 /**
  * Custom CRC parameters
  */
-typedef struct CrcFastParams {
-  enum CrcFastAlgorithm algorithm;
+typedef struct CrcTurboParams {
+  enum CrcTurboAlgorithm algorithm;
   uint8_t width;
   uint64_t poly;
   uint64_t init;
@@ -136,7 +136,7 @@ typedef struct CrcFastParams {
   uint64_t check;
   uint32_t key_count;
   const uint64_t *keys;
-} CrcFastParams;
+} CrcTurboParams;
 
 #ifdef __cplusplus
 extern "C" {
@@ -144,159 +144,159 @@ extern "C" {
 
 /**
  * Gets the last error that occurred in the current thread
- * Returns CrcFastError::Success if no error has occurred
+ * Returns CrcTurboError::Success if no error has occurred
  */
-enum CrcFastError crc_fast_get_last_error(void);
+enum CrcTurboError crc_turbo_get_last_error(void);
 
 /**
  * Clears the last error for the current thread
  */
-void crc_fast_clear_error(void);
+void crc_turbo_clear_error(void);
 
 /**
  * Gets a human-readable error message for the given error code
  * Returns a pointer to a static string (do not free)
  */
-const char *crc_fast_error_message(enum CrcFastError error);
+const char *crc_turbo_error_message(enum CrcTurboError error);
 
 /**
  * Creates a new Digest to compute CRC checksums using algorithm
  */
-struct CrcFastDigestHandle *crc_fast_digest_new(enum CrcFastAlgorithm algorithm);
+struct CrcTurboDigestHandle *crc_turbo_digest_new(enum CrcTurboAlgorithm algorithm);
 
 /**
  * Creates a new Digest with a custom initial state
  */
-struct CrcFastDigestHandle *crc_fast_digest_new_with_init_state(enum CrcFastAlgorithm algorithm,
-                                                                uint64_t init_state);
+struct CrcTurboDigestHandle *crc_turbo_digest_new_with_init_state(enum CrcTurboAlgorithm algorithm,
+                                                                  uint64_t init_state);
 
 /**
  * Creates a new Digest to compute CRC checksums using custom parameters
  * Returns NULL if parameters are invalid (invalid key count or null pointer)
- * Call crc_fast_get_last_error() to get the specific error code
+ * Call crc_turbo_get_last_error() to get the specific error code
  */
-struct CrcFastDigestHandle *crc_fast_digest_new_with_params(struct CrcFastParams params);
+struct CrcTurboDigestHandle *crc_turbo_digest_new_with_params(struct CrcTurboParams params);
 
 /**
  * Updates the Digest with data
  */
-void crc_fast_digest_update(struct CrcFastDigestHandle *handle, const char *data, uintptr_t len);
+void crc_turbo_digest_update(struct CrcTurboDigestHandle *handle, const char *data, uintptr_t len);
 
 /**
  * Calculates the CRC checksum for data that's been written to the Digest
  * Returns 0 on error (e.g. null handle)
  */
-uint64_t crc_fast_digest_finalize(struct CrcFastDigestHandle *handle);
+uint64_t crc_turbo_digest_finalize(struct CrcTurboDigestHandle *handle);
 
 /**
  * Free the Digest resources without finalizing
  */
-void crc_fast_digest_free(struct CrcFastDigestHandle *handle);
+void crc_turbo_digest_free(struct CrcTurboDigestHandle *handle);
 
 /**
  * Reset the Digest state
  */
-void crc_fast_digest_reset(struct CrcFastDigestHandle *handle);
+void crc_turbo_digest_reset(struct CrcTurboDigestHandle *handle);
 
 /**
  * Finalize and reset the Digest in one operation
  * Returns 0 on error (e.g. null handle)
  */
-uint64_t crc_fast_digest_finalize_reset(struct CrcFastDigestHandle *handle);
+uint64_t crc_turbo_digest_finalize_reset(struct CrcTurboDigestHandle *handle);
 
 /**
  * Combine two Digest checksums
  */
-void crc_fast_digest_combine(struct CrcFastDigestHandle *handle1,
-                             struct CrcFastDigestHandle *handle2);
+void crc_turbo_digest_combine(struct CrcTurboDigestHandle *handle1,
+                              struct CrcTurboDigestHandle *handle2);
 
 /**
  * Gets the amount of data processed by the Digest so far
  * Returns 0 on error (e.g. null handle)
  */
-uint64_t crc_fast_digest_get_amount(struct CrcFastDigestHandle *handle);
+uint64_t crc_turbo_digest_get_amount(struct CrcTurboDigestHandle *handle);
 
 /**
  * Gets the current state of the Digest
  * Returns 0 on error (e.g. null handle)
  */
-uint64_t crc_fast_digest_get_state(struct CrcFastDigestHandle *handle);
+uint64_t crc_turbo_digest_get_state(struct CrcTurboDigestHandle *handle);
 
 /**
  * Helper method to calculate a CRC checksum directly for a string using algorithm
  * Returns 0 on error (e.g. null data pointer)
  */
-uint64_t crc_fast_checksum(enum CrcFastAlgorithm algorithm, const char *data, uintptr_t len);
+uint64_t crc_turbo_checksum(enum CrcTurboAlgorithm algorithm, const char *data, uintptr_t len);
 
 /**
  * Helper method to calculate a CRC checksum directly for data using custom parameters
  * Returns 0 if parameters are invalid or data is null
- * Call crc_fast_get_last_error() to get the specific error code
+ * Call crc_turbo_get_last_error() to get the specific error code
  */
-uint64_t crc_fast_checksum_with_params(struct CrcFastParams params,
-                                       const char *data,
-                                       uintptr_t len);
+uint64_t crc_turbo_checksum_with_params(struct CrcTurboParams params,
+                                        const char *data,
+                                        uintptr_t len);
 
 /**
  * Helper method to just calculate a CRC checksum directly for a file using algorithm
  * Returns 0 if path is null or file I/O fails
- * Call crc_fast_get_last_error() to get the specific error code
+ * Call crc_turbo_get_last_error() to get the specific error code
  */
-uint64_t crc_fast_checksum_file(enum CrcFastAlgorithm algorithm,
-                                const uint8_t *path_ptr,
-                                uintptr_t path_len);
+uint64_t crc_turbo_checksum_file(enum CrcTurboAlgorithm algorithm,
+                                 const uint8_t *path_ptr,
+                                 uintptr_t path_len);
 
 /**
  * Helper method to calculate a CRC checksum directly for a file using custom parameters
  * Returns 0 if parameters are invalid, path is null, or file I/O fails
- * Call crc_fast_get_last_error() to get the specific error code
+ * Call crc_turbo_get_last_error() to get the specific error code
  */
-uint64_t crc_fast_checksum_file_with_params(struct CrcFastParams params,
-                                            const uint8_t *path_ptr,
-                                            uintptr_t path_len);
+uint64_t crc_turbo_checksum_file_with_params(struct CrcTurboParams params,
+                                             const uint8_t *path_ptr,
+                                             uintptr_t path_len);
 
 /**
  * Combine two CRC checksums using algorithm
  */
-uint64_t crc_fast_checksum_combine(enum CrcFastAlgorithm algorithm,
-                                   uint64_t checksum1,
-                                   uint64_t checksum2,
-                                   uint64_t checksum2_len);
+uint64_t crc_turbo_checksum_combine(enum CrcTurboAlgorithm algorithm,
+                                    uint64_t checksum1,
+                                    uint64_t checksum2,
+                                    uint64_t checksum2_len);
 
 /**
  * Combine two CRC checksums using custom parameters
  * Returns 0 if parameters are invalid
- * Call crc_fast_get_last_error() to get the specific error code
+ * Call crc_turbo_get_last_error() to get the specific error code
  */
-uint64_t crc_fast_checksum_combine_with_params(struct CrcFastParams params,
-                                               uint64_t checksum1,
-                                               uint64_t checksum2,
-                                               uint64_t checksum2_len);
+uint64_t crc_turbo_checksum_combine_with_params(struct CrcTurboParams params,
+                                                uint64_t checksum1,
+                                                uint64_t checksum2,
+                                                uint64_t checksum2_len);
 
 /**
  * Returns the custom CRC parameters for a given set of Rocksoft CRC parameters
  * If width is not 32 or 64, sets error to UnsupportedWidth
  */
-struct CrcFastParams crc_fast_get_custom_params(const char *name_ptr,
-                                                uint8_t width,
-                                                uint64_t poly,
-                                                uint64_t init,
-                                                bool reflected,
-                                                uint64_t xorout,
-                                                uint64_t check);
+struct CrcTurboParams crc_turbo_get_custom_params(const char *name_ptr,
+                                                  uint8_t width,
+                                                  uint64_t poly,
+                                                  uint64_t init,
+                                                  bool reflected,
+                                                  uint64_t xorout,
+                                                  uint64_t check);
 
 /**
  * Gets the target build properties (CPU architecture and fine-tuning parameters) for this algorithm
  * Returns NULL if string conversion fails
- * Call crc_fast_get_last_error() to get the specific error code
+ * Call crc_turbo_get_last_error() to get the specific error code
  */
-const char *crc_fast_get_calculator_target(enum CrcFastAlgorithm algorithm);
+const char *crc_turbo_get_calculator_target(enum CrcTurboAlgorithm algorithm);
 
 /**
  * Gets the version of this library
  * Returns a pointer to "unknown" if version string is invalid
  */
-const char *crc_fast_get_version(void);
+const char *crc_turbo_get_version(void);
 
 /**
  * Calculates the CRC-32/ISCSI checksum (commonly called "crc32c" in many, but not all,
@@ -306,7 +306,7 @@ const char *crc_fast_get_version(void);
  *
  * Returns 0 on error (e.g. null data pointer)
  */
-uint32_t crc_fast_crc32_iscsi(const char *data, uintptr_t len);
+uint32_t crc_turbo_crc32_iscsi(const char *data, uintptr_t len);
 
 /**
  * Calculates the CRC-32/ISO-HDLC checksum (commonly called "crc32" in many, but not all,
@@ -316,7 +316,7 @@ uint32_t crc_fast_crc32_iscsi(const char *data, uintptr_t len);
  *
  * Returns 0 on error (e.g. null data pointer)
  */
-uint32_t crc_fast_crc32_iso_hdlc(const char *data, uintptr_t len);
+uint32_t crc_turbo_crc32_iso_hdlc(const char *data, uintptr_t len);
 
 /**
  * Calculates the CRC-64/NVME checksum.
@@ -325,10 +325,10 @@ uint32_t crc_fast_crc32_iso_hdlc(const char *data, uintptr_t len);
  *
  * Returns 0 on error (e.g. null data pointer)
  */
-uint64_t crc_fast_crc64_nvme(const char *data, uintptr_t len);
+uint64_t crc_turbo_crc64_nvme(const char *data, uintptr_t len);
 
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus
 
-#endif  /* CRC_FAST_H */
+#endif  /* CRC_TURBO_H */

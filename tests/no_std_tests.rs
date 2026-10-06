@@ -5,7 +5,7 @@
 //!
 //! Run tests: cargo test --test no_std_tests
 
-use crc_fast::{checksum, CrcAlgorithm, Digest};
+use crc_turbo::{checksum, CrcAlgorithm, Digest};
 
 /// Test basic checksum calculation (works without std)
 #[test]
@@ -118,7 +118,7 @@ fn test_no_std_reflection_modes() {
 #[cfg(feature = "alloc")]
 #[test]
 fn test_no_std_custom_params() {
-    use crc_fast::{checksum_with_params, CrcParams};
+    use crc_turbo::{checksum_with_params, CrcParams};
 
     let params = CrcParams::new(
         "CRC-32/CUSTOM",
@@ -169,7 +169,7 @@ fn test_no_std_incremental_digest() {
 #[cfg(feature = "alloc")]
 #[test]
 fn test_no_std_checksum_combine() {
-    use crc_fast::checksum_combine;
+    use crc_turbo::checksum_combine;
 
     let crc1 = checksum(CrcAlgorithm::Crc32IsoHdlc, b"1234");
     let crc2 = checksum(CrcAlgorithm::Crc32IsoHdlc, b"56789");

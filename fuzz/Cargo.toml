@@ -1,5 +1,5 @@
 [package]
-name = "crc-fast-rust-fuzz"
+name = "crc-turbo-fuzz"
 version = "0.1.0"
 publish = false
 edition = "2021"
@@ -7,10 +7,15 @@ edition = "2021"
 [package.metadata]
 cargo-fuzz = true
 
+# Its own workspace: the fuzz harness builds on nightly with sanitizer flags
+# and must not join the crate's workspace.
+[workspace]
+members = ["."]
+
 [dependencies]
 libfuzzer-sys = "0.4"
 
-[dependencies.crc-fast]
+[dependencies.crc-turbo]
 path = ".."
 
 [[bin]]

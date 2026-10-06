@@ -234,8 +234,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19d374276b40fb8bbdee95aef7c7fa6b5316ec764510eb64b8dd0e2ed0d7e7f5"
 
 [[package]]
-name = "crc-fast"
-version = "1.10.0"
+name = "crc-turbo"
+version = "1.11.0"
 dependencies = [
  "cbindgen",
  "crc",

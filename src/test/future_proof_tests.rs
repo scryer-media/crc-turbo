@@ -1357,20 +1357,20 @@ fn test_future_expansion_backwards_compatibility() {
         "Third-party function should produce identical results"
     );
 }
-// FFI Tests for future-proof CrcFastParams functionality
+// FFI Tests for future-proof CrcTurboParams functionality
 
 #[cfg(all(
     feature = "ffi",
     any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "x86")
 ))]
 mod ffi_tests {
-    use crate::ffi::CrcFastParams;
+    use crate::ffi::CrcTurboParams;
     use crate::{CrcAlgorithm, CrcKeysStorage, CrcParams};
 
     #[test]
     #[allow(deprecated)]
     fn test_ffi_conversion_23_keys() {
-        // Test conversion between CrcParams and CrcFastParams for 23-key variant
+        // Test conversion between CrcParams and CrcTurboParams for 23-key variant
         let keys_23 = [0x1234567890ABCDEFu64; 23];
         let original_params = CrcParams {
             algorithm: CrcAlgorithm::Crc32Custom,
@@ -1387,7 +1387,7 @@ mod ffi_tests {
         };
 
         // Convert to FFI struct
-        let ffi_params: CrcFastParams = original_params.into();
+        let ffi_params: CrcTurboParams = original_params.into();
 
         // Verify FFI struct fields
         assert_eq!(ffi_params.key_count, 23, "FFI params should have 23 keys");
@@ -1443,7 +1443,7 @@ mod ffi_tests {
     #[test]
     #[allow(deprecated)]
     fn test_ffi_conversion_25_keys() {
-        // Test conversion between CrcParams and CrcFastParams for 25-key variant
+        // Test conversion between CrcParams and CrcTurboParams for 25-key variant
         let keys_25 = [0xFEDCBA0987654321u64; 25];
         let original_params = CrcParams {
             algorithm: CrcAlgorithm::Crc64Custom,
@@ -1460,7 +1460,7 @@ mod ffi_tests {
         };
 
         // Convert to FFI struct
-        let ffi_params: CrcFastParams = original_params.into();
+        let ffi_params: CrcTurboParams = original_params.into();
 
         // Verify FFI struct fields
         assert_eq!(ffi_params.key_count, 25, "FFI params should have 25 keys");
@@ -1518,8 +1518,8 @@ mod ffi_tests {
         };
 
         // Convert to FFI multiple times
-        let ffi_params1: CrcFastParams = params.into();
-        let ffi_params2: CrcFastParams = params.into();
+        let ffi_params1: CrcTurboParams = params.into();
+        let ffi_params2: CrcTurboParams = params.into();
 
         // Pointers should be stable (same keys should get same pointer)
         assert_eq!(
@@ -1547,7 +1547,7 @@ mod ffi_tests {
             keys: CrcKeysStorage::from_keys_fold_256(different_keys),
         };
 
-        let ffi_params3: CrcFastParams = different_params.into();
+        let ffi_params3: CrcTurboParams = different_params.into();
         assert_ne!(
             ffi_params1.keys, ffi_params3.keys,
             "Different key sets should get different pointers"
@@ -1573,7 +1573,7 @@ mod ffi_tests {
             keys: CrcKeysStorage::from_keys_fold_256(keys_23),
         };
 
-        let ffi_params: CrcFastParams = params.into();
+        let ffi_params: CrcTurboParams = params.into();
 
         // Test that we can safely access all keys through the pointer
         unsafe {
@@ -1650,8 +1650,8 @@ mod ffi_tests {
         };
 
         // Convert both to FFI
-        let ffi_23: CrcFastParams = params_23.into();
-        let ffi_25: CrcFastParams = params_25.into();
+        let ffi_23: CrcTurboParams = params_23.into();
+        let ffi_25: CrcTurboParams = params_25.into();
 
         // Verify key counts
         assert_eq!(ffi_23.key_count, 23);
@@ -1706,11 +1706,11 @@ mod ffi_tests {
 
     #[test]
     fn test_ffi_get_custom_params_function() {
-        // Test the crc_fast_get_custom_params FFI function
+        // Test the crc_turbo_get_custom_params FFI function
         use std::ffi::CString;
 
         let name = CString::new("Test CRC").unwrap();
-        let ffi_params = crate::ffi::crc_fast_get_custom_params(
+        let ffi_params = crate::ffi::crc_turbo_get_custom_params(
             name.as_ptr(),
             32,
             0x1EDC6F41,

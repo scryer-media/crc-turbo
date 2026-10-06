@@ -2,18 +2,22 @@
 // Future proofing for no_std support
 #![cfg_attr(not(feature = "std"), no_std)]
 
-//! `crc-fast`
+//! `crc-turbo`
 //! ===========
 //!
 //! Hardware-accelerated CRC calculation for
-//! [all known CRC-32 and CRC-64 variants](https://reveng.sourceforge.io/crc-catalogue/all.htm)
+//! [all known CRC-16, CRC-32 and CRC-64 variants](https://reveng.sourceforge.io/crc-catalogue/all.htm)
 //! using SIMD intrinsics which can exceed 100GiB/s for CRC-32 and 50GiB/s for CRC-64 on modern
 //! systems.
 //!
+//! `crc-turbo` is a fork of [`crc-fast`](https://github.com/awesomized/crc-fast-rust) by Don
+//! MacAskill, taken at its 1.10.0 release. The public API is `crc-fast`'s, so migrating is
+//! `crc_fast::` → `crc_turbo::` plus the dependency line.
+//!
 //! # Other languages
 //!
-//! Supplies a C-compatible shared library for use with other non-Rust languages. See
-//! [PHP extension](https://github.com/awesomized/crc-fast-php-ext) example.
+//! Supplies a C-compatible shared library for use with other non-Rust languages; see
+//! `libcrc_turbo.h` in the repository.
 //!
 //! # Background
 //!
@@ -41,7 +45,7 @@
 //! trait for easier integration with existing code.
 //!
 //! ```rust
-//! use crc_fast::{Digest, CrcAlgorithm::Crc32IsoHdlc};
+//! use crc_turbo::{Digest, CrcAlgorithm::Crc32IsoHdlc};
 //!
 //! let mut digest = Digest::new(Crc32IsoHdlc);
 //! digest.update(b"1234");
@@ -59,7 +63,7 @@
 //! ```rust
 //! use std::env;
 //! use std::fs::File;
-//! use crc_fast::{Digest, CrcAlgorithm::Crc32IsoHdlc};
+//! use crc_turbo::{Digest, CrcAlgorithm::Crc32IsoHdlc};
 //!
 //! // for example/test purposes only, use your own file path
 //! let file_path = env::current_dir().expect("missing working dir").join("crc-check.txt");
@@ -75,7 +79,7 @@
 //! ```
 //! ## checksum
 //!```rust
-//! use crc_fast::{checksum, CrcAlgorithm::Crc32IsoHdlc};
+//! use crc_turbo::{checksum, CrcAlgorithm::Crc32IsoHdlc};
 //!
 //! let checksum = checksum(Crc32IsoHdlc, b"123456789");
 //!
@@ -84,7 +88,7 @@
 //!
 //! ## checksum_combine
 //!```rust
-//! use crc_fast::{checksum, checksum_combine, CrcAlgorithm::Crc32IsoHdlc};
+//! use crc_turbo::{checksum, checksum_combine, CrcAlgorithm::Crc32IsoHdlc};
 //!
 //! let checksum_1 = checksum(Crc32IsoHdlc, b"1234");
 //! let checksum_2 = checksum(Crc32IsoHdlc, b"56789");
@@ -96,7 +100,7 @@
 //! ## checksum_file
 //!```rust
 //! use std::env;
-//! use crc_fast::{checksum_file, CrcAlgorithm::Crc32IsoHdlc};
+//! use crc_turbo::{checksum_file, CrcAlgorithm::Crc32IsoHdlc};
 //!
 //! // for example/test purposes only, use your own file path
 //! let file_path = env::current_dir().expect("missing working dir").join("crc-check.txt");
@@ -114,7 +118,7 @@
 //!
 //! ## checksum_with_params
 //!```rust
-//! use crc_fast::{checksum_with_params, CrcParams};
+//! use crc_turbo::{checksum_with_params, CrcParams};
 //!
 //! // Define custom CRC-32 parameters (equivalent to CRC-32/ISO-HDLC)
 //! let custom_params = CrcParams::new(
@@ -519,7 +523,7 @@ impl Digest {
     /// # Examples
     ///
     /// ```rust
-    /// use crc_fast::{Digest, CrcAlgorithm::Crc32IsoHdlc};
+    /// use crc_turbo::{Digest, CrcAlgorithm::Crc32IsoHdlc};
     ///
     /// let mut digest = Digest::new(Crc32IsoHdlc);
     /// digest.update(b"123456789");
@@ -544,7 +548,7 @@ impl Digest {
     /// # Examples
     ///
     /// ```rust
-    /// use crc_fast::{Digest, CrcAlgorithm::Crc32IsoHdlc};
+    /// use crc_turbo::{Digest, CrcAlgorithm::Crc32IsoHdlc};
     ///
     /// // CRC-32/ISO-HDLC with initial state of 0x00000000, instead of the default initial state
     /// // of 0xffffffff,
@@ -579,7 +583,7 @@ impl Digest {
     /// # Examples
     ///
     /// ```rust
-    /// use crc_fast::{Digest, CrcParams};
+    /// use crc_turbo::{Digest, CrcParams};
     ///
     /// // Define custom CRC-32 parameters (equivalent to CRC-32/ISO-HDLC)
     /// let custom_params = CrcParams::new(
@@ -665,7 +669,7 @@ impl Digest {
     ///
     /// # Examples
     /// ```rust
-    /// use crc_fast::{Digest, CrcAlgorithm::Crc32IsoHdlc};
+    /// use crc_turbo::{Digest, CrcAlgorithm::Crc32IsoHdlc};
     ///
     /// let mut digest = Digest::new(Crc32IsoHdlc);
     /// digest.update(b"123456789");
@@ -720,7 +724,7 @@ impl Write for Digest {
 /// Computes the CRC checksum for the given data using the specified algorithm.
 ///
 ///```rust
-/// use crc_fast::{checksum, CrcAlgorithm::Crc32IsoHdlc};
+/// use crc_turbo::{checksum, CrcAlgorithm::Crc32IsoHdlc};
 /// let checksum = checksum(Crc32IsoHdlc, b"123456789");
 ///
 /// assert_eq!(checksum, 0xcbf43926);
@@ -909,7 +913,7 @@ pub fn checksum(algorithm: CrcAlgorithm, buf: &[u8]) -> u64 {
 /// # Examples
 ///
 /// ```rust
-/// use crc_fast::{checksum_with_params, CrcParams};
+/// use crc_turbo::{checksum_with_params, CrcParams};
 ///
 /// // Define custom CRC-32 parameters (equivalent to CRC-32/ISO-HDLC)
 /// let custom_params = CrcParams::new(
@@ -944,7 +948,7 @@ pub fn checksum_with_params(params: CrcParams, buf: &[u8]) -> u64 {
 /// ### checksum_file
 ///```rust
 /// use std::env;
-/// use crc_fast::{checksum_file, CrcAlgorithm::Crc32IsoHdlc};
+/// use crc_turbo::{checksum_file, CrcAlgorithm::Crc32IsoHdlc};
 ///
 /// // for example/test purposes only, use your own file path
 /// let file_path = env::current_dir().expect("missing working dir").join("crc-check.txt");
@@ -976,7 +980,7 @@ pub fn checksum_file(
 ///
 /// ```rust
 /// use std::env;
-/// use crc_fast::{checksum_file_with_params, CrcParams};
+/// use crc_turbo::{checksum_file_with_params, CrcParams};
 ///
 /// // for example/test purposes only, use your own file path
 /// let file_path = env::current_dir().expect("missing working dir").join("crc-check.txt");
@@ -1042,7 +1046,7 @@ fn checksum_file_with_digest(
 ///
 /// # Examples
 ///```rust
-/// use crc_fast::{checksum, checksum_combine, CrcAlgorithm::Crc32IsoHdlc};
+/// use crc_turbo::{checksum, checksum_combine, CrcAlgorithm::Crc32IsoHdlc};
 ///
 /// let checksum_1 = checksum(Crc32IsoHdlc, b"1234");
 /// let checksum_2 = checksum(Crc32IsoHdlc, b"56789");
@@ -1067,7 +1071,7 @@ pub fn checksum_combine(
 /// # Examples
 ///
 /// ```rust
-/// use crc_fast::{checksum_with_params, checksum_combine_with_params, CrcParams};
+/// use crc_turbo::{checksum_with_params, checksum_combine_with_params, CrcParams};
 ///
 /// // Define custom CRC-32 parameters (equivalent to CRC-32/ISO-HDLC)
 /// let custom_params = CrcParams::new(
@@ -1115,7 +1119,7 @@ pub fn checksum_combine_with_params(
 ///
 /// # Examples
 ///```rust
-/// use crc_fast::{get_calculator_target, CrcAlgorithm::Crc32IsoHdlc};
+/// use crc_turbo::{get_calculator_target, CrcAlgorithm::Crc32IsoHdlc};
 ///
 /// let target = get_calculator_target(Crc32IsoHdlc);
 /// println!("Using performance tier: {}", target);
@@ -1144,7 +1148,7 @@ pub fn get_calculator_target(_algorithm: CrcAlgorithm) -> String {
 /// # Examples
 ///
 /// ```rust
-/// use crc_fast::crc32_iscsi;
+/// use crc_turbo::crc32_iscsi;
 /// let checksum = crc32_iscsi(b"123456789");
 /// assert_eq!(checksum, 0xe3069283);
 /// ```
@@ -1164,7 +1168,7 @@ pub fn crc32_iscsi(data: &[u8]) -> u32 {
 /// # Examples
 ///
 /// ```rust
-/// use crc_fast::crc32_iso_hdlc;
+/// use crc_turbo::crc32_iso_hdlc;
 /// let checksum = crc32_iso_hdlc(b"123456789");
 /// assert_eq!(checksum, 0xcbf43926);
 /// ```
@@ -1184,7 +1188,7 @@ pub fn crc32_iso_hdlc(data: &[u8]) -> u32 {
 /// # Examples
 ///
 /// ```rust
-/// use crc_fast::crc64_nvme;
+/// use crc_turbo::crc64_nvme;
 /// let checksum = crc64_nvme(b"123456789");
 /// assert_eq!(checksum, 0xae8b14860a799888);
 /// ```
@@ -1852,15 +1856,15 @@ mod lib {
             return Ok(());
         }
 
-        const HEADER: &str = "libcrc_fast.h";
+        const HEADER: &str = "libcrc_turbo.h";
 
         let crate_dir = std::env::var("CARGO_MANIFEST_DIR").map_err(|error| error.to_string())?;
 
         let mut expected = Vec::new();
         cbindgen::Builder::new()
             .with_crate(crate_dir)
-            .with_include_guard("CRC_FAST_H")
-            .with_header("/* crc_fast library C/C++ API - Copyright 2025 Don MacAskill */\n/* This header is auto-generated. Do not edit directly. */\n")
+            .with_include_guard("CRC_TURBO_H")
+            .with_header("/* crc_turbo library C/C++ API - Copyright 2025 Don MacAskill */\n/* This header is auto-generated. Do not edit directly. */\n")
             // exclude internal implementation functions
             .exclude_item("crc32_iscsi_impl")
             .exclude_item("crc32_iso_hdlc_impl")
@@ -1869,7 +1873,7 @@ mod lib {
             .exclude_item("ISO_HDLC_TARGET")
             .exclude_item("ISCSI_TARGET")
             .exclude_item("CrcParams")
-            .rename_item("Digest", "CrcFastDigest")
+            .rename_item("Digest", "CrcTurboDigest")
             .with_style(Both)
             // generate C header
             .with_language(C)

@@ -1,9 +1,30 @@
-`crc-fast`
-===========
+# crc-turbo
 
-[![Test status](https://github.com/awesomized/crc-fast-rust/workflows/Tests/badge.svg)](https://github.com/awesomized/crc-fast-rust/actions?query=workflow%3ATests)
-[![Latest Version](https://img.shields.io/crates/v/crc-fast.svg)](https://crates.io/crates/crc-fast)
-[![Documentation](https://img.shields.io/badge/api-rustdoc-blue.svg)](https://docs.rs/crc-fast)
+[![ci](https://github.com/scryer-media/crc-turbo/actions/workflows/ci.yml/badge.svg)](https://github.com/scryer-media/crc-turbo/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/crc-turbo.svg)](https://crates.io/crates/crc-turbo)
+[![docs.rs](https://docs.rs/crc-turbo/badge.svg)](https://docs.rs/crc-turbo)
+
+## This is a fork
+
+`crc-turbo` is a maintained fork of
+**[crc-fast](https://github.com/awesomized/crc-fast-rust)** by Don MacAskill
+(MIT OR Apache-2.0), taken at its 1.10.0 release. Nearly all of the code here
+is upstream's. The public Rust API is upstream's, so migrating is the
+dependency line plus `crc_fast::` → `crc_turbo::`:
+
+```toml
+crc-turbo = "1.11"
+```
+
+What differs is recorded in the `## Fork` section of the
+[CHANGELOG](CHANGELOG.md): the security and hygiene fixes that were waiting on
+upstream, an AVX2 + VPCLMULQDQ tier for x86_64 CPUs that have 256-bit
+carry-less multiply but no AVX-512, and the C library's symbols, which are
+`crc_turbo_*` so that `crc-fast` and `crc-turbo` can be linked into one binary.
+
+The rest of this document is upstream's, adapted to the new name.
+
+## crc-fast's introduction
 
 World's fastest generic CRC calculator for
 [all known CRC-16, CRC-32, and CRC-64 variants](https://reveng.sourceforge.io/crc-catalogue/all.htm), as well as bring-your-own
@@ -26,11 +47,11 @@ So I wrote one. :)
 
 Supplies a [C/C++ compatible library](#cc-compatible-library) for use with other non-`Rust` languages.
 
-## Implementations
+## Implementations using upstream crc-fast
 
 * [AWS SDK for Rust](https://awslabs.github.io/aws-sdk-rust/) via
   the [aws-smithy-checksums](https://crates.io/crates/aws-smithy-checksums) crate.
-* [crc-fast-php-ext](https://github.com/awesomized/crc-fast-php-ext) `PHP` extension using this library.
+* [crc-fast-php-ext](https://github.com/awesomized/crc-fast-php-ext) `PHP` extension using upstream's library.
 
 ## Changes
 
@@ -116,7 +137,7 @@ Tested on `wasm32-unknown-unknown`, `wasm32-wasip1`, and `wasm32-wasip2` targets
 
 ## Usage
 
-Add `crc-fast = "1"` to your `Cargo.toml` dependencies, which will enable every available optimization for
+Add `crc-turbo = "1.11"` to your `Cargo.toml` dependencies, which will enable every available optimization for
 the `stable` toolchain.
 
 ### Fast helper functions
@@ -130,7 +151,7 @@ performance faster, particularly for smaller input sizes, since it reduces some 
 Also commonly known as `crc32c` in many, but not all, implementations.
 
 ```rust
-use crc_fast::crc32_iscsi;
+use crc_turbo::crc32_iscsi;
 
 let checksum = crc32_iscsi(b"123456789");
 
@@ -142,7 +163,7 @@ assert_eq!(checksum, 0xe3069283);
 Also commonly known as `crc32` in many, but not all, implementations.
 
 ```rust
-use crc_fast::crc32_iso_hdlc;
+use crc_turbo::crc32_iso_hdlc;
 
 let checksum = crc32_iso_hdlc(b"123456789");
 
@@ -152,7 +173,7 @@ assert_eq!(checksum, 0xcbf43926);
 #### CRC-64/NVME
 
 ```rust
-use crc_fast::crc64_nvme;
+use crc_turbo::crc64_nvme;
 
 let checksum = crc64_nvme(b"123456789");
 
@@ -168,7 +189,7 @@ Creates a `Digest` which can be updated over time, for stream processing, interm
 finalizing the checksum once processing is complete.
 
  ```rust
- use crc_fast::{Digest, CrcAlgorithm::Crc32IsoHdlc};
+ use crc_turbo::{Digest, CrcAlgorithm::Crc32IsoHdlc};
 
 let mut digest = Digest::new(Crc32IsoHdlc);
 digest.update(b"1234");
@@ -186,7 +207,7 @@ easier integration with existing Rust code.
  ```rust
 use std::env;
 use std::fs::File;
-use crc_fast::{Digest, CrcAlgorithm::Crc32IsoHdlc};
+use crc_turbo::{Digest, CrcAlgorithm::Crc32IsoHdlc};
 
 // for example/test purposes only, use your own file path
 let binding = env::current_dir().expect("missing working dir").join("crc-check.txt");
@@ -206,7 +227,7 @@ assert_eq!(checksum, 0xcbf43926);
 Checksums a string.
 
 ```rust
- use crc_fast::{checksum, CrcAlgorithm::Crc32IsoHdlc};
+ use crc_turbo::{checksum, CrcAlgorithm::Crc32IsoHdlc};
 
 let checksum = checksum(Crc32IsoHdlc, b"123456789");
 
@@ -218,7 +239,7 @@ assert_eq!(checksum, 0xcbf43926);
 Combines checksums from two different sources, which can be useful for distributed or multithreaded workloads, etc.
 
 ```rust
- use crc_fast::{checksum, checksum_combine, CrcAlgorithm::Crc32IsoHdlc};
+ use crc_turbo::{checksum, checksum_combine, CrcAlgorithm::Crc32IsoHdlc};
 
 let checksum_1 = checksum(Crc32IsoHdlc, b"1234");
 let checksum_2 = checksum(Crc32IsoHdlc, b"56789");
@@ -233,7 +254,7 @@ Checksums a file, which will chunk through the file optimally, limiting RAM usag
 is optional.
 
 ```rust
- use crc_fast::{checksum_file, CrcAlgorithm::Crc32IsoHdlc};
+ use crc_turbo::{checksum_file, CrcAlgorithm::Crc32IsoHdlc};
 
 // for example/test purposes only, use your own file path
 let binding = env::current_dir().expect("missing working dir").join("crc-check.txt");
@@ -254,7 +275,7 @@ parameters and use the `*_with_params` functions.
 Creates a `Digest` with custom CRC parameters for stream processing.
 
 ```rust
-use crc_fast::{Digest, CrcParams};
+use crc_turbo::{Digest, CrcParams};
 
 // Define custom CRC-32 parameters (equivalent to CRC-32/ISO-HDLC)
 let custom_params = CrcParams::new(
@@ -279,7 +300,7 @@ assert_eq!(checksum, 0xcbf43926);
 Checksums data using custom CRC parameters.
 
 ```rust
-use crc_fast::{checksum_with_params, CrcParams};
+use crc_turbo::{checksum_with_params, CrcParams};
 
 // Define custom CRC-32 parameters (equivalent to CRC-32/ISO-HDLC)
 let custom_params = CrcParams::new(
@@ -302,7 +323,7 @@ assert_eq!(checksum, 0xcbf43926);
 Combines checksums from two different sources using custom CRC parameters.
 
 ```rust
-use crc_fast::{checksum_with_params, checksum_combine_with_params, CrcParams};
+use crc_turbo::{checksum_with_params, checksum_combine_with_params, CrcParams};
 
 // Define custom CRC-32 parameters (equivalent to CRC-32/ISO-HDLC)
 let custom_params = CrcParams::new(
@@ -328,7 +349,7 @@ Checksums a file using custom CRC parameters, chunking through the file optimall
 
 ```rust
 use std::env;
-use crc_fast::{checksum_file_with_params, CrcParams};
+use crc_turbo::{checksum_file_with_params, CrcParams};
 
 // for example/test purposes only, use your own file path
 let binding = env::current_dir().expect("missing working dir").join("crc-check.txt");
@@ -353,12 +374,12 @@ assert_eq!(checksum.unwrap(), 0xcbf43926);
 ## C/C++ compatible library
 
 `cargo build` will produce a shared library target (`.so` on Linux, `.dll` on Windows, `.dylib` on macOS, etc) and an
-auto-generated [libcrc_fast.h](libcrc_fast.h) header file for use in non-Rust projects, such as through
+auto-generated [libcrc_turbo.h](libcrc_turbo.h) header file for use in non-Rust projects, such as through
 [FFI](https://en.wikipedia.org/wiki/Foreign_function_interface). It will also produce a static library target (`.a` on
 Linux and macOS, `.lib` on Windows, etc) for projects
 which prefer statically linking.
 
-There is a [crc-fast PHP extension](https://github.com/awesomized/crc-fast-php-ext) using it, for example.
+Upstream's [crc-fast PHP extension](https://github.com/awesomized/crc-fast-php-ext) is an example of a consumer of that library (it links `crc-fast`'s, whose symbols are `crc_fast_*` rather than `crc_turbo_*`).
 
 ## Background
 
@@ -582,7 +603,7 @@ To help ensure memory safety and stability, this crate is validated using [Miri]
 
 ## License
 
-`cfc-fast` is dual-licensed under
+`crc-turbo`, like `crc-fast` before it, is dual-licensed under
 
 * Apache 2.0 license ([LICENSE-Apache](./LICENSE-Apache) or <http://www.apache.org/licenses/LICENSE-2.0>)
 * MIT license ([LICENSE-MIT](./LICENSE-MIT) or <https://opensource.org/licenses/MIT>)

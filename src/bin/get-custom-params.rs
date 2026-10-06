@@ -169,7 +169,7 @@ fn main() -> ExitCode {
 
     let static_name: &'static str = Box::leak(config.name.unwrap().into_boxed_str());
 
-    let params = crc_fast::CrcParams::new(
+    let params = crc_turbo::CrcParams::new(
         static_name,
         config.width.unwrap() as u8,
         config.polynomial.unwrap(),

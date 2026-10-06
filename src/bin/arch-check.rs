@@ -8,8 +8,8 @@ use std::arch::is_aarch64_feature_detected;
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 use std::arch::is_x86_feature_detected;
 
-use crc_fast::get_calculator_target;
-use crc_fast::CrcAlgorithm::{Crc32Iscsi, Crc32IsoHdlc, Crc64Nvme};
+use crc_turbo::get_calculator_target;
+use crc_turbo::CrcAlgorithm::{Crc32Iscsi, Crc32IsoHdlc, Crc64Nvme};
 
 fn main() {
     // Check the target architecture and call the appropriate function

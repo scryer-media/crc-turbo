@@ -25,7 +25,7 @@ static STRING_CACHE: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
 /// Error codes for FFI operations
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CrcFastError {
+pub enum CrcTurboError {
     /// Operation completed successfully
     Success = 0,
     /// Lock was poisoned (thread panicked while holding lock)
@@ -44,35 +44,35 @@ pub enum CrcFastError {
     StringConversionError = 7,
 }
 
-impl CrcFastError {
+impl CrcTurboError {
     /// Returns a static string describing the error
     fn message(&self) -> &'static str {
         match self {
-            CrcFastError::Success => "Operation completed successfully",
-            CrcFastError::LockPoisoned => "Lock was poisoned (thread panicked while holding lock)",
-            CrcFastError::NullPointer => "Null pointer was passed where non-null required",
-            CrcFastError::InvalidKeyCount => "Invalid key count for CRC parameters",
-            CrcFastError::UnsupportedWidth => "Unsupported CRC width (must be 32 or 64)",
-            CrcFastError::InvalidUtf8 => "Invalid UTF-8 string",
-            CrcFastError::IoError => "File I/O error",
-            CrcFastError::StringConversionError => "Internal string conversion error",
+            CrcTurboError::Success => "Operation completed successfully",
+            CrcTurboError::LockPoisoned => "Lock was poisoned (thread panicked while holding lock)",
+            CrcTurboError::NullPointer => "Null pointer was passed where non-null required",
+            CrcTurboError::InvalidKeyCount => "Invalid key count for CRC parameters",
+            CrcTurboError::UnsupportedWidth => "Unsupported CRC width (must be 32 or 64)",
+            CrcTurboError::InvalidUtf8 => "Invalid UTF-8 string",
+            CrcTurboError::IoError => "File I/O error",
+            CrcTurboError::StringConversionError => "Internal string conversion error",
         }
     }
 }
 
 // Thread-local storage for the last error that occurred
 thread_local! {
-    static LAST_ERROR: std::cell::Cell<CrcFastError> = const { std::cell::Cell::new(CrcFastError::Success) };
+    static LAST_ERROR: std::cell::Cell<CrcTurboError> = const { std::cell::Cell::new(CrcTurboError::Success) };
 }
 
 /// Sets the thread-local last error
-fn set_last_error(error: CrcFastError) {
+fn set_last_error(error: CrcTurboError) {
     LAST_ERROR.with(|e| e.set(error));
 }
 
 /// Clears the thread-local last error (sets it to Success)
 fn clear_last_error() {
-    LAST_ERROR.with(|e| e.set(CrcFastError::Success));
+    LAST_ERROR.with(|e| e.set(CrcTurboError::Success));
 }
 
 // Global storage for stable key pointers to ensure they remain valid across FFI boundary
@@ -81,7 +81,7 @@ static STABLE_KEY_STORAGE: OnceLock<Mutex<HashMap<u64, Box<[u64]>>>> = OnceLock:
 /// Creates a stable pointer to the keys for FFI usage.
 /// The keys are stored in global memory to ensure the pointer remains valid.
 /// Returns (pointer, count) on success, or (null, 0) on error.
-/// Sets CrcFastError::LockPoisoned on lock failure.
+/// Sets CrcTurboError::LockPoisoned on lock failure.
 fn create_stable_key_pointer(keys: &crate::CrcKeysStorage) -> (*const u64, u32) {
     let storage = STABLE_KEY_STORAGE.get_or_init(|| Mutex::new(HashMap::new()));
 
@@ -104,7 +104,7 @@ fn create_stable_key_pointer(keys: &crate::CrcKeysStorage) -> (*const u64, u32) 
     let mut storage_map = match storage.lock() {
         Ok(guard) => guard,
         Err(_) => {
-            set_last_error(CrcFastError::LockPoisoned);
+            set_last_error(CrcTurboError::LockPoisoned);
             return (std::ptr::null(), 0);
         }
     };
@@ -132,12 +132,12 @@ fn create_stable_key_pointer(keys: &crate::CrcKeysStorage) -> (*const u64, u32) 
 
 /// A handle to the Digest object
 #[repr(C)]
-pub struct CrcFastDigestHandle(*mut Digest);
+pub struct CrcTurboDigestHandle(*mut Digest);
 
 /// The supported CRC algorithms
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub enum CrcFastAlgorithm {
+pub enum CrcTurboAlgorithm {
     // CrcCustom works with any supported widths (16, 32, 64)
     CrcCustom,
     Crc16Arc,
@@ -196,83 +196,83 @@ pub enum CrcFastAlgorithm {
 
 // Convert from FFI enum to internal enum
 #[allow(deprecated)]
-impl From<CrcFastAlgorithm> for CrcAlgorithm {
-    fn from(value: CrcFastAlgorithm) -> Self {
+impl From<CrcTurboAlgorithm> for CrcAlgorithm {
+    fn from(value: CrcTurboAlgorithm) -> Self {
         match value {
-            CrcFastAlgorithm::Crc16Arc => CrcAlgorithm::Crc16Arc,
-            CrcFastAlgorithm::Crc16Cdma2000 => CrcAlgorithm::Crc16Cdma2000,
-            CrcFastAlgorithm::Crc16Cms => CrcAlgorithm::Crc16Cms,
-            CrcFastAlgorithm::Crc16Dds110 => CrcAlgorithm::Crc16Dds110,
-            CrcFastAlgorithm::Crc16DectR => CrcAlgorithm::Crc16DectR,
-            CrcFastAlgorithm::Crc16DectX => CrcAlgorithm::Crc16DectX,
-            CrcFastAlgorithm::Crc16Dnp => CrcAlgorithm::Crc16Dnp,
-            CrcFastAlgorithm::Crc16En13757 => CrcAlgorithm::Crc16En13757,
-            CrcFastAlgorithm::Crc16Genibus => CrcAlgorithm::Crc16Genibus,
-            CrcFastAlgorithm::Crc16Gsm => CrcAlgorithm::Crc16Gsm,
-            CrcFastAlgorithm::Crc16Ibm3740 => CrcAlgorithm::Crc16Ibm3740,
-            CrcFastAlgorithm::Crc16IbmSdlc => CrcAlgorithm::Crc16IbmSdlc,
-            CrcFastAlgorithm::Crc16IsoIec144433A => CrcAlgorithm::Crc16IsoIec144433A,
-            CrcFastAlgorithm::Crc16Kermit => CrcAlgorithm::Crc16Kermit,
-            CrcFastAlgorithm::Crc16Lj1200 => CrcAlgorithm::Crc16Lj1200,
-            CrcFastAlgorithm::Crc16M17 => CrcAlgorithm::Crc16M17,
-            CrcFastAlgorithm::Crc16MaximDow => CrcAlgorithm::Crc16MaximDow,
-            CrcFastAlgorithm::Crc16Mcrf4xx => CrcAlgorithm::Crc16Mcrf4xx,
-            CrcFastAlgorithm::Crc16Modbus => CrcAlgorithm::Crc16Modbus,
-            CrcFastAlgorithm::Crc16Nrsc5 => CrcAlgorithm::Crc16Nrsc5,
-            CrcFastAlgorithm::Crc16OpensafetyA => CrcAlgorithm::Crc16OpensafetyA,
-            CrcFastAlgorithm::Crc16OpensafetyB => CrcAlgorithm::Crc16OpensafetyB,
-            CrcFastAlgorithm::Crc16Profibus => CrcAlgorithm::Crc16Profibus,
-            CrcFastAlgorithm::Crc16Riello => CrcAlgorithm::Crc16Riello,
-            CrcFastAlgorithm::Crc16SpiFujitsu => CrcAlgorithm::Crc16SpiFujitsu,
-            CrcFastAlgorithm::Crc16T10Dif => CrcAlgorithm::Crc16T10Dif,
-            CrcFastAlgorithm::Crc16Teledisk => CrcAlgorithm::Crc16Teledisk,
-            CrcFastAlgorithm::Crc16Tms37157 => CrcAlgorithm::Crc16Tms37157,
-            CrcFastAlgorithm::Crc16Umts => CrcAlgorithm::Crc16Umts,
-            CrcFastAlgorithm::Crc16Usb => CrcAlgorithm::Crc16Usb,
-            CrcFastAlgorithm::Crc16Xmodem => CrcAlgorithm::Crc16Xmodem,
-            CrcFastAlgorithm::Crc32Aixm => CrcAlgorithm::Crc32Aixm,
-            CrcFastAlgorithm::Crc32Autosar => CrcAlgorithm::Crc32Autosar,
-            CrcFastAlgorithm::Crc32Base91D => CrcAlgorithm::Crc32Base91D,
-            CrcFastAlgorithm::Crc32Bzip2 => CrcAlgorithm::Crc32Bzip2,
-            CrcFastAlgorithm::Crc32CdRomEdc => CrcAlgorithm::Crc32CdRomEdc,
-            CrcFastAlgorithm::Crc32Cksum => CrcAlgorithm::Crc32Cksum,
-            CrcFastAlgorithm::Crc32Custom => CrcAlgorithm::Crc32Custom,
-            CrcFastAlgorithm::Crc32Iscsi => CrcAlgorithm::Crc32Iscsi,
-            CrcFastAlgorithm::Crc32IsoHdlc => CrcAlgorithm::Crc32IsoHdlc,
-            CrcFastAlgorithm::Crc32Jamcrc => CrcAlgorithm::Crc32Jamcrc,
-            CrcFastAlgorithm::Crc32Mef => CrcAlgorithm::Crc32Mef,
-            CrcFastAlgorithm::Crc32Mpeg2 => CrcAlgorithm::Crc32Mpeg2,
-            CrcFastAlgorithm::Crc32Xfer => CrcAlgorithm::Crc32Xfer,
-            CrcFastAlgorithm::CrcCustom => CrcAlgorithm::CrcCustom,
-            CrcFastAlgorithm::Crc64Custom => CrcAlgorithm::Crc64Custom,
-            CrcFastAlgorithm::Crc64Ecma182 => CrcAlgorithm::Crc64Ecma182,
-            CrcFastAlgorithm::Crc64GoIso => CrcAlgorithm::Crc64GoIso,
-            CrcFastAlgorithm::Crc64Ms => CrcAlgorithm::Crc64Ms,
-            CrcFastAlgorithm::Crc64Nvme => CrcAlgorithm::Crc64Nvme,
-            CrcFastAlgorithm::Crc64Redis => CrcAlgorithm::Crc64Redis,
-            CrcFastAlgorithm::Crc64We => CrcAlgorithm::Crc64We,
-            CrcFastAlgorithm::Crc64Xz => CrcAlgorithm::Crc64Xz,
+            CrcTurboAlgorithm::Crc16Arc => CrcAlgorithm::Crc16Arc,
+            CrcTurboAlgorithm::Crc16Cdma2000 => CrcAlgorithm::Crc16Cdma2000,
+            CrcTurboAlgorithm::Crc16Cms => CrcAlgorithm::Crc16Cms,
+            CrcTurboAlgorithm::Crc16Dds110 => CrcAlgorithm::Crc16Dds110,
+            CrcTurboAlgorithm::Crc16DectR => CrcAlgorithm::Crc16DectR,
+            CrcTurboAlgorithm::Crc16DectX => CrcAlgorithm::Crc16DectX,
+            CrcTurboAlgorithm::Crc16Dnp => CrcAlgorithm::Crc16Dnp,
+            CrcTurboAlgorithm::Crc16En13757 => CrcAlgorithm::Crc16En13757,
+            CrcTurboAlgorithm::Crc16Genibus => CrcAlgorithm::Crc16Genibus,
+            CrcTurboAlgorithm::Crc16Gsm => CrcAlgorithm::Crc16Gsm,
+            CrcTurboAlgorithm::Crc16Ibm3740 => CrcAlgorithm::Crc16Ibm3740,
+            CrcTurboAlgorithm::Crc16IbmSdlc => CrcAlgorithm::Crc16IbmSdlc,
+            CrcTurboAlgorithm::Crc16IsoIec144433A => CrcAlgorithm::Crc16IsoIec144433A,
+            CrcTurboAlgorithm::Crc16Kermit => CrcAlgorithm::Crc16Kermit,
+            CrcTurboAlgorithm::Crc16Lj1200 => CrcAlgorithm::Crc16Lj1200,
+            CrcTurboAlgorithm::Crc16M17 => CrcAlgorithm::Crc16M17,
+            CrcTurboAlgorithm::Crc16MaximDow => CrcAlgorithm::Crc16MaximDow,
+            CrcTurboAlgorithm::Crc16Mcrf4xx => CrcAlgorithm::Crc16Mcrf4xx,
+            CrcTurboAlgorithm::Crc16Modbus => CrcAlgorithm::Crc16Modbus,
+            CrcTurboAlgorithm::Crc16Nrsc5 => CrcAlgorithm::Crc16Nrsc5,
+            CrcTurboAlgorithm::Crc16OpensafetyA => CrcAlgorithm::Crc16OpensafetyA,
+            CrcTurboAlgorithm::Crc16OpensafetyB => CrcAlgorithm::Crc16OpensafetyB,
+            CrcTurboAlgorithm::Crc16Profibus => CrcAlgorithm::Crc16Profibus,
+            CrcTurboAlgorithm::Crc16Riello => CrcAlgorithm::Crc16Riello,
+            CrcTurboAlgorithm::Crc16SpiFujitsu => CrcAlgorithm::Crc16SpiFujitsu,
+            CrcTurboAlgorithm::Crc16T10Dif => CrcAlgorithm::Crc16T10Dif,
+            CrcTurboAlgorithm::Crc16Teledisk => CrcAlgorithm::Crc16Teledisk,
+            CrcTurboAlgorithm::Crc16Tms37157 => CrcAlgorithm::Crc16Tms37157,
+            CrcTurboAlgorithm::Crc16Umts => CrcAlgorithm::Crc16Umts,
+            CrcTurboAlgorithm::Crc16Usb => CrcAlgorithm::Crc16Usb,
+            CrcTurboAlgorithm::Crc16Xmodem => CrcAlgorithm::Crc16Xmodem,
+            CrcTurboAlgorithm::Crc32Aixm => CrcAlgorithm::Crc32Aixm,
+            CrcTurboAlgorithm::Crc32Autosar => CrcAlgorithm::Crc32Autosar,
+            CrcTurboAlgorithm::Crc32Base91D => CrcAlgorithm::Crc32Base91D,
+            CrcTurboAlgorithm::Crc32Bzip2 => CrcAlgorithm::Crc32Bzip2,
+            CrcTurboAlgorithm::Crc32CdRomEdc => CrcAlgorithm::Crc32CdRomEdc,
+            CrcTurboAlgorithm::Crc32Cksum => CrcAlgorithm::Crc32Cksum,
+            CrcTurboAlgorithm::Crc32Custom => CrcAlgorithm::Crc32Custom,
+            CrcTurboAlgorithm::Crc32Iscsi => CrcAlgorithm::Crc32Iscsi,
+            CrcTurboAlgorithm::Crc32IsoHdlc => CrcAlgorithm::Crc32IsoHdlc,
+            CrcTurboAlgorithm::Crc32Jamcrc => CrcAlgorithm::Crc32Jamcrc,
+            CrcTurboAlgorithm::Crc32Mef => CrcAlgorithm::Crc32Mef,
+            CrcTurboAlgorithm::Crc32Mpeg2 => CrcAlgorithm::Crc32Mpeg2,
+            CrcTurboAlgorithm::Crc32Xfer => CrcAlgorithm::Crc32Xfer,
+            CrcTurboAlgorithm::CrcCustom => CrcAlgorithm::CrcCustom,
+            CrcTurboAlgorithm::Crc64Custom => CrcAlgorithm::Crc64Custom,
+            CrcTurboAlgorithm::Crc64Ecma182 => CrcAlgorithm::Crc64Ecma182,
+            CrcTurboAlgorithm::Crc64GoIso => CrcAlgorithm::Crc64GoIso,
+            CrcTurboAlgorithm::Crc64Ms => CrcAlgorithm::Crc64Ms,
+            CrcTurboAlgorithm::Crc64Nvme => CrcAlgorithm::Crc64Nvme,
+            CrcTurboAlgorithm::Crc64Redis => CrcAlgorithm::Crc64Redis,
+            CrcTurboAlgorithm::Crc64We => CrcAlgorithm::Crc64We,
+            CrcTurboAlgorithm::Crc64Xz => CrcAlgorithm::Crc64Xz,
         }
     }
 }
 
 /// Gets the last error that occurred in the current thread
-/// Returns CrcFastError::Success if no error has occurred
+/// Returns CrcTurboError::Success if no error has occurred
 #[no_mangle]
-pub extern "C" fn crc_fast_get_last_error() -> CrcFastError {
+pub extern "C" fn crc_turbo_get_last_error() -> CrcTurboError {
     LAST_ERROR.with(|e| e.get())
 }
 
 /// Clears the last error for the current thread
 #[no_mangle]
-pub extern "C" fn crc_fast_clear_error() {
+pub extern "C" fn crc_turbo_clear_error() {
     clear_last_error();
 }
 
 /// Gets a human-readable error message for the given error code
 /// Returns a pointer to a static string (do not free)
 #[no_mangle]
-pub extern "C" fn crc_fast_error_message(error: CrcFastError) -> *const c_char {
+pub extern "C" fn crc_turbo_error_message(error: CrcTurboError) -> *const c_char {
     let message = error.message();
     // These are static strings, so we can safely return them as C strings
     // The strings are guaranteed to be valid UTF-8 and null-terminated
@@ -288,8 +288,8 @@ pub extern "C" fn crc_fast_error_message(error: CrcFastError) -> *const c_char {
 
 /// Custom CRC parameters
 #[repr(C)]
-pub struct CrcFastParams {
-    pub algorithm: CrcFastAlgorithm,
+pub struct CrcTurboParams {
+    pub algorithm: CrcTurboAlgorithm,
     pub width: u8,
     pub poly: u64,
     pub init: u64,
@@ -303,7 +303,7 @@ pub struct CrcFastParams {
 
 /// Fallible conversion from FFI struct to internal struct
 /// Returns None if the parameters are invalid (unsupported key count)
-fn try_params_from_ffi(value: &CrcFastParams) -> Option<CrcParams> {
+fn try_params_from_ffi(value: &CrcTurboParams) -> Option<CrcParams> {
     // Validate key pointer
     if value.keys.is_null() {
         return None;
@@ -348,8 +348,8 @@ fn try_params_from_ffi(value: &CrcFastParams) -> Option<CrcParams> {
 
 // Convert from FFI struct to internal struct (legacy, may panic)
 // For backwards compatibility, but prefer try_params_from_ffi
-impl From<CrcFastParams> for CrcParams {
-    fn from(value: CrcFastParams) -> Self {
+impl From<CrcTurboParams> for CrcParams {
+    fn from(value: CrcTurboParams) -> Self {
         try_params_from_ffi(&value)
             .expect("Invalid CRC parameters: unsupported key count or null pointer")
     }
@@ -357,66 +357,66 @@ impl From<CrcFastParams> for CrcParams {
 
 // Convert from internal struct to FFI struct
 #[allow(deprecated)]
-impl From<CrcParams> for CrcFastParams {
+impl From<CrcParams> for CrcTurboParams {
     fn from(params: CrcParams) -> Self {
         // Create stable key pointer for FFI usage
         let (keys_ptr, key_count) = create_stable_key_pointer(&params.keys);
 
-        CrcFastParams {
+        CrcTurboParams {
             algorithm: match params.algorithm {
-                CrcAlgorithm::Crc16Arc => CrcFastAlgorithm::Crc16Arc,
-                CrcAlgorithm::Crc16Cdma2000 => CrcFastAlgorithm::Crc16Cdma2000,
-                CrcAlgorithm::Crc16Cms => CrcFastAlgorithm::Crc16Cms,
-                CrcAlgorithm::Crc16Dds110 => CrcFastAlgorithm::Crc16Dds110,
-                CrcAlgorithm::Crc16DectR => CrcFastAlgorithm::Crc16DectR,
-                CrcAlgorithm::Crc16DectX => CrcFastAlgorithm::Crc16DectX,
-                CrcAlgorithm::Crc16Dnp => CrcFastAlgorithm::Crc16Dnp,
-                CrcAlgorithm::Crc16En13757 => CrcFastAlgorithm::Crc16En13757,
-                CrcAlgorithm::Crc16Genibus => CrcFastAlgorithm::Crc16Genibus,
-                CrcAlgorithm::Crc16Gsm => CrcFastAlgorithm::Crc16Gsm,
-                CrcAlgorithm::Crc16Ibm3740 => CrcFastAlgorithm::Crc16Ibm3740,
-                CrcAlgorithm::Crc16IbmSdlc => CrcFastAlgorithm::Crc16IbmSdlc,
-                CrcAlgorithm::Crc16IsoIec144433A => CrcFastAlgorithm::Crc16IsoIec144433A,
-                CrcAlgorithm::Crc16Kermit => CrcFastAlgorithm::Crc16Kermit,
-                CrcAlgorithm::Crc16Lj1200 => CrcFastAlgorithm::Crc16Lj1200,
-                CrcAlgorithm::Crc16M17 => CrcFastAlgorithm::Crc16M17,
-                CrcAlgorithm::Crc16MaximDow => CrcFastAlgorithm::Crc16MaximDow,
-                CrcAlgorithm::Crc16Mcrf4xx => CrcFastAlgorithm::Crc16Mcrf4xx,
-                CrcAlgorithm::Crc16Modbus => CrcFastAlgorithm::Crc16Modbus,
-                CrcAlgorithm::Crc16Nrsc5 => CrcFastAlgorithm::Crc16Nrsc5,
-                CrcAlgorithm::Crc16OpensafetyA => CrcFastAlgorithm::Crc16OpensafetyA,
-                CrcAlgorithm::Crc16OpensafetyB => CrcFastAlgorithm::Crc16OpensafetyB,
-                CrcAlgorithm::Crc16Profibus => CrcFastAlgorithm::Crc16Profibus,
-                CrcAlgorithm::Crc16Riello => CrcFastAlgorithm::Crc16Riello,
-                CrcAlgorithm::Crc16SpiFujitsu => CrcFastAlgorithm::Crc16SpiFujitsu,
-                CrcAlgorithm::Crc16T10Dif => CrcFastAlgorithm::Crc16T10Dif,
-                CrcAlgorithm::Crc16Teledisk => CrcFastAlgorithm::Crc16Teledisk,
-                CrcAlgorithm::Crc16Tms37157 => CrcFastAlgorithm::Crc16Tms37157,
-                CrcAlgorithm::Crc16Umts => CrcFastAlgorithm::Crc16Umts,
-                CrcAlgorithm::Crc16Usb => CrcFastAlgorithm::Crc16Usb,
-                CrcAlgorithm::Crc16Xmodem => CrcFastAlgorithm::Crc16Xmodem,
-                CrcAlgorithm::Crc32Aixm => CrcFastAlgorithm::Crc32Aixm,
-                CrcAlgorithm::Crc32Autosar => CrcFastAlgorithm::Crc32Autosar,
-                CrcAlgorithm::Crc32Base91D => CrcFastAlgorithm::Crc32Base91D,
-                CrcAlgorithm::Crc32Bzip2 => CrcFastAlgorithm::Crc32Bzip2,
-                CrcAlgorithm::Crc32CdRomEdc => CrcFastAlgorithm::Crc32CdRomEdc,
-                CrcAlgorithm::Crc32Cksum => CrcFastAlgorithm::Crc32Cksum,
-                CrcAlgorithm::Crc32Custom => CrcFastAlgorithm::Crc32Custom,
-                CrcAlgorithm::Crc32Iscsi => CrcFastAlgorithm::Crc32Iscsi,
-                CrcAlgorithm::Crc32IsoHdlc => CrcFastAlgorithm::Crc32IsoHdlc,
-                CrcAlgorithm::Crc32Jamcrc => CrcFastAlgorithm::Crc32Jamcrc,
-                CrcAlgorithm::Crc32Mef => CrcFastAlgorithm::Crc32Mef,
-                CrcAlgorithm::Crc32Mpeg2 => CrcFastAlgorithm::Crc32Mpeg2,
-                CrcAlgorithm::Crc32Xfer => CrcFastAlgorithm::Crc32Xfer,
-                CrcAlgorithm::CrcCustom => CrcFastAlgorithm::CrcCustom,
-                CrcAlgorithm::Crc64Custom => CrcFastAlgorithm::Crc64Custom,
-                CrcAlgorithm::Crc64Ecma182 => CrcFastAlgorithm::Crc64Ecma182,
-                CrcAlgorithm::Crc64GoIso => CrcFastAlgorithm::Crc64GoIso,
-                CrcAlgorithm::Crc64Ms => CrcFastAlgorithm::Crc64Ms,
-                CrcAlgorithm::Crc64Nvme => CrcFastAlgorithm::Crc64Nvme,
-                CrcAlgorithm::Crc64Redis => CrcFastAlgorithm::Crc64Redis,
-                CrcAlgorithm::Crc64We => CrcFastAlgorithm::Crc64We,
-                CrcAlgorithm::Crc64Xz => CrcFastAlgorithm::Crc64Xz,
+                CrcAlgorithm::Crc16Arc => CrcTurboAlgorithm::Crc16Arc,
+                CrcAlgorithm::Crc16Cdma2000 => CrcTurboAlgorithm::Crc16Cdma2000,
+                CrcAlgorithm::Crc16Cms => CrcTurboAlgorithm::Crc16Cms,
+                CrcAlgorithm::Crc16Dds110 => CrcTurboAlgorithm::Crc16Dds110,
+                CrcAlgorithm::Crc16DectR => CrcTurboAlgorithm::Crc16DectR,
+                CrcAlgorithm::Crc16DectX => CrcTurboAlgorithm::Crc16DectX,
+                CrcAlgorithm::Crc16Dnp => CrcTurboAlgorithm::Crc16Dnp,
+                CrcAlgorithm::Crc16En13757 => CrcTurboAlgorithm::Crc16En13757,
+                CrcAlgorithm::Crc16Genibus => CrcTurboAlgorithm::Crc16Genibus,
+                CrcAlgorithm::Crc16Gsm => CrcTurboAlgorithm::Crc16Gsm,
+                CrcAlgorithm::Crc16Ibm3740 => CrcTurboAlgorithm::Crc16Ibm3740,
+                CrcAlgorithm::Crc16IbmSdlc => CrcTurboAlgorithm::Crc16IbmSdlc,
+                CrcAlgorithm::Crc16IsoIec144433A => CrcTurboAlgorithm::Crc16IsoIec144433A,
+                CrcAlgorithm::Crc16Kermit => CrcTurboAlgorithm::Crc16Kermit,
+                CrcAlgorithm::Crc16Lj1200 => CrcTurboAlgorithm::Crc16Lj1200,
+                CrcAlgorithm::Crc16M17 => CrcTurboAlgorithm::Crc16M17,
+                CrcAlgorithm::Crc16MaximDow => CrcTurboAlgorithm::Crc16MaximDow,
+                CrcAlgorithm::Crc16Mcrf4xx => CrcTurboAlgorithm::Crc16Mcrf4xx,
+                CrcAlgorithm::Crc16Modbus => CrcTurboAlgorithm::Crc16Modbus,
+                CrcAlgorithm::Crc16Nrsc5 => CrcTurboAlgorithm::Crc16Nrsc5,
+                CrcAlgorithm::Crc16OpensafetyA => CrcTurboAlgorithm::Crc16OpensafetyA,
+                CrcAlgorithm::Crc16OpensafetyB => CrcTurboAlgorithm::Crc16OpensafetyB,
+                CrcAlgorithm::Crc16Profibus => CrcTurboAlgorithm::Crc16Profibus,
+                CrcAlgorithm::Crc16Riello => CrcTurboAlgorithm::Crc16Riello,
+                CrcAlgorithm::Crc16SpiFujitsu => CrcTurboAlgorithm::Crc16SpiFujitsu,
+                CrcAlgorithm::Crc16T10Dif => CrcTurboAlgorithm::Crc16T10Dif,
+                CrcAlgorithm::Crc16Teledisk => CrcTurboAlgorithm::Crc16Teledisk,
+                CrcAlgorithm::Crc16Tms37157 => CrcTurboAlgorithm::Crc16Tms37157,
+                CrcAlgorithm::Crc16Umts => CrcTurboAlgorithm::Crc16Umts,
+                CrcAlgorithm::Crc16Usb => CrcTurboAlgorithm::Crc16Usb,
+                CrcAlgorithm::Crc16Xmodem => CrcTurboAlgorithm::Crc16Xmodem,
+                CrcAlgorithm::Crc32Aixm => CrcTurboAlgorithm::Crc32Aixm,
+                CrcAlgorithm::Crc32Autosar => CrcTurboAlgorithm::Crc32Autosar,
+                CrcAlgorithm::Crc32Base91D => CrcTurboAlgorithm::Crc32Base91D,
+                CrcAlgorithm::Crc32Bzip2 => CrcTurboAlgorithm::Crc32Bzip2,
+                CrcAlgorithm::Crc32CdRomEdc => CrcTurboAlgorithm::Crc32CdRomEdc,
+                CrcAlgorithm::Crc32Cksum => CrcTurboAlgorithm::Crc32Cksum,
+                CrcAlgorithm::Crc32Custom => CrcTurboAlgorithm::Crc32Custom,
+                CrcAlgorithm::Crc32Iscsi => CrcTurboAlgorithm::Crc32Iscsi,
+                CrcAlgorithm::Crc32IsoHdlc => CrcTurboAlgorithm::Crc32IsoHdlc,
+                CrcAlgorithm::Crc32Jamcrc => CrcTurboAlgorithm::Crc32Jamcrc,
+                CrcAlgorithm::Crc32Mef => CrcTurboAlgorithm::Crc32Mef,
+                CrcAlgorithm::Crc32Mpeg2 => CrcTurboAlgorithm::Crc32Mpeg2,
+                CrcAlgorithm::Crc32Xfer => CrcTurboAlgorithm::Crc32Xfer,
+                CrcAlgorithm::CrcCustom => CrcTurboAlgorithm::CrcCustom,
+                CrcAlgorithm::Crc64Custom => CrcTurboAlgorithm::Crc64Custom,
+                CrcAlgorithm::Crc64Ecma182 => CrcTurboAlgorithm::Crc64Ecma182,
+                CrcAlgorithm::Crc64GoIso => CrcTurboAlgorithm::Crc64GoIso,
+                CrcAlgorithm::Crc64Ms => CrcTurboAlgorithm::Crc64Ms,
+                CrcAlgorithm::Crc64Nvme => CrcTurboAlgorithm::Crc64Nvme,
+                CrcAlgorithm::Crc64Redis => CrcTurboAlgorithm::Crc64Redis,
+                CrcAlgorithm::Crc64We => CrcTurboAlgorithm::Crc64We,
+                CrcAlgorithm::Crc64Xz => CrcTurboAlgorithm::Crc64Xz,
             },
             width: params.width,
             poly: params.poly,
@@ -433,45 +433,45 @@ impl From<CrcParams> for CrcFastParams {
 
 /// Creates a new Digest to compute CRC checksums using algorithm
 #[no_mangle]
-pub extern "C" fn crc_fast_digest_new(algorithm: CrcFastAlgorithm) -> *mut CrcFastDigestHandle {
+pub extern "C" fn crc_turbo_digest_new(algorithm: CrcTurboAlgorithm) -> *mut CrcTurboDigestHandle {
     clear_last_error();
     let digest = Box::new(Digest::new(algorithm.into()));
-    let handle = Box::new(CrcFastDigestHandle(Box::into_raw(digest)));
+    let handle = Box::new(CrcTurboDigestHandle(Box::into_raw(digest)));
     Box::into_raw(handle)
 }
 
 /// Creates a new Digest with a custom initial state
 #[no_mangle]
-pub extern "C" fn crc_fast_digest_new_with_init_state(
-    algorithm: CrcFastAlgorithm,
+pub extern "C" fn crc_turbo_digest_new_with_init_state(
+    algorithm: CrcTurboAlgorithm,
     init_state: u64,
-) -> *mut CrcFastDigestHandle {
+) -> *mut CrcTurboDigestHandle {
     clear_last_error();
     let digest = Box::new(Digest::new_with_init_state(algorithm.into(), init_state));
-    let handle = Box::new(CrcFastDigestHandle(Box::into_raw(digest)));
+    let handle = Box::new(CrcTurboDigestHandle(Box::into_raw(digest)));
     Box::into_raw(handle)
 }
 
 /// Creates a new Digest to compute CRC checksums using custom parameters
 /// Returns NULL if parameters are invalid (invalid key count or null pointer)
-/// Call crc_fast_get_last_error() to get the specific error code
+/// Call crc_turbo_get_last_error() to get the specific error code
 #[no_mangle]
-pub extern "C" fn crc_fast_digest_new_with_params(
-    params: CrcFastParams,
-) -> *mut CrcFastDigestHandle {
+pub extern "C" fn crc_turbo_digest_new_with_params(
+    params: CrcTurboParams,
+) -> *mut CrcTurboDigestHandle {
     clear_last_error();
     match try_params_from_ffi(&params) {
         Some(crc_params) => {
             let digest = Box::new(Digest::new_with_params(crc_params));
-            let handle = Box::new(CrcFastDigestHandle(Box::into_raw(digest)));
+            let handle = Box::new(CrcTurboDigestHandle(Box::into_raw(digest)));
             Box::into_raw(handle)
         }
         None => {
             // Set appropriate error based on the failure
             if params.keys.is_null() {
-                set_last_error(CrcFastError::NullPointer);
+                set_last_error(CrcTurboError::NullPointer);
             } else {
-                set_last_error(CrcFastError::InvalidKeyCount);
+                set_last_error(CrcTurboError::InvalidKeyCount);
             }
             std::ptr::null_mut()
         }
@@ -480,17 +480,17 @@ pub extern "C" fn crc_fast_digest_new_with_params(
 
 /// Updates the Digest with data
 #[no_mangle]
-pub extern "C" fn crc_fast_digest_update(
-    handle: *mut CrcFastDigestHandle,
+pub extern "C" fn crc_turbo_digest_update(
+    handle: *mut CrcTurboDigestHandle,
     data: *const c_char,
     len: usize,
 ) {
     if handle.is_null() {
-        set_last_error(CrcFastError::NullPointer);
+        set_last_error(CrcTurboError::NullPointer);
         return;
     }
     if data.is_null() {
-        set_last_error(CrcFastError::NullPointer);
+        set_last_error(CrcTurboError::NullPointer);
         return;
     }
 
@@ -507,9 +507,9 @@ pub extern "C" fn crc_fast_digest_update(
 /// Calculates the CRC checksum for data that's been written to the Digest
 /// Returns 0 on error (e.g. null handle)
 #[no_mangle]
-pub extern "C" fn crc_fast_digest_finalize(handle: *mut CrcFastDigestHandle) -> u64 {
+pub extern "C" fn crc_turbo_digest_finalize(handle: *mut CrcTurboDigestHandle) -> u64 {
     if handle.is_null() {
-        set_last_error(CrcFastError::NullPointer);
+        set_last_error(CrcTurboError::NullPointer);
         return 0;
     }
 
@@ -522,9 +522,9 @@ pub extern "C" fn crc_fast_digest_finalize(handle: *mut CrcFastDigestHandle) -> 
 
 /// Free the Digest resources without finalizing
 #[no_mangle]
-pub extern "C" fn crc_fast_digest_free(handle: *mut CrcFastDigestHandle) {
+pub extern "C" fn crc_turbo_digest_free(handle: *mut CrcTurboDigestHandle) {
     if handle.is_null() {
-        set_last_error(CrcFastError::NullPointer);
+        set_last_error(CrcTurboError::NullPointer);
         return;
     }
 
@@ -537,9 +537,9 @@ pub extern "C" fn crc_fast_digest_free(handle: *mut CrcFastDigestHandle) {
 
 /// Reset the Digest state
 #[no_mangle]
-pub extern "C" fn crc_fast_digest_reset(handle: *mut CrcFastDigestHandle) {
+pub extern "C" fn crc_turbo_digest_reset(handle: *mut CrcTurboDigestHandle) {
     if handle.is_null() {
-        set_last_error(CrcFastError::NullPointer);
+        set_last_error(CrcTurboError::NullPointer);
         return;
     }
 
@@ -554,9 +554,9 @@ pub extern "C" fn crc_fast_digest_reset(handle: *mut CrcFastDigestHandle) {
 /// Finalize and reset the Digest in one operation
 /// Returns 0 on error (e.g. null handle)
 #[no_mangle]
-pub extern "C" fn crc_fast_digest_finalize_reset(handle: *mut CrcFastDigestHandle) -> u64 {
+pub extern "C" fn crc_turbo_digest_finalize_reset(handle: *mut CrcTurboDigestHandle) -> u64 {
     if handle.is_null() {
-        set_last_error(CrcFastError::NullPointer);
+        set_last_error(CrcTurboError::NullPointer);
         return 0;
     }
 
@@ -570,12 +570,12 @@ pub extern "C" fn crc_fast_digest_finalize_reset(handle: *mut CrcFastDigestHandl
 
 /// Combine two Digest checksums
 #[no_mangle]
-pub extern "C" fn crc_fast_digest_combine(
-    handle1: *mut CrcFastDigestHandle,
-    handle2: *mut CrcFastDigestHandle,
+pub extern "C" fn crc_turbo_digest_combine(
+    handle1: *mut CrcTurboDigestHandle,
+    handle2: *mut CrcTurboDigestHandle,
 ) {
     if handle1.is_null() || handle2.is_null() {
-        set_last_error(CrcFastError::NullPointer);
+        set_last_error(CrcTurboError::NullPointer);
         return;
     }
 
@@ -590,9 +590,9 @@ pub extern "C" fn crc_fast_digest_combine(
 /// Gets the amount of data processed by the Digest so far
 /// Returns 0 on error (e.g. null handle)
 #[no_mangle]
-pub extern "C" fn crc_fast_digest_get_amount(handle: *mut CrcFastDigestHandle) -> u64 {
+pub extern "C" fn crc_turbo_digest_get_amount(handle: *mut CrcTurboDigestHandle) -> u64 {
     if handle.is_null() {
-        set_last_error(CrcFastError::NullPointer);
+        set_last_error(CrcTurboError::NullPointer);
         return 0;
     }
 
@@ -606,9 +606,9 @@ pub extern "C" fn crc_fast_digest_get_amount(handle: *mut CrcFastDigestHandle) -
 /// Gets the current state of the Digest
 /// Returns 0 on error (e.g. null handle)
 #[no_mangle]
-pub extern "C" fn crc_fast_digest_get_state(handle: *mut CrcFastDigestHandle) -> u64 {
+pub extern "C" fn crc_turbo_digest_get_state(handle: *mut CrcTurboDigestHandle) -> u64 {
     if handle.is_null() {
-        set_last_error(CrcFastError::NullPointer);
+        set_last_error(CrcTurboError::NullPointer);
         return 0;
     }
     clear_last_error();
@@ -621,13 +621,13 @@ pub extern "C" fn crc_fast_digest_get_state(handle: *mut CrcFastDigestHandle) ->
 /// Helper method to calculate a CRC checksum directly for a string using algorithm
 /// Returns 0 on error (e.g. null data pointer)
 #[no_mangle]
-pub extern "C" fn crc_fast_checksum(
-    algorithm: CrcFastAlgorithm,
+pub extern "C" fn crc_turbo_checksum(
+    algorithm: CrcTurboAlgorithm,
     data: *const c_char,
     len: usize,
 ) -> u64 {
     if data.is_null() {
-        set_last_error(CrcFastError::NullPointer);
+        set_last_error(CrcTurboError::NullPointer);
         return 0;
     }
     clear_last_error();
@@ -640,15 +640,15 @@ pub extern "C" fn crc_fast_checksum(
 
 /// Helper method to calculate a CRC checksum directly for data using custom parameters
 /// Returns 0 if parameters are invalid or data is null
-/// Call crc_fast_get_last_error() to get the specific error code
+/// Call crc_turbo_get_last_error() to get the specific error code
 #[no_mangle]
-pub extern "C" fn crc_fast_checksum_with_params(
-    params: CrcFastParams,
+pub extern "C" fn crc_turbo_checksum_with_params(
+    params: CrcTurboParams,
     data: *const c_char,
     len: usize,
 ) -> u64 {
     if data.is_null() {
-        set_last_error(CrcFastError::NullPointer);
+        set_last_error(CrcTurboError::NullPointer);
         return 0;
     }
     match try_params_from_ffi(&params) {
@@ -662,9 +662,9 @@ pub extern "C" fn crc_fast_checksum_with_params(
         }
         None => {
             if params.keys.is_null() {
-                set_last_error(CrcFastError::NullPointer);
+                set_last_error(CrcTurboError::NullPointer);
             } else {
-                set_last_error(CrcFastError::InvalidKeyCount);
+                set_last_error(CrcTurboError::InvalidKeyCount);
             }
             0
         }
@@ -673,15 +673,15 @@ pub extern "C" fn crc_fast_checksum_with_params(
 
 /// Helper method to just calculate a CRC checksum directly for a file using algorithm
 /// Returns 0 if path is null or file I/O fails
-/// Call crc_fast_get_last_error() to get the specific error code
+/// Call crc_turbo_get_last_error() to get the specific error code
 #[no_mangle]
-pub extern "C" fn crc_fast_checksum_file(
-    algorithm: CrcFastAlgorithm,
+pub extern "C" fn crc_turbo_checksum_file(
+    algorithm: CrcTurboAlgorithm,
     path_ptr: *const u8,
     path_len: usize,
 ) -> u64 {
     if path_ptr.is_null() {
-        set_last_error(CrcFastError::NullPointer);
+        set_last_error(CrcTurboError::NullPointer);
         return 0;
     }
 
@@ -696,7 +696,7 @@ pub extern "C" fn crc_fast_checksum_file(
                 result
             }
             Err(_) => {
-                set_last_error(CrcFastError::IoError);
+                set_last_error(CrcTurboError::IoError);
                 0
             }
         }
@@ -705,15 +705,15 @@ pub extern "C" fn crc_fast_checksum_file(
 
 /// Helper method to calculate a CRC checksum directly for a file using custom parameters
 /// Returns 0 if parameters are invalid, path is null, or file I/O fails
-/// Call crc_fast_get_last_error() to get the specific error code
+/// Call crc_turbo_get_last_error() to get the specific error code
 #[no_mangle]
-pub extern "C" fn crc_fast_checksum_file_with_params(
-    params: CrcFastParams,
+pub extern "C" fn crc_turbo_checksum_file_with_params(
+    params: CrcTurboParams,
     path_ptr: *const u8,
     path_len: usize,
 ) -> u64 {
     if path_ptr.is_null() {
-        set_last_error(CrcFastError::NullPointer);
+        set_last_error(CrcTurboError::NullPointer);
         return 0;
     }
 
@@ -729,16 +729,16 @@ pub extern "C" fn crc_fast_checksum_file_with_params(
                     result
                 }
                 Err(_) => {
-                    set_last_error(CrcFastError::IoError);
+                    set_last_error(CrcTurboError::IoError);
                     0
                 }
             }
         },
         None => {
             if params.keys.is_null() {
-                set_last_error(CrcFastError::NullPointer);
+                set_last_error(CrcTurboError::NullPointer);
             } else {
-                set_last_error(CrcFastError::InvalidKeyCount);
+                set_last_error(CrcTurboError::InvalidKeyCount);
             }
             0
         }
@@ -747,8 +747,8 @@ pub extern "C" fn crc_fast_checksum_file_with_params(
 
 /// Combine two CRC checksums using algorithm
 #[no_mangle]
-pub extern "C" fn crc_fast_checksum_combine(
-    algorithm: CrcFastAlgorithm,
+pub extern "C" fn crc_turbo_checksum_combine(
+    algorithm: CrcTurboAlgorithm,
     checksum1: u64,
     checksum2: u64,
     checksum2_len: u64,
@@ -759,10 +759,10 @@ pub extern "C" fn crc_fast_checksum_combine(
 
 /// Combine two CRC checksums using custom parameters
 /// Returns 0 if parameters are invalid
-/// Call crc_fast_get_last_error() to get the specific error code
+/// Call crc_turbo_get_last_error() to get the specific error code
 #[no_mangle]
-pub extern "C" fn crc_fast_checksum_combine_with_params(
-    params: CrcFastParams,
+pub extern "C" fn crc_turbo_checksum_combine_with_params(
+    params: CrcTurboParams,
     checksum1: u64,
     checksum2: u64,
     checksum2_len: u64,
@@ -774,9 +774,9 @@ pub extern "C" fn crc_fast_checksum_combine_with_params(
         }
         None => {
             if params.keys.is_null() {
-                set_last_error(CrcFastError::NullPointer);
+                set_last_error(CrcTurboError::NullPointer);
             } else {
-                set_last_error(CrcFastError::InvalidKeyCount);
+                set_last_error(CrcTurboError::InvalidKeyCount);
             }
             0
         }
@@ -786,7 +786,7 @@ pub extern "C" fn crc_fast_checksum_combine_with_params(
 /// Returns the custom CRC parameters for a given set of Rocksoft CRC parameters
 /// If width is not 32 or 64, sets error to UnsupportedWidth
 #[no_mangle]
-pub extern "C" fn crc_fast_get_custom_params(
+pub extern "C" fn crc_turbo_get_custom_params(
     name_ptr: *const c_char,
     width: u8,
     poly: u64,
@@ -794,10 +794,10 @@ pub extern "C" fn crc_fast_get_custom_params(
     reflected: bool,
     xorout: u64,
     check: u64,
-) -> CrcFastParams {
+) -> CrcTurboParams {
     // Validate width
     if width != 32 && width != 64 {
-        set_last_error(CrcFastError::UnsupportedWidth);
+        set_last_error(CrcTurboError::UnsupportedWidth);
     } else {
         clear_last_error();
     }
@@ -809,7 +809,7 @@ pub extern "C" fn crc_fast_get_custom_params(
             match CStr::from_ptr(name_ptr).to_str() {
                 Ok(s) => s,
                 Err(_) => {
-                    set_last_error(CrcFastError::InvalidUtf8);
+                    set_last_error(CrcTurboError::InvalidUtf8);
                     "custom"
                 }
             }
@@ -831,8 +831,8 @@ pub extern "C" fn crc_fast_get_custom_params(
     let (keys_ptr, key_count) = create_stable_key_pointer(&params.keys);
 
     // Convert to FFI struct - use CrcCustom for all widths since CrcParams::new now uses it
-    CrcFastParams {
-        algorithm: CrcFastAlgorithm::CrcCustom,
+    CrcTurboParams {
+        algorithm: CrcTurboAlgorithm::CrcCustom,
         width: params.width,
         poly: params.poly,
         init: params.init,
@@ -847,9 +847,9 @@ pub extern "C" fn crc_fast_get_custom_params(
 
 /// Gets the target build properties (CPU architecture and fine-tuning parameters) for this algorithm
 /// Returns NULL if string conversion fails
-/// Call crc_fast_get_last_error() to get the specific error code
+/// Call crc_turbo_get_last_error() to get the specific error code
 #[no_mangle]
-pub extern "C" fn crc_fast_get_calculator_target(algorithm: CrcFastAlgorithm) -> *const c_char {
+pub extern "C" fn crc_turbo_get_calculator_target(algorithm: CrcTurboAlgorithm) -> *const c_char {
     let target = get_calculator_target(algorithm.into());
 
     match std::ffi::CString::new(target) {
@@ -858,7 +858,7 @@ pub extern "C" fn crc_fast_get_calculator_target(algorithm: CrcFastAlgorithm) ->
             s.into_raw()
         }
         Err(_) => {
-            set_last_error(CrcFastError::StringConversionError);
+            set_last_error(CrcTurboError::StringConversionError);
             std::ptr::null_mut()
         }
     }
@@ -867,7 +867,7 @@ pub extern "C" fn crc_fast_get_calculator_target(algorithm: CrcFastAlgorithm) ->
 /// Gets the version of this library
 /// Returns a pointer to "unknown" if version string is invalid
 #[no_mangle]
-pub extern "C" fn crc_fast_get_version() -> *const c_char {
+pub extern "C" fn crc_turbo_get_version() -> *const c_char {
     const VERSION: &CStr =
         match CStr::from_bytes_with_nul(concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes()) {
             Ok(version) => version,
@@ -885,9 +885,9 @@ pub extern "C" fn crc_fast_get_version() -> *const c_char {
 ///
 /// Returns 0 on error (e.g. null data pointer)
 #[no_mangle]
-pub extern "C" fn crc_fast_crc32_iscsi(data: *const c_char, len: usize) -> u32 {
+pub extern "C" fn crc_turbo_crc32_iscsi(data: *const c_char, len: usize) -> u32 {
     if data.is_null() {
-        set_last_error(CrcFastError::NullPointer);
+        set_last_error(CrcTurboError::NullPointer);
         return 0;
     }
     clear_last_error();
@@ -905,9 +905,9 @@ pub extern "C" fn crc_fast_crc32_iscsi(data: *const c_char, len: usize) -> u32 {
 ///
 /// Returns 0 on error (e.g. null data pointer)
 #[no_mangle]
-pub extern "C" fn crc_fast_crc32_iso_hdlc(data: *const c_char, len: usize) -> u32 {
+pub extern "C" fn crc_turbo_crc32_iso_hdlc(data: *const c_char, len: usize) -> u32 {
     if data.is_null() {
-        set_last_error(CrcFastError::NullPointer);
+        set_last_error(CrcTurboError::NullPointer);
         return 0;
     }
     clear_last_error();
@@ -924,9 +924,9 @@ pub extern "C" fn crc_fast_crc32_iso_hdlc(data: *const c_char, len: usize) -> u3
 ///
 /// Returns 0 on error (e.g. null data pointer)
 #[no_mangle]
-pub extern "C" fn crc_fast_crc64_nvme(data: *const c_char, len: usize) -> u64 {
+pub extern "C" fn crc_turbo_crc64_nvme(data: *const c_char, len: usize) -> u64 {
     if data.is_null() {
-        set_last_error(CrcFastError::NullPointer);
+        set_last_error(CrcTurboError::NullPointer);
         return 0;
     }
     clear_last_error();

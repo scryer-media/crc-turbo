@@ -5,10 +5,10 @@
 //!
 //! Run tests: cargo test --test wasm_tests
 
-use crc_fast::{checksum, CrcAlgorithm, Digest};
+use crc_turbo::{checksum, CrcAlgorithm, Digest};
 
 #[cfg(feature = "alloc")]
-use crc_fast::{checksum_combine, checksum_with_params, CrcParams};
+use crc_turbo::{checksum_combine, checksum_with_params, CrcParams};
 
 /// Test basic CRC calculation
 #[test]

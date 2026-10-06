@@ -5,7 +5,7 @@
 //! This generates Rust source code that can be used to create the `src/tables.rs` module.
 //! Run with: `cargo run --bin generate_tables > src/tables.rs`
 
-use crc_fast::arch::software::{generate_table_u16, generate_table_u32, generate_table_u64};
+use crc_turbo::arch::software::{generate_table_u16, generate_table_u32, generate_table_u64};
 
 fn main() {
     println!("// Copyright 2025 Don MacAskill. Licensed under MIT or Apache-2.0.");

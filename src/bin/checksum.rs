@@ -2,7 +2,7 @@
 
 //! This is a simple program to calculate a checksum from the command line
 
-use crc_fast::{checksum, checksum_file, CrcAlgorithm};
+use crc_turbo::{checksum, checksum_file, CrcAlgorithm};
 use std::env;
 use std::process::ExitCode;
 use std::str::FromStr;
@@ -109,7 +109,7 @@ impl BenchmarkRunner {
                 .map_err(|e| format!("Failed to get file size: {}", e))?,
         };
 
-        let acceleration_target = crc_fast::get_calculator_target(self.algorithm);
+        let acceleration_target = crc_turbo::get_calculator_target(self.algorithm);
 
         Ok(BenchmarkResult::new(
             iterations,
