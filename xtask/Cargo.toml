@@ -1,0 +1,12 @@
+[package]
+name = "xtask"
+description = "Repository tasks: `cargo xtask release`"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# No dependencies on purpose: this has to build on a fresh clone, on any host,
+# before anything else does.
+[dependencies]

@@ -1,4 +1,57 @@
-# Changes for crc-fast-rust
+# Changelog
+
+All notable changes to this project are documented in this file.
+
+## Fork
+
+`crc-turbo` began as a fork of
+[crc-fast](https://github.com/awesomized/crc-fast-rust) by Don MacAskill,
+taken at its 1.10.0 release (`3a853cc`). crc-fast is a good library whose
+maintainer has been inactive since that release: no merges or comments since
+the start of 2026, and a backlog of outside pull requests - dependency
+security bumps, `no_std` fixes, `digest` 0.11, a 256-bit x86 tier - waiting
+without an answer. This crate exists so that work can ship. It is a hard
+fork: it is not rebased onto crc-fast and is not kept in step with it, though
+a fix that lands there is still welcome here. Every change taken from one of
+crc-fast's open pull requests credits its author below and in the commit
+that carries it. This section is the record of how the crate differs from
+the release it was taken at, kept for readers who know crc-fast. crc-fast's
+own changelog up to the fork point continues below, unchanged.
+
+### Packaging
+
+- Crate renamed to `crc-turbo`, library `crc_turbo`. The Rust module paths
+  and the public API stay crc-fast 1.10.0's, so a consumer's migration is the
+  dependency line plus `crc_fast::` → `crc_turbo::`.
+- Version starts at `1.11.0`, one minor above the upstream base, to make the
+  lineage obvious. The MSRV stays crc-fast's 1.89; development and CI use the
+  toolchain pinned in `rust-toolchain.toml`.
+- The C library's header is `libcrc_turbo.h`, its symbols are `crc_turbo_*`
+  and its types `CrcTurbo*`. With crc-fast's names, a binary linking both
+  crates under the default `ffi` feature would fail on duplicate symbols.
+- Released by `.github/workflows/release.yml`, dispatched from the Actions tab
+  on `main` (it creates the tag) or started by the signed `v<version>` tag
+  `cargo xtask release` pushes; crates.io trusted publishing either way. See
+  `docs/publishing.md`. Upstream's release workflow, which also built and
+  attested binary packages of the C library and the CLI tools, is not
+  carried; the `Makefile` builds and installs both from a checkout.
+- Repository hygiene adopted from the scryer-media house style: SHA-pinned CI
+  ending in a required `ci-complete` job that keeps all of upstream's lanes
+  (aarch64, x86_64, 32-bit x86, the software fallback on big-endian PowerPC,
+  Miri, `no_std`, WASM and a fuzz smoke of every target) and adds `clippy -D
+  warnings` across feature sets, docs, MSRV and packaging; `security`
+  (cargo-audit over both lockfiles, zizmor); `codeql`; gitleaks pre-commit
+  hooks; renovate; issue templates; `AGENTS.md`, `SECURITY.md`,
+  `CONTRIBUTORS.md`. Upstream's `tests.yml` and `release.yml` were removed
+  as duplicates of these.
+- The crate archive no longer carries the repository's CI, hook, fuzz and
+  agent files, nor upstream's `.kiro/` design notes, which stay in the
+  repository.
+
+## 1.11.0
+
+The first release of the fork. It is everything in the [Fork](#fork) section
+above.
 
 ## [1.10.0](https://github.com/awesomized/crc-fast-rust/releases/tag/1.10.0) - 2025-12-26
 * [Rust 1.89 baseline](https://github.com/awesomized/crc-fast-rust/pull/27)

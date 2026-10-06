@@ -1,0 +1,4 @@
+#!/bin/sh
+# Git runs hooks through sh on every platform, Windows included. Everything
+# the hook does is in xtask/src/hooks.rs.
+exec cargo xtask pre-commit

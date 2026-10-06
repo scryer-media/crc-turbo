@@ -1,8 +1,37 @@
 /target
+/target-*/
 /scratch
 /test/test_*.bin
 .idea
 .DS_Store
+**/.DS_Store
+._*
 .git
 .vscode
 /scripts
+
+# Local CI/release artifacts
+/.ci-*.txt
+/dist/
+/package/
+/logs/
+/SHA256SUMS
+
+# Rust profiling/coverage
+/coverage/
+*.profraw
+*.profdata
+/perf.data*
+/*.trace/
+
+# Local environment/secrets
+.env
+.env.*
+!.env.example
+
+# Cargo-fuzz build state, corpora and crash artifacts. fuzz/Cargo.lock is
+# tracked, so the harness builds against the versions CI audits.
+**/fuzz/target/
+**/fuzz/artifacts/
+**/fuzz/corpus/
+**/fuzz/coverage/

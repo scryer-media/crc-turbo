@@ -1,0 +1,15 @@
+name: Feature request
+description: An algorithm, an API, a platform or a tier the crate should support.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: What you need and why
+    validations:
+      required: true
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Hardware
+      description: For a new or faster tier, the CPUs it is for and how you measured them.

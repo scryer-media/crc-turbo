@@ -19,6 +19,12 @@ exclude = [".github/", ".githooks/", ".gitleaks.toml", ".gitattributes", ".kiro/
 # 1.89.0 stabilized AVX-512 intrinsics, including VPCLMULQDQ
 rust-version = "1.89"
 
+# `xtask` holds the repository tasks (`cargo xtask release`). The fuzz harness
+# is its own workspace, built on nightly by cargo-fuzz.
+[workspace]
+members = ["xtask"]
+exclude = ["fuzz"]
+
 [lib]
 name = "crc_turbo"
 crate-type = ["lib", "cdylib", "staticlib"]

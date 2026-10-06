@@ -1,0 +1,34 @@
+name: Bug report
+description: A wrong checksum, a panic, a crash or a build failure.
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: crc-turbo version
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: The algorithm or CrcParams, what you expected and what you got. Include any panic message.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: The input (or its length and how it was generated) and the calls made. Never attach private data.
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform (OS, CPU, rustc version, and what `get_calculator_target` reports)
+  - type: checkboxes
+    id: upstream
+    attributes:
+      label: Upstream check
+      options:
+        - label: I checked whether crc-fast (the upstream crate this forks) has the same behaviour.
