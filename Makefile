@@ -12,6 +12,8 @@ ifeq ($(UNAME_S),Linux)
     INSTALL_BIN_DIR := /bin
     INSTALL_INCLUDE_DIR := /include
     POST_INSTALL := ldconfig
+    CAPI_STATIC_LIBS := -lpthread -ldl -lm
+    CAPI_RUN_ENV := LD_LIBRARY_PATH=capi/target/release
 else ifeq ($(UNAME_S),Darwin)
     DESTDIR ?=
     # on macOS, there's not really a default location, so require DESTDIR
@@ -19,6 +21,7 @@ else ifeq ($(UNAME_S),Darwin)
         $(error On macOS, DESTDIR must be set for installation. Common locations include /usr/local or /opt/homebrew)
     endif
     LIB_EXTENSION := dylib
+    CAPI_RUN_ENV := DYLD_LIBRARY_PATH=capi/target/release
     STATIC_LIB_EXTENSION := a
     INSTALL_LIB_DIR := /lib
     INSTALL_BIN_DIR := /bin
@@ -54,12 +57,13 @@ all: build
 # Build the library using Cargo
 .PHONY: build
 build: test
-	cargo build --all-features --release
+	cargo build --locked --all-features --release
+	cargo build --locked --release --manifest-path capi/Cargo.toml
 
 # Test the library using Cargo
 .PHONY: test
 test:
-	cargo test --all-features
+	cargo test --locked --all-features
 
 # Install the library and headers
 .PHONY: install
@@ -68,8 +72,8 @@ install: print-paths build
 	@install -d $(DESTDIR)$(INSTALL_BIN_DIR)
 	@install -d $(DESTDIR)$(INSTALL_INCLUDE_DIR)
 
-	install -m 644 target/release/$(LIB_NAME) $(DESTDIR)$(INSTALL_LIB_DIR)/
-	install -m 644 target/release/$(STATIC_LIB_NAME) $(DESTDIR)$(INSTALL_LIB_DIR)/
+	install -m 644 capi/target/release/$(LIB_NAME) $(DESTDIR)$(INSTALL_LIB_DIR)/
+	install -m 644 capi/target/release/$(STATIC_LIB_NAME) $(DESTDIR)$(INSTALL_LIB_DIR)/
 
 	install -m 644 lib$(PROJECT_NAME).h $(DESTDIR)$(INSTALL_INCLUDE_DIR)/
 
@@ -110,6 +114,7 @@ check:
 .PHONY: clean
 clean:
 	cargo clean
+	cargo clean --manifest-path capi/Cargo.toml
 
 # Print installation paths (useful for debugging)
 .PHONY: print-paths
@@ -118,3 +123,13 @@ print-paths:
 	@echo "Library dir: $(DESTDIR)$(INSTALL_LIB_DIR)"
 	@echo "Binary dir: $(DESTDIR)$(INSTALL_BIN_DIR)"
 	@echo "Include dir: $(DESTDIR)$(INSTALL_INCLUDE_DIR)"
+
+# Build the C library and run the C smoke test against the static and the
+# shared library
+.PHONY: capi-test
+capi-test:
+	cargo build --locked --release --manifest-path capi/Cargo.toml
+	$(CC) -O2 -I. capi/tests/smoke.c capi/target/release/$(STATIC_LIB_NAME) $(CAPI_STATIC_LIBS) -o capi/target/smoke-static
+	capi/target/smoke-static
+	$(CC) -O2 -I. capi/tests/smoke.c -Lcapi/target/release -l$(PROJECT_NAME) -o capi/target/smoke-shared
+	$(CAPI_RUN_ENV) capi/target/smoke-shared

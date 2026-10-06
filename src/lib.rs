@@ -220,7 +220,10 @@ use digest::DynDigest;
 #[cfg(feature = "alloc")]
 use digest::InvalidBufferSize;
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(all(
+    feature = "alloc",
+    any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")
+))]
 use crate::feature_detection::get_arch_ops;
 #[cfg(feature = "std")]
 use std::fs::File;

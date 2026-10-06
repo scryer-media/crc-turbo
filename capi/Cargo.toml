@@ -1,0 +1,28 @@
+[package]
+name = "crc-turbo-capi"
+version = "1.11.0"
+edition = "2021"
+rust-version = "1.89"
+authors = ["Don MacAskill", "NZB Man"]
+license = "MIT OR Apache-2.0"
+description = "crc-turbo's C library, libcrc_turbo, built as a shared and a static library"
+repository = "https://github.com/scryer-media/crc-turbo"
+publish = false
+
+# Its own workspace, so its outputs (libcrc_turbo.so/.dylib/.dll and
+# libcrc_turbo.a/.lib) do not collide with the crate's rlib of the same name.
+[workspace]
+
+[lib]
+name = "crc_turbo"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+# Renamed: this package's own library is also called `crc_turbo`.
+turbo = { package = "crc-turbo", path = "..", version = "=1.11.0" }
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
+opt-level = 3

@@ -11,8 +11,8 @@ ways:
   dependencies, so it runs wherever `cargo` does) runs every check the
   workflow runs, so a tag that reaches GitHub is one the workflow will accept.
 
-Only the `crc-turbo` crate is published. The xtask and the fuzz harness are
-`publish = false`.
+Only the `crc-turbo` crate is published. The xtask, the fuzz harness and the C
+library package (`capi/`) are `publish = false`.
 
 ## One-time setup, before the first release
 

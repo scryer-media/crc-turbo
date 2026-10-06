@@ -33,6 +33,9 @@ jobs:
       - name: Audit the fuzz harness's dependencies
         run: cargo audit --file fuzz/Cargo.lock
 
+      - name: Audit the C library's dependencies
+        run: cargo audit --file capi/Cargo.lock
+
   zizmor:
     name: zizmor
     runs-on: ubuntu-24.04

@@ -289,6 +289,7 @@ pub enum ArchOpsInstance {
 #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
 impl ArchOpsInstance {
     #[inline(always)]
+    #[cfg_attr(not(feature = "alloc"), allow(dead_code))]
     pub fn get_tier(&self) -> PerformanceTier {
         match self {
             #[cfg(target_arch = "aarch64")]

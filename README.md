@@ -61,8 +61,8 @@ See [CHANGELOG](CHANGELOG.md).
 
 ### Library
 
-`cargo build --release` will obviously build the Rust library, including
-the  [C/C++ compatible dynamic and static libraries](#cc-compatible-library).
+`cargo build --release` builds the Rust library. The [C/C++ compatible dynamic and static
+libraries](#cc-compatible-library) are built from `capi/`: `cargo build --release --manifest-path capi/Cargo.toml`.
 
 ### CLI tools
 
@@ -76,10 +76,10 @@ To build them, enable the `cli` feature: `cargo build --features cli --release`.
 
 ### Everything
 
-To build the libraries and the CLI tools, use the `--all-features` flag:  `cargo build --all-features --release`. 
+To build the Rust library and the CLI tools, use the `--all-features` flag: `cargo build --all-features --release`.
 
-A _very_ basic [Makefile](Makefile) is supplied which supports `make install` to install the libraries, header file, and
-CLI binaries to the local system. Specifying the `DESTDIR` environment variable will allow you to customize the install
+A _very_ basic [Makefile](Makefile) is supplied which supports `make install` to build and install the C libraries,
+header file, and CLI binaries to the local system. Specifying the `DESTDIR` environment variable will allow you to customize the install
 location.
 
 ```
@@ -92,8 +92,8 @@ The library supports various feature flags for different environments:
 
 ### Default Features
 * `std` - Standard library support, includes `alloc`
-* `ffi` - C/C++ FFI bindings for shared library (will become optional in v2.0)
-* `panic-handler` - Provides panic handler for `no_std` environments (disable when building binaries)
+* `ffi` - the C functions declared in `libcrc_turbo.h`, which `capi/` builds into the C libraries
+* `panic-handler` - provides a panic handler in a `no_std` build; an embedded application leaves it off and brings its own
 
 ### Optional Features
 * `alloc` - Heap allocation support (enables `Digest` trait, custom CRC params, checksum combining)
@@ -373,11 +373,13 @@ assert_eq!(checksum.unwrap(), 0xcbf43926);
 
 ## C/C++ compatible library
 
-`cargo build` will produce a shared library target (`.so` on Linux, `.dll` on Windows, `.dylib` on macOS, etc) and an
-auto-generated [libcrc_turbo.h](libcrc_turbo.h) header file for use in non-Rust projects, such as through
-[FFI](https://en.wikipedia.org/wiki/Foreign_function_interface). It will also produce a static library target (`.a` on
-Linux and macOS, `.lib` on Windows, etc) for projects
-which prefer statically linking.
+`cargo build --release --manifest-path capi/Cargo.toml` produces a shared library (`.so` on Linux, `.dll` on Windows,
+`.dylib` on macOS) and a static library (`.a` on Linux and macOS, `.lib` on Windows) in `capi/target/release/`, to use with
+the auto-generated [libcrc_turbo.h](libcrc_turbo.h) header file for use in non-Rust projects, such as through
+[FFI](https://en.wikipedia.org/wiki/Foreign_function_interface). `make capi-test` builds both and runs a C smoke test
+against each. The C library lives in its own package so that a Rust dependency on `crc-turbo` is an ordinary library:
+Cargo builds every crate type a library declares, even for a dependency, and a static library needs a panic handler an
+embedded `no_std` application provides for itself.
 
 Upstream's [crc-fast PHP extension](https://github.com/awesomized/crc-fast-php-ext) is an example of a consumer of that library (it links `crc-fast`'s, whose symbols are `crc_fast_*` rather than `crc_turbo_*`).
 

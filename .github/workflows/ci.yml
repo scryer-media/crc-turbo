@@ -43,6 +43,7 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all --check
       - run: cargo fmt --all --check --manifest-path fuzz/Cargo.toml
+      - run: cargo fmt --all --check --manifest-path capi/Cargo.toml
 
   # Each architecture compiles different tiers, so clippy runs on each.
   clippy:
@@ -372,10 +373,33 @@ jobs:
       - name: The crates.io archive builds
         run: cargo package --locked -p crc-turbo
 
+  capi:
+    name: capi (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, windows-2025]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: The C library builds
+        if: runner.os == 'Windows'
+        run: cargo build --locked --release --manifest-path capi/Cargo.toml
+      - name: The C smoke test passes against the static and the shared library
+        if: runner.os != 'Windows'
+        # DESTDIR only satisfies the Makefile's install-path guard on macOS.
+        run: make capi-test DESTDIR=/unused
+
   ci-complete:
     name: ci-complete
     if: always()
-    needs: [fmt, clippy, docs, test, test-x86-linux, test-x86-windows, test-software, miri, no-std, wasm, fuzz, msrv, package]
+    needs: [fmt, clippy, docs, test, test-x86-linux, test-x86-windows, test-software, miri, no-std, wasm, fuzz, msrv, package, capi]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

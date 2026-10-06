@@ -53,6 +53,15 @@ own changelog up to the fork point continues below, unchanged.
 - `no_std` builds for x86_64 compile again: the AVX-512 tier imported
   `std::arch` rather than `core::arch` (crc-fast#57). From crc-fast#42 by
   netsbot; crc-fast#49 by onur-ozkan carries the same fix.
+- A `crc-turbo` dependency is an ordinary Rust library again. The crate
+  declared `cdylib` and `staticlib` crate types as well, which Cargo builds
+  even for a dependency, and a `no_std` static library needs a panic handler
+  the embedded application provides for itself. The C library, renamed
+  `libcrc_turbo`, is now built by the unpublished `capi/` package; the
+  Makefile builds and installs from there, and `make capi-test` runs a C smoke
+  test against the static and the shared library. From crc-fast#49 by
+  onur-ozkan, which dropped the extra crate types; the `capi/` package keeps
+  the C library.
 
 ## 1.11.0
 
