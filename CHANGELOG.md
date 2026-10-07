@@ -63,6 +63,18 @@ own changelog up to the fork point continues below, unchanged.
   onur-ozkan, which dropped the extra crate types; the `capi/` package keeps
   the C library.
 
+### Dependencies
+
+- `spin` 0.10.1; 0.10.0 is yanked (crc-fast#52). From crc-fast#50 by
+  xtqqczze.
+- `crossbeam-epoch` 0.9.20 in the development lockfile, for RUSTSEC-2026-0204
+  (crc-fast#53). From crc-fast#55 by xtqqczze.
+- `rand` 0.10 for the tests and benches, and `rand` 0.9.5 under `proptest`,
+  for RUSTSEC-2026-0097 (crc-fast#54). From crc-fast#48 by MggMuggins, which
+  supersedes crc-fast#51 by xtqqczze. `rand` was never a dependency of the
+  library itself.
+- `cargo audit` is clean on the crate, `fuzz/` and `capi/` lockfiles.
+
 ### x86_64 performance
 
 - A new `x86_64-avx2-vpclmulqdq` tier for CPUs that have 256-bit VPCLMULQDQ
