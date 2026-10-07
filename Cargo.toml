@@ -1,0 +1,12 @@
+[package]
+name = "crc-turbo"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.89"
+description = "Placeholder, do not depend on this version: name reserved for a maintained fork of crc-fast, publishing after 2026-10-20 (see awesomized/crc-fast-rust#62)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/scryer-media/crc-turbo"
+readme = "README.md"
+keywords = ["crc", "crc32", "crc64", "checksum", "simd"]
+categories = ["algorithms", "no-std"]
+include = ["Cargo.toml", "README.md", "src/lib.rs"]
