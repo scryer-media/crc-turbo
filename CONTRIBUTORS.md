@@ -28,7 +28,11 @@ taken. Each commit that carries one names its author.
 - **musicinmybrain**: the SPDX expression for the Zlib-licensed code in
   `src/combine.rs` (crc-fast#41).
 - **xtqqczze**: the `spin`, `rand`, `crossbeam-epoch` and `digest` updates
-  (crc-fast#50, #51, #55, #46).
+  (crc-fast#50, #51, #55, #46), and the advisories behind them (crc-fast#52,
+  #53, #54).
+- **jacobloveless**: the lookup-table size measurement and request behind
+  `generated-tables` (crc-fast#61).
+- **Nukesor**: the request for `digest` 0.11 (crc-fast#44).
 - **dcbtsla**: an AVX2 + VPCLMULQDQ tier for CPUs without AVX-512
   (crc-fast#56), written independently of and before the one this crate
   ships, whose feature-detection model this crate adopts; and the field
