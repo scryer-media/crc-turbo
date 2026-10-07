@@ -254,6 +254,99 @@ impl Field {
     }
 }
 
+/// What a built-in algorithm's combines share: the field and its `x^(2^k) mod P(x)` table, so
+/// that `x^(8n)` costs one multiply per set bit of `n` rather than a square per bit as well.
+/// This is zlib's `x2n_table`, built at first use instead of stored.
+#[cfg(any(
+    feature = "std",
+    all(
+        feature = "alloc",
+        any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+    )
+))]
+mod powers {
+    use super::{mask, Field};
+    use crate::{CrcAlgorithm, CrcParams};
+    #[cfg(not(feature = "std"))]
+    use alloc::boxed::Box;
+
+    /// Entries in a table: `x^(2^k)` for `k < 67` covers `x^(8n)` for every `u64` `n`.
+    const X2N_LEN: usize = 67;
+
+    pub(super) struct Powers {
+        pub(super) field: Field,
+        pub(super) x2n: [u64; X2N_LEN],
+    }
+
+    impl Powers {
+        fn new(params: &CrcParams) -> Self {
+            let field = Field::new(params.poly, params.width);
+            let mut x2n = [0u64; X2N_LEN];
+            x2n[0] = 1 << 1; // x
+            for k in 1..X2N_LEN {
+                x2n[k] = field.mul(x2n[k - 1], x2n[k - 1]);
+            }
+
+            Self { field, x2n }
+        }
+
+        /// `x^(8 * n) mod P(x)`: one multiply per set bit of `n`.
+        #[inline]
+        pub(super) fn pow_bytes(&self, n: u64) -> u64 {
+            let mut power = 1u64;
+            let mut bits = n;
+            while bits != 0 {
+                // Bit j of n is x^(8 * 2^j) = x^(2^(j + 3)).
+                power = self
+                    .field
+                    .mul(power, self.x2n[bits.trailing_zeros() as usize + 3]);
+                bits &= bits - 1;
+            }
+
+            power
+        }
+    }
+
+    /// One slot per `CrcAlgorithm` discriminant. Boxed, so an unused slot costs a pointer.
+    const SLOTS: usize = 64;
+
+    #[cfg(feature = "std")]
+    type Slot = std::sync::OnceLock<Box<Powers>>;
+    #[cfg(not(feature = "std"))]
+    type Slot = spin::Once<Box<Powers>>;
+
+    #[allow(clippy::declare_interior_mutable_const)]
+    const EMPTY: Slot = Slot::new();
+    static TABLES: [Slot; SLOTS] = [EMPTY; SLOTS];
+
+    /// The table for `params`' algorithm, when it is a built-in one and `params` still describes
+    /// it. Parameters built by hand under a built-in name fall back to plain square-and-multiply.
+    #[allow(deprecated)]
+    pub(super) fn get(params: &CrcParams) -> Option<&'static Powers> {
+        if matches!(
+            params.algorithm,
+            CrcAlgorithm::CrcCustom | CrcAlgorithm::Crc32Custom | CrcAlgorithm::Crc64Custom
+        ) {
+            return None;
+        }
+
+        let slot = TABLES.get(params.algorithm as usize)?;
+        let init = || {
+            Box::new(Powers::new(
+                &crate::get_calculator_params(params.algorithm).1,
+            ))
+        };
+        #[cfg(feature = "std")]
+        let powers = slot.get_or_init(init);
+        #[cfg(not(feature = "std"))]
+        let powers = slot.call_once(init);
+
+        (powers.field.width == params.width
+            && powers.field.poly == params.poly & mask(params.width))
+        .then_some(&**powers)
+    }
+}
+
 /// The effect on a CRC of appending a fixed number of bytes to its input: what combining the
 /// CRCs of two adjacent ranges, undoing such a combine, and the CRC of a run of zero bytes all
 /// need, computed once for that length.
@@ -299,13 +392,44 @@ impl CrcCombine {
     ///
     /// If the parameters mix reflected input with unreflected output or the reverse, which no
     /// catalogued CRC of a supported width does, or if the width is not 16, 32 or 64.
+    #[inline]
     pub fn new_with_params(params: CrcParams, len: u64) -> Self {
+        Self::from_params(&params, len)
+    }
+
+    /// [`CrcCombine::new_with_params`] without moving the parameters, which carry the fold keys.
+    #[inline]
+    pub(crate) fn from_params(params: &CrcParams, len: u64) -> Self {
         assert!(
             params.refin == params.refout,
             "Unsupported CRC configuration: refin and refout differ"
         );
 
-        let field = Field::new(params.poly, params.width);
+        #[cfg(any(
+            feature = "std",
+            all(
+                feature = "alloc",
+                any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+            )
+        ))]
+        let (field, power) = match powers::get(params) {
+            Some(powers) => (powers.field, powers.pow_bytes(len)),
+            None => {
+                let field = Field::new(params.poly, params.width);
+                (field, field.pow_bytes(1 << 1, len))
+            }
+        };
+        #[cfg(not(any(
+            feature = "std",
+            all(
+                feature = "alloc",
+                any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+            )
+        )))]
+        let (field, power) = {
+            let field = Field::new(params.poly, params.width);
+            (field, field.pow_bytes(1 << 1, len))
+        };
 
         Self {
             field,
@@ -313,7 +437,7 @@ impl CrcCombine {
             init_algorithm: params.init_algorithm & mask(params.width),
             xorout: params.xorout & mask(params.width),
             len,
-            power: field.pow_bytes(1 << 1, len),
+            power,
         }
     }
 
@@ -386,7 +510,7 @@ sequence of bytes, and len2 is the length of the second sequence.  The CRC
 of the combined sequence is returned. */
 #[inline]
 pub fn checksums(crc1: u64, crc2: u64, len2: u64, params: &CrcParams) -> u64 {
-    CrcCombine::new_with_params(*params, len2).combine(crc1, crc2)
+    CrcCombine::from_params(params, len2).combine(crc1, crc2)
 }
 
 #[cfg(all(test, feature = "std"))]
@@ -574,6 +698,34 @@ mod tests {
                     config.get_name()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn every_built_in_algorithm_takes_the_table() {
+        for config in TEST_ALL_CONFIGS {
+            let params = config.get_params();
+            let powers = powers::get(params)
+                .unwrap_or_else(|| panic!("{} has no power table", config.get_name()));
+            assert_eq!(powers.field, Field::new(params.poly, params.width));
+        }
+    }
+
+    #[test]
+    fn parameters_relabelled_with_a_built_in_name_skip_its_table() {
+        let mut stream = Stream(0x2545_f491_4f6c_dd1d);
+        let mut params = *TEST_ALL_CONFIGS[0].get_params();
+        params.poly ^= 0x8; // a different field under the same name
+        assert!(powers::get(&params).is_none());
+
+        for len2 in lengths(&mut stream) {
+            let crc1 = stream.next() & mask(params.width);
+            let crc2 = stream.next() & mask(params.width);
+            assert_eq!(
+                CrcCombine::new_with_params(params, len2).combine(crc1, crc2),
+                combine_by_matrix(crc1, crc2, len2, &params),
+                "len {len2}"
+            );
         }
     }
 

@@ -93,18 +93,22 @@ own changelog up to the fork point continues below, unchanged.
 ### Combine
 
 - `checksum_combine` and `checksum_combine_with_params` compute the shift
-  as a power of x modulo the polynomial, by square-and-multiply with a
-  carry-less multiply (PCLMULQDQ on x86_64, PMULL on aarch64, a portable
-  shift-and-add elsewhere), in place of crc-fast's GF(2) matrix squaring.
-  The results are bit-identical; the old matrix code is kept as the test
-  oracle. On an Apple M-series core, one combine of a CRC-32/ISO-HDLC over
-  a 1 MiB second part drops from 12.7 µs to 0.30 µs, and CRC-64/NVME from
-  83.5 µs to 0.34 µs. The gap grows with the width and the length, from 5x
-  for a CRC-16 over 1 byte to 380x for a CRC-64 over 4 GiB. The field
-  arithmetic is from crc-fast#60 by dcbtsla. That pull request's
-  per-polynomial key tables and its new `CrcParams` field are not taken:
-  the field would be a breaking change to a struct consumers build by hand,
-  and the tables add several kilobytes that crc-fast#61 asks to shrink.
+  as a power of x modulo the polynomial with a carry-less multiply
+  (PCLMULQDQ on x86_64, PMULL on aarch64, a portable shift-and-add
+  elsewhere), in place of crc-fast's GF(2) matrix squaring. Each built-in
+  algorithm keeps a table of x^(2^k), built on its first combine, so a
+  combine costs one multiply per set bit of the length, as zlib's
+  `crc32_combine` does; custom parameters use square-and-multiply. The
+  table needs `std`, or `alloc` on aarch64 and x86. The results are
+  bit-identical; the old matrix code is kept as the test oracle. On an
+  Apple M-series core, one combine of a CRC-32/ISO-HDLC over a 1 MiB second
+  part drops from 12.5 µs to 12 ns, and CRC-64/NVME from 81.7 µs to 13 ns.
+  The gain ranges from 18x for a CRC-16 over 1 byte to 6,300x for a CRC-64
+  over 1 MiB. The field arithmetic is from crc-fast#60 by dcbtsla. That
+  pull request's per-polynomial key tables and its new `CrcParams` field
+  are not taken: the field would be a breaking change to a struct
+  consumers build by hand, and the tables add several kilobytes that
+  crc-fast#61 asks to shrink.
 - New `CrcCombine`, a combine operator for one algorithm and one length,
   built once with `CrcCombine::new` or `CrcCombine::new_with_params`. Each
   `combine` is then one field multiply, about 2 ns. `uncombine` runs it

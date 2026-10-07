@@ -1111,7 +1111,7 @@ impl CrcCombine {
     ///
     /// For the `Custom` algorithms, which need [`CrcCombine::new_with_params`].
     pub fn new(algorithm: CrcAlgorithm, len: u64) -> Self {
-        Self::new_with_params(get_calculator_params(algorithm).1, len)
+        Self::from_params(&get_calculator_params(algorithm).1, len)
     }
 }
 
