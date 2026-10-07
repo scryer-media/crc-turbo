@@ -80,6 +80,8 @@ jobs:
         run: cargo clippy --locked --lib --no-default-features --features alloc -- -D warnings
       - name: cache without std
         run: cargo clippy --locked --lib --no-default-features --features cache -- -D warnings
+      - name: generated tables without std
+        run: cargo clippy --locked --lib --no-default-features --features generated-tables -- -D warnings
 
   docs:
     name: docs
@@ -246,6 +248,8 @@ jobs:
         run: cargo check --locked --target ${{ matrix.target }} --no-default-features --features alloc,panic-handler --lib
       - name: no_std with cache
         run: cargo check --locked --target ${{ matrix.target }} --no-default-features --features cache,panic-handler --lib
+      - name: no_std with generated tables
+        run: cargo check --locked --target ${{ matrix.target }} --no-default-features --features generated-tables,panic-handler --lib
       - name: no_std tests (on the host)
         run: cargo test --locked --test no_std_tests
 

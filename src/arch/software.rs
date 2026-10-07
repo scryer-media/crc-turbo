@@ -2,6 +2,7 @@
 
 //! This module contains a software fallback for unsupported architectures.
 
+#[cfg(not(feature = "generated-tables"))]
 use crate::tables;
 use crate::CrcAlgorithm;
 use crate::CrcParams;
@@ -269,7 +270,17 @@ pub(crate) fn update(state: u64, data: &[u8], params: &CrcParams) -> u64 {
 // ============================================================================
 
 fn update_crc16(state: u16, data: &[u8], params: &CrcParams) -> u16 {
-    let (table, refin) = match params.algorithm {
+    match builtin_table_u16(params.algorithm) {
+        Some((table, refin)) => native_update_u16(state, table, refin, data),
+        None => update_crc16_custom(state, data, params),
+    }
+}
+
+/// The stored table of a built-in CRC-16 algorithm and whether it is reflected, or `None` for
+/// custom parameters.
+#[cfg(not(feature = "generated-tables"))]
+fn builtin_table_u16(algorithm: CrcAlgorithm) -> Option<(&'static [[u16; 256]; 16], bool)> {
+    Some(match algorithm {
         CrcAlgorithm::Crc16Arc => (&tables::crc16::CRC16_ARC_TABLE, true),
         CrcAlgorithm::Crc16Cdma2000 => (&tables::crc16::CRC16_CDMA2000_TABLE, false),
         CrcAlgorithm::Crc16Cms => (&tables::crc16::CRC16_CMS_TABLE, false),
@@ -301,13 +312,9 @@ fn update_crc16(state: u16, data: &[u8], params: &CrcParams) -> u16 {
         CrcAlgorithm::Crc16Umts => (&tables::crc16::CRC16_UMTS_TABLE, false),
         CrcAlgorithm::Crc16Usb => (&tables::crc16::CRC16_USB_TABLE, true),
         CrcAlgorithm::Crc16Xmodem => (&tables::crc16::CRC16_XMODEM_TABLE, false),
-        CrcAlgorithm::CrcCustom => {
-            return update_crc16_custom(state, data, params);
-        }
+        CrcAlgorithm::CrcCustom => return None,
         _ => panic!("Invalid algorithm for u16 CRC"),
-    };
-
-    native_update_u16(state, table, refin, data)
+    })
 }
 
 #[cfg(feature = "alloc")]
@@ -370,7 +377,17 @@ fn update_crc16_custom(_state: u16, _data: &[u8], _params: &CrcParams) -> u16 {
 // ============================================================================
 
 fn update_crc32(state: u32, data: &[u8], params: &CrcParams) -> u32 {
-    let (table, refin) = match params.algorithm {
+    match builtin_table_u32(params.algorithm) {
+        Some((table, refin)) => native_update_u32(state, table, refin, data),
+        None => update_crc32_custom(state, data, params),
+    }
+}
+
+/// The stored table of a built-in CRC-32 algorithm and whether it is reflected, or `None` for
+/// custom parameters.
+#[cfg(not(feature = "generated-tables"))]
+fn builtin_table_u32(algorithm: CrcAlgorithm) -> Option<(&'static [[u32; 256]; 16], bool)> {
+    Some(match algorithm {
         CrcAlgorithm::Crc32Aixm => (&tables::crc32::CRC32_AIXM_TABLE, false),
         CrcAlgorithm::Crc32Autosar => (&tables::crc32::CRC32_AUTOSAR_TABLE, true),
         CrcAlgorithm::Crc32Base91D => (&tables::crc32::CRC32_BASE91_D_TABLE, true),
@@ -384,13 +401,9 @@ fn update_crc32(state: u32, data: &[u8], params: &CrcParams) -> u32 {
         CrcAlgorithm::Crc32Mpeg2 => (&tables::crc32::CRC32_MPEG_2_TABLE, false),
         CrcAlgorithm::Crc32Xfer => (&tables::crc32::CRC32_XFER_TABLE, false),
         #[allow(deprecated)]
-        CrcAlgorithm::Crc32Custom | CrcAlgorithm::CrcCustom => {
-            return update_crc32_custom(state, data, params);
-        }
+        CrcAlgorithm::Crc32Custom | CrcAlgorithm::CrcCustom => return None,
         _ => panic!("Invalid algorithm for u32 CRC"),
-    };
-
-    native_update_u32(state, table, refin, data)
+    })
 }
 
 #[cfg(feature = "alloc")]
@@ -453,7 +466,17 @@ fn update_crc32_custom(_state: u32, _data: &[u8], _params: &CrcParams) -> u32 {
 // ============================================================================
 
 fn update_crc64(state: u64, data: &[u8], params: &CrcParams) -> u64 {
-    let (table, refin) = match params.algorithm {
+    match builtin_table_u64(params.algorithm) {
+        Some((table, refin)) => native_update_u64(state, table, refin, data),
+        None => update_crc64_custom(state, data, params),
+    }
+}
+
+/// The stored table of a built-in CRC-64 algorithm and whether it is reflected, or `None` for
+/// custom parameters.
+#[cfg(not(feature = "generated-tables"))]
+fn builtin_table_u64(algorithm: CrcAlgorithm) -> Option<(&'static [[u64; 256]; 16], bool)> {
+    Some(match algorithm {
         CrcAlgorithm::Crc64Ecma182 => (&tables::crc64::CRC64_ECMA_182_TABLE, false),
         CrcAlgorithm::Crc64GoIso => (&tables::crc64::CRC64_GO_ISO_TABLE, true),
         CrcAlgorithm::Crc64Ms => (&tables::crc64::CRC64_MS_TABLE, true),
@@ -462,13 +485,9 @@ fn update_crc64(state: u64, data: &[u8], params: &CrcParams) -> u64 {
         CrcAlgorithm::Crc64We => (&tables::crc64::CRC64_WE_TABLE, false),
         CrcAlgorithm::Crc64Xz => (&tables::crc64::CRC64_XZ_TABLE, true),
         #[allow(deprecated)]
-        CrcAlgorithm::Crc64Custom | CrcAlgorithm::CrcCustom => {
-            return update_crc64_custom(state, data, params);
-        }
+        CrcAlgorithm::Crc64Custom | CrcAlgorithm::CrcCustom => return None,
         _ => panic!("Invalid algorithm for u64 CRC"),
-    };
-
-    native_update_u64(state, table, refin, data)
+    })
 }
 
 #[cfg(feature = "alloc")]
@@ -524,6 +543,106 @@ fn update_crc64_custom(state: u64, data: &[u8], params: &CrcParams) -> u64 {
 #[cfg(not(feature = "alloc"))]
 fn update_crc64_custom(_state: u64, _data: &[u8], _params: &CrcParams) -> u64 {
     panic!("Custom CRC parameters require the 'alloc' feature")
+}
+
+/// The built-in algorithms' tables, generated on first use rather than stored, under the
+/// `generated-tables` feature. Each slot is filled once, from the algorithm's catalogued
+/// parameters by the generator that produced the stored tables, so the tables are identical.
+#[cfg(feature = "generated-tables")]
+mod generated {
+    use super::{generate_table_u16, generate_table_u32, generate_table_u64};
+    use crate::{CrcAlgorithm, CrcParams};
+    #[cfg(not(feature = "std"))]
+    use alloc::boxed::Box;
+
+    /// One slot per `CrcAlgorithm` discriminant. Boxed, so an unused slot costs a pointer.
+    const SLOTS: usize = 64;
+
+    #[cfg(feature = "std")]
+    type Slot<T> = std::sync::OnceLock<Box<T>>;
+    #[cfg(not(feature = "std"))]
+    type Slot<T> = spin::Once<Box<T>>;
+
+    static U16: [Slot<[[u16; 256]; 16]>; SLOTS] = [const { Slot::new() }; SLOTS];
+    static U32: [Slot<[[u32; 256]; 16]>; SLOTS] = [const { Slot::new() }; SLOTS];
+    static U64: [Slot<[[u64; 256]; 16]>; SLOTS] = [const { Slot::new() }; SLOTS];
+
+    /// The catalogued parameters of a built-in algorithm, checked against the width the caller
+    /// dispatched on.
+    fn params(algorithm: CrcAlgorithm, width: u8) -> CrcParams {
+        let params = crate::get_calculator_params(algorithm).1;
+        assert!(params.width == width, "Invalid algorithm for u{width} CRC");
+        params
+    }
+
+    fn slot<T>(slots: &'static [Slot<T>; SLOTS], algorithm: CrcAlgorithm) -> &'static Slot<T> {
+        slots
+            .get(algorithm as usize)
+            .expect("every CrcAlgorithm has a table slot")
+    }
+
+    fn fill<T>(slot: &'static Slot<T>, init: impl FnOnce() -> T) -> &'static T {
+        #[cfg(feature = "std")]
+        let table = slot.get_or_init(|| Box::new(init()));
+        #[cfg(not(feature = "std"))]
+        let table = slot.call_once(|| Box::new(init()));
+        table
+    }
+
+    pub(super) fn u16(algorithm: CrcAlgorithm) -> (&'static [[u16; 256]; 16], bool) {
+        let params = params(algorithm, 16);
+        let table = fill(slot(&U16, algorithm), || {
+            generate_table_u16(16, params.poly as u16, params.refin)
+        });
+        (table, params.refin)
+    }
+
+    pub(super) fn u32(algorithm: CrcAlgorithm) -> (&'static [[u32; 256]; 16], bool) {
+        let params = params(algorithm, 32);
+        let table = fill(slot(&U32, algorithm), || {
+            generate_table_u32(32, params.poly as u32, params.refin)
+        });
+        (table, params.refin)
+    }
+
+    pub(super) fn u64(algorithm: CrcAlgorithm) -> (&'static [[u64; 256]; 16], bool) {
+        let params = params(algorithm, 64);
+        let table = fill(slot(&U64, algorithm), || {
+            generate_table_u64(64, params.poly, params.refin)
+        });
+        (table, params.refin)
+    }
+}
+
+/// The table of a built-in CRC-16 algorithm, generated on first use, and whether it is
+/// reflected, or `None` for custom parameters.
+#[cfg(feature = "generated-tables")]
+fn builtin_table_u16(algorithm: CrcAlgorithm) -> Option<(&'static [[u16; 256]; 16], bool)> {
+    (algorithm != CrcAlgorithm::CrcCustom).then(|| generated::u16(algorithm))
+}
+
+/// The table of a built-in CRC-32 algorithm, generated on first use, and whether it is
+/// reflected, or `None` for custom parameters.
+#[cfg(feature = "generated-tables")]
+#[allow(deprecated)]
+fn builtin_table_u32(algorithm: CrcAlgorithm) -> Option<(&'static [[u32; 256]; 16], bool)> {
+    (!matches!(
+        algorithm,
+        CrcAlgorithm::Crc32Custom | CrcAlgorithm::CrcCustom
+    ))
+    .then(|| generated::u32(algorithm))
+}
+
+/// The table of a built-in CRC-64 algorithm, generated on first use, and whether it is
+/// reflected, or `None` for custom parameters.
+#[cfg(feature = "generated-tables")]
+#[allow(deprecated)]
+fn builtin_table_u64(algorithm: CrcAlgorithm) -> Option<(&'static [[u64; 256]; 16], bool)> {
+    (!matches!(
+        algorithm,
+        CrcAlgorithm::Crc64Custom | CrcAlgorithm::CrcCustom
+    ))
+    .then(|| generated::u64(algorithm))
 }
 
 // ============================================================================
@@ -783,6 +902,56 @@ pub(crate) fn native_update_u64(
 // ============================================================================
 // Property Tests for Native Implementation
 // ============================================================================
+
+#[cfg(test)]
+mod table_tests {
+    use super::*;
+    use crate::test::consts::TEST_ALL_CONFIGS;
+
+    /// Every built-in algorithm's table, stored or generated on first use, is the one its
+    /// catalogued parameters generate, with the matching reflection.
+    #[test]
+    fn every_built_in_algorithm_has_its_generated_table() {
+        for config in TEST_ALL_CONFIGS {
+            let params = config.get_params();
+            let algorithm = params.algorithm;
+            match params.width {
+                16 => {
+                    let (table, refin) = builtin_table_u16(algorithm).expect("built-in table");
+                    assert_eq!(refin, params.refin, "{algorithm:?}");
+                    assert!(
+                        *table == generate_table_u16(16, params.poly as u16, params.refin),
+                        "{algorithm:?}"
+                    );
+                }
+                32 => {
+                    let (table, refin) = builtin_table_u32(algorithm).expect("built-in table");
+                    assert_eq!(refin, params.refin, "{algorithm:?}");
+                    assert!(
+                        *table == generate_table_u32(32, params.poly as u32, params.refin),
+                        "{algorithm:?}"
+                    );
+                }
+                64 => {
+                    let (table, refin) = builtin_table_u64(algorithm).expect("built-in table");
+                    assert_eq!(refin, params.refin, "{algorithm:?}");
+                    assert!(
+                        *table == generate_table_u64(64, params.poly, params.refin),
+                        "{algorithm:?}"
+                    );
+                }
+                width => panic!("unexpected width {width}"),
+            }
+        }
+    }
+
+    #[test]
+    fn custom_parameters_have_no_built_in_table() {
+        assert!(builtin_table_u16(CrcAlgorithm::CrcCustom).is_none());
+        assert!(builtin_table_u32(CrcAlgorithm::CrcCustom).is_none());
+        assert!(builtin_table_u64(CrcAlgorithm::CrcCustom).is_none());
+    }
+}
 
 #[cfg(test)]
 mod property_tests {

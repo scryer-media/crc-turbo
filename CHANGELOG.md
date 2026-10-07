@@ -70,6 +70,18 @@ own changelog up to the fork point continues below, unchanged.
   tests check against. The `capi/` package carries none of it and stays
   `MIT OR Apache-2.0`. From crc-fast#41 by musicinmybrain.
 
+### Binary size
+
+- New `generated-tables` feature: the fifty built-in lookup tables
+  (664 KiB) are generated on first use instead of stored, so a binary that
+  picks its algorithm at run time no longer carries every table. On
+  aarch64 a release build choosing among three algorithms shrinks from
+  1,062,560 to 385,584 bytes. The tables are those the stored ones were
+  generated from, and a test checks every built-in algorithm against the
+  generator either way. Requested in crc-fast#61 by jacobloveless, whose
+  per-width table features this replaces with one feature that covers
+  every algorithm a binary does not use, without fifty feature flags.
+
 ### digest 0.11
 
 - New `digest-0-11` feature: `Digest` implements digest 0.11's `DynDigest`

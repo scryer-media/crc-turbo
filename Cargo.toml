@@ -144,6 +144,9 @@ cache = [
     "hashbrown",
     "spin",
 ] # no_std caching requires alloc + hashbrown HashMap + spin for synchronization
+# Generate each built-in algorithm's 16-slice table on first use instead of storing all of them in
+# the binary. For size-constrained targets; costs one table build per algorithm on first use.
+generated-tables = ["alloc", "spin"]
 
 # the features below are deprecated, aren't in use, and will be removed in the next MAJOR version (v2)
 vpclmulqdq = [] # deprecated, VPCLMULQDQ stabilized in Rust 1.89.0

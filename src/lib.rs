@@ -254,6 +254,7 @@ mod feature_detection;
 mod ffi;
 mod generate;
 mod structs;
+#[cfg(not(feature = "generated-tables"))]
 mod tables;
 mod test;
 mod traits;

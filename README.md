@@ -98,8 +98,29 @@ The library supports various feature flags for different environments:
 ### Optional Features
 * `alloc` - Heap allocation support (enables `Digest` trait, custom CRC params, checksum combining)
 * `cache` - Caches generated constants for custom CRC parameters (requires `alloc`)
+* `generated-tables` - Builds each built-in algorithm's 16-slice lookup table on first use instead of storing all fifty in the binary (requires `alloc`); see [Binary size](#binary-size)
 * `digest-0-11` - Implements digest 0.11's `DynDigest` for `Digest`, alongside digest 0.10's (requires `alloc`)
 * `cli` - Enables command-line tools (`checksum`, `arch-check`, `get-custom-params`)
+
+### Binary size
+
+The table-driven software fallback holds a 16-slice lookup table for each of the fifty built-in
+algorithms, 664 KiB in all:
+
+| width  | tables | each   | total     |
+|--------|-------:|-------:|----------:|
+| CRC-16 |     31 |  8 KiB | 248 KiB   |
+| CRC-32 |     12 | 16 KiB | 192 KiB   |
+| CRC-64 |      7 | 32 KiB | 224 KiB   |
+|        |     50 |        | 664 KiB   |
+
+When the algorithm is a constant, link-time optimisation keeps only its table. When it is chosen at
+run time, as in `Digest::new(algorithm)` with a stored algorithm, the linker keeps all fifty. The
+`generated-tables` feature stores none of them: each algorithm's table is generated on its first
+software-path use and kept on the heap. A release build on aarch64 that picks one of three
+algorithms at run time goes from 1,062,560 to 385,584 bytes; one that names a single algorithm
+goes from 335,792 to 319,296 bytes. CPUs with a SIMD tier never take the software path, so
+there the tables are never built at all.
 
 ### Building for `no_std`
 
