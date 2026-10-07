@@ -88,7 +88,7 @@ impl CrcParams {
     ///
     /// Does not support mis-matched refin/refout parameters, so both must be true or both false.
     ///
-    /// Rocksoft parameters for lots of variants: https://reveng.sourceforge.io/crc-catalogue/all.htm
+    /// Rocksoft parameters for lots of variants: <https://reveng.sourceforge.io/crc-catalogue/all.htm>
     pub fn new(
         name: &'static str,
         width: u8,
