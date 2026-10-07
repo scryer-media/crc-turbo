@@ -3,7 +3,8 @@ name = "crc-turbo"
 version = "1.11.0"
 edition = "2021"
 authors = ["Don MacAskill", "NZB Man"]
-license = "MIT OR Apache-2.0"
+# src/combine.rs carries Zlib-licensed code; its notice is in that file.
+license = "(MIT OR Apache-2.0) AND Zlib"
 keywords = ["crc", "checksum", "simd", "accelerated", "fast"]
 categories = ["algorithms", "encoding", "hardware-support"]
 homepage = "https://github.com/scryer-media/crc-turbo"

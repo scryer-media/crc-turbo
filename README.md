@@ -654,3 +654,6 @@ To help ensure memory safety and stability, this crate is validated using [Miri]
 
 * Apache 2.0 license ([LICENSE-Apache](./LICENSE-Apache) or <http://www.apache.org/licenses/LICENSE-2.0>)
 * MIT license ([LICENSE-MIT](./LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
+
+`src/combine.rs` also carries Mark Adler's `crccomb.c`, under the Zlib licence whose notice is kept
+in that file, so the crate's SPDX expression is `(MIT OR Apache-2.0) AND Zlib`.

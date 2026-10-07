@@ -65,6 +65,10 @@ own changelog up to the fork point continues below, unchanged.
 - The `ffi` feature enables `std`. The C functions use `std` throughout,
   so `--no-default-features --features ffi` did not compile. From
   crc-fast#48 by MggMuggins.
+- The licence field is `(MIT OR Apache-2.0) AND Zlib`: `src/combine.rs`
+  carries Mark Adler's Zlib-licensed `crccomb.c`, now as the reference its
+  tests check against. The `capi/` package carries none of it and stays
+  `MIT OR Apache-2.0`. From crc-fast#41 by musicinmybrain.
 
 ### Dependencies
 
