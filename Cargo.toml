@@ -128,8 +128,8 @@ alloc = ["digest"] # marker feature for heap allocation support
 # this off and brings its own. Kept, and default, for compatibility with crc-fast.
 panic-handler = []
 # The C functions declared in libcrc_turbo.h. `capi/` builds them into the shared and static
-# libraries. Default for compatibility with crc-fast.
-ffi = []
+# libraries. Default for compatibility with crc-fast. Needs `std`, which it now enables.
+ffi = ["std"]
 
 # optional features
 cli = ["std"] # command line interface binaries (checksum, arch-check, get-custom-params)

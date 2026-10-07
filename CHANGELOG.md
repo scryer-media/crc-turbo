@@ -62,6 +62,9 @@ own changelog up to the fork point continues below, unchanged.
   test against the static and the shared library. From crc-fast#49 by
   onur-ozkan, which dropped the extra crate types; the `capi/` package keeps
   the C library.
+- The `ffi` feature enables `std`. The C functions use `std` throughout,
+  so `--no-default-features --features ffi` did not compile. From
+  crc-fast#48 by MggMuggins.
 
 ### Dependencies
 
