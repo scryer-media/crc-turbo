@@ -98,6 +98,7 @@ The library supports various feature flags for different environments:
 ### Optional Features
 * `alloc` - Heap allocation support (enables `Digest` trait, custom CRC params, checksum combining)
 * `cache` - Caches generated constants for custom CRC parameters (requires `alloc`)
+* `digest-0-11` - Implements digest 0.11's `DynDigest` for `Digest`, alongside digest 0.10's (requires `alloc`)
 * `cli` - Enables command-line tools (`checksum`, `arch-check`, `get-custom-params`)
 
 ### Building for `no_std`

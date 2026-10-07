@@ -41,8 +41,9 @@
 //!
 //! ## Digest
 //!
-//! Implements the [digest::DynDigest](https://docs.rs/digest/latest/digest/trait.DynDigest.html)
-//! trait for easier integration with existing code.
+//! Implements digest 0.10's [`DynDigest`](https://docs.rs/digest/0.10/digest/trait.DynDigest.html)
+//! trait for easier integration with existing code, and digest 0.11's as well under the
+//! `digest-0-11` feature.
 //!
 //! ```rust
 //! use crc_turbo::{Digest, CrcAlgorithm::Crc32IsoHdlc};
@@ -473,54 +474,67 @@ pub struct Digest {
     calculator: CalculatorFn,
 }
 
+/// Implements one major version's `DynDigest` for [`Digest`]. digest 0.10 and 0.11 declare the
+/// same methods; only the trait and its error type differ.
 #[cfg(feature = "alloc")]
-impl DynDigest for Digest {
-    #[inline(always)]
-    fn update(&mut self, data: &[u8]) {
-        self.update(data);
-    }
+macro_rules! impl_dyn_digest {
+    ($dyn_digest:path, $invalid_buffer_size:path) => {
+        impl $dyn_digest for Digest {
+            #[inline(always)]
+            fn update(&mut self, data: &[u8]) {
+                self.update(data);
+            }
 
-    #[inline(always)]
-    fn finalize_into(self, buf: &mut [u8]) -> Result<(), InvalidBufferSize> {
-        if buf.len() != self.output_size() {
-            return Err(InvalidBufferSize);
+            #[inline(always)]
+            fn finalize_into(self, buf: &mut [u8]) -> Result<(), $invalid_buffer_size> {
+                if buf.len() != <Self as $dyn_digest>::output_size(&self) {
+                    return Err($invalid_buffer_size);
+                }
+
+                let result = self.finalize();
+                let be_bytes = result.to_be_bytes();
+                let start = 8 - <Self as $dyn_digest>::output_size(&self);
+                buf.copy_from_slice(&be_bytes[start..]);
+
+                Ok(())
+            }
+
+            #[inline(always)]
+            fn finalize_into_reset(&mut self, out: &mut [u8]) -> Result<(), $invalid_buffer_size> {
+                if out.len() != <Self as $dyn_digest>::output_size(&self) {
+                    return Err($invalid_buffer_size);
+                }
+                let result = self.finalize();
+                self.reset();
+                let be_bytes = result.to_be_bytes();
+                let start = 8 - <Self as $dyn_digest>::output_size(&self);
+                out.copy_from_slice(&be_bytes[start..]);
+                Ok(())
+            }
+
+            #[inline(always)]
+            fn reset(&mut self) {
+                self.reset();
+            }
+
+            #[inline(always)]
+            fn output_size(&self) -> usize {
+                self.params.width as usize / 8
+            }
+
+            fn box_clone(&self) -> Box<dyn $dyn_digest> {
+                Box::new(*self)
+            }
         }
-
-        let result = self.finalize();
-        let be_bytes = result.to_be_bytes();
-        let start = 8 - self.output_size();
-        buf.copy_from_slice(&be_bytes[start..]);
-
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn finalize_into_reset(&mut self, out: &mut [u8]) -> Result<(), InvalidBufferSize> {
-        if out.len() != self.output_size() {
-            return Err(InvalidBufferSize);
-        }
-        let result = self.finalize();
-        self.reset();
-        let be_bytes = result.to_be_bytes();
-        let start = 8 - self.output_size();
-        out.copy_from_slice(&be_bytes[start..]);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn reset(&mut self) {
-        self.reset();
-    }
-
-    #[inline(always)]
-    fn output_size(&self) -> usize {
-        self.params.width as usize / 8
-    }
-
-    fn box_clone(&self) -> Box<dyn DynDigest> {
-        Box::new(*self)
-    }
+    };
 }
+
+#[cfg(feature = "alloc")]
+impl_dyn_digest!(DynDigest, InvalidBufferSize);
+
+// digest 0.11's `DynDigest`, alongside digest 0.10's, under the `digest-0-11` feature.
+#[cfg(feature = "digest-0-11")]
+impl_dyn_digest!(digest_0_11::DynDigest, digest_0_11::InvalidBufferSize);
 
 impl Digest {
     /// Creates a new `Digest` instance for the specified CRC algorithm.
@@ -1878,6 +1892,38 @@ mod lib {
 
             digest.update(TEST_CHECK_STRING);
             assert_eq!(digest.finalize(), config.get_check());
+        }
+    }
+
+    /// digest 0.11's `DynDigest` gives the bytes digest 0.10's does, through a trait object and
+    /// after a reset, for every algorithm.
+    #[cfg(feature = "digest-0-11")]
+    #[test]
+    fn test_digest_0_11_matches_digest_0_10() {
+        for config in TEST_ALL_CONFIGS {
+            let mut old: Box<dyn digest::DynDigest> = Box::new(Digest::new(config.get_algorithm()));
+            let mut new: Box<dyn digest_0_11::DynDigest> =
+                Box::new(Digest::new(config.get_algorithm()));
+            assert_eq!(new.output_size(), old.output_size());
+
+            for _ in 0..2 {
+                old.update(TEST_CHECK_STRING);
+                new.update(TEST_CHECK_STRING);
+                let mut expected = vec![0u8; old.output_size()];
+                let mut actual = vec![0u8; new.output_size()];
+                old.finalize_into_reset(&mut expected).unwrap();
+                new.finalize_into_reset(&mut actual).unwrap();
+                assert_eq!(actual, expected, "{:?}", config.get_algorithm());
+            }
+
+            let mut short = vec![0u8; new.output_size() - 1];
+            assert!(new.box_clone().finalize_into_reset(&mut short).is_err());
+            new.update(TEST_CHECK_STRING);
+            let actual = new.box_clone().finalize();
+            let mut expected = vec![0u8; old.output_size()];
+            old.update(TEST_CHECK_STRING);
+            old.finalize_into_reset(&mut expected).unwrap();
+            assert_eq!(&*actual, &expected[..], "{:?}", config.get_algorithm());
         }
     }
 

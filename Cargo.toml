@@ -39,6 +39,9 @@ bench = true
 # environments. This configuration is safe because the alloc feature in digest does not depend on its default features
 # as of digest v0.10.
 digest = { version = "0.10", optional = true, default-features = false, features = ["alloc"] }
+# digest 0.11, for the `digest-0-11` feature. Renamed so both majors can be implemented at once;
+# making 0.11 the only one would change a trait the default features expose, which waits for 2.0.
+digest_0_11 = { package = "digest", version = "0.11", optional = true, default-features = false, features = ["alloc"] }
 
 # no_std support
 # spin is optional - only needed on architectures with SIMD (for feature detection)
@@ -134,6 +137,8 @@ ffi = ["std"]
 
 # optional features
 cli = ["std"] # command line interface binaries (checksum, arch-check, get-custom-params)
+# Implements digest 0.11's `DynDigest` for `Digest` as well as digest 0.10's.
+digest-0-11 = ["alloc", "dep:digest_0_11"]
 cache = [
     "alloc",
     "hashbrown",

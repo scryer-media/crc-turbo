@@ -70,6 +70,17 @@ own changelog up to the fork point continues below, unchanged.
   tests check against. The `capi/` package carries none of it and stays
   `MIT OR Apache-2.0`. From crc-fast#41 by musicinmybrain.
 
+### digest 0.11
+
+- New `digest-0-11` feature: `Digest` implements digest 0.11's `DynDigest`
+  as well as digest 0.10's, from one shared body. digest 0.10 stays the
+  default because its `DynDigest` impl is reached under the default
+  features (`std` enables `alloc`), so moving the default to 0.11 changes a
+  trait a consumer already uses without opting in, which is a breaking
+  change for 2.0. The update itself is crc-fast#46 by xtqqczze, for
+  crc-fast#44 by Nukesor; taking it as a second, opt-in implementation lets
+  it ship in 1.11.
+
 ### Dependencies
 
 - `spin` 0.10.1; 0.10.0 is yanked (crc-fast#52). From crc-fast#50 by
