@@ -1,0 +1,6 @@
+# Labels actionlint's bundled list does not know yet. GitHub's hosted runner
+# list (actions/runner-images README) carries both.
+self-hosted-runner:
+  labels:
+    - ubuntu-26.04
+    - ubuntu-26.04-arm

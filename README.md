@@ -428,6 +428,27 @@ let checksum = checksum_file_with_params(custom_params, file_on_disk, None);
 assert_eq!(checksum.unwrap(), 0xcbf43926);
 ```
 
+### Errors
+
+`CrcParams::new`, and the functions that take a `CrcAlgorithm`, panic on misuse: a width other than 16, 32 or 64, or a
+`Custom` algorithm passed where parameters are needed. Each has a fallible form that returns a `CrcError` instead, for
+callers that would rather handle it than abort, which matters in `no_std` builds: `CrcParams::try_new`, `try_checksum`,
+`Digest::try_new`, `Digest::try_new_with_init_state`, `CrcCombine::try_new` and `CrcCombine::try_new_with_params`.
+Checksumming itself never fails.
+
+```rust
+use crc_turbo::{try_checksum, CrcAlgorithm, CrcError, CrcParams};
+
+assert_eq!(
+    CrcParams::try_new("CRC-8/CUSTOM", 8, 0x07, 0, false, 0, 0xf4).unwrap_err(),
+    CrcError::UnsupportedWidth(8)
+);
+assert_eq!(
+    try_checksum(CrcAlgorithm::CrcCustom, b"123456789").unwrap_err(),
+    CrcError::MissingParams(CrcAlgorithm::CrcCustom)
+);
+```
+
 ## C/C++ compatible library
 
 `cargo build --release --manifest-path capi/Cargo.toml` produces a shared library (`.so` on Linux, `.dll` on Windows,

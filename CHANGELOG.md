@@ -45,7 +45,8 @@ own changelog up to the fork point continues below, unchanged.
   (cargo-audit over both lockfiles, zizmor); `codeql`; gitleaks pre-commit
   hooks; renovate; issue templates; `AGENTS.md`, `SECURITY.md`,
   `CONTRIBUTORS.md`. Upstream's `tests.yml` and `release.yml` were replaced
-  as duplicates of these.
+  as duplicates of these. The Linux lanes run on `ubuntu-26.04` and
+  `ubuntu-26.04-arm`, the current hosted images.
 - The crate archive no longer carries the repository's CI, hook, fuzz and
   agent files, nor upstream's `.kiro/` design notes, which stay in the
   repository.
@@ -210,6 +211,30 @@ own changelog up to the fork point continues below, unchanged.
 - `.gitleaks.toml` extends the default rule set; a config without
   `[extend]` has no rules at all, so the pre-commit scan could never find
   a secret. The hook also fails closed when `git diff --cached` fails.
+- crc-fast#64 by GiorgioRegni, filed the day before that review, reports
+  the aarch64 `crc` and AVX512BW gaps above and two more, also fixed: the
+  AVX-512 CRC-32/ISCSI kernel folded the initial CRC in through
+  `_mm512_castsi128_si512`, whose upper 384 bits the intrinsic leaves
+  undefined (the compiler zeroed them, so no result was wrong); it is now
+  `_mm512_zextsi128_si512`, which defines them as zero. And the tests it
+  asked for exist: every built-in algorithm against the `crc` crate from
+  every start offset within a cache line, inputs that end exactly at an
+  unmapped page and inputs that start exactly after one (a read outside
+  the input faults the test), and a digest split at every point of 3,000
+  bytes.
+
+### Errors
+
+- Misuse no longer has to panic. New `CrcError` (`UnsupportedWidth`,
+  `MismatchedReflection`, `MissingParams`), with fallible forms of every
+  entry point that could panic on its arguments: `CrcParams::try_new`,
+  `try_checksum`, `Digest::try_new`, `Digest::try_new_with_init_state`,
+  `CrcCombine::try_new` and `CrcCombine::try_new_with_params`. The
+  existing functions keep their signatures and now document their panics,
+  which carry the same messages. `CrcAlgorithm` derives `Eq` and `Hash`.
+  Requested in crc-fast#37 by dengyt2018 for `no_std` callers; the error
+  type is hand-written rather than `thiserror`'s, so the library gains no
+  dependency.
 
 ### Combine
 

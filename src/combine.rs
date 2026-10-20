@@ -50,7 +50,7 @@
 */
 
 use crate::arch::clmul::Clmul;
-use crate::CrcParams;
+use crate::{CrcError, CrcParams};
 
 /// The low `width` bits.
 #[inline(always)]
@@ -319,19 +319,38 @@ impl CrcCombine {
     /// # Panics
     ///
     /// If the parameters mix reflected input with unreflected output or the reverse, which no
-    /// catalogued CRC of a supported width does, or if the width is not 16, 32 or 64.
+    /// catalogued CRC of a supported width does, or if the width is not 16, 32 or 64;
+    /// [`CrcCombine::try_new_with_params`] returns the error instead.
     #[inline]
     pub fn new_with_params(params: CrcParams, len: u64) -> Self {
         Self::from_params(&params, len)
     }
 
+    /// [`CrcCombine::new_with_params`] that returns [`CrcError::MismatchedReflection`] or
+    /// [`CrcError::UnsupportedWidth`] instead of panicking.
+    #[inline]
+    pub fn try_new_with_params(params: CrcParams, len: u64) -> Result<Self, CrcError> {
+        Self::try_from_params(&params, len)
+    }
+
     /// [`CrcCombine::new_with_params`] without moving the parameters, which carry the fold keys.
     #[inline]
     pub(crate) fn from_params(params: &CrcParams, len: u64) -> Self {
-        assert!(
-            params.refin == params.refout,
-            "Unsupported CRC configuration: refin and refout differ"
-        );
+        match Self::try_from_params(params, len) {
+            Ok(combine) => combine,
+            Err(error) => panic!("{error}"),
+        }
+    }
+
+    /// [`CrcCombine::try_new_with_params`] without moving the parameters.
+    #[inline]
+    pub(crate) fn try_from_params(params: &CrcParams, len: u64) -> Result<Self, CrcError> {
+        if !matches!(params.width, 16 | 32 | 64) {
+            return Err(CrcError::UnsupportedWidth(params.width));
+        }
+        if params.refin != params.refout {
+            return Err(CrcError::MismatchedReflection);
+        }
 
         #[cfg(any(
             feature = "std",
@@ -359,14 +378,14 @@ impl CrcCombine {
             (field, field.pow_bytes(1 << 1, len))
         };
 
-        Self {
+        Ok(Self {
             field,
             reflected: params.refin,
             init_algorithm: params.init_algorithm & mask(params.width),
             xorout: params.xorout & mask(params.width),
             len,
             power,
-        }
+        })
     }
 
     /// The number of bytes this operator appends.

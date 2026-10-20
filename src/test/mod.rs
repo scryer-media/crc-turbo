@@ -6,6 +6,7 @@
 #![allow(dead_code)]
 
 pub(crate) mod consts;
+mod contract;
 pub(crate) mod enums;
 mod future_proof_tests;
 mod structs;

@@ -243,12 +243,14 @@ pub mod arch;
 mod cache;
 mod combine;
 pub use combine::CrcCombine;
+pub use error::CrcError;
 pub use feature_detection::TIER_ENV;
 mod consts;
 mod crc16;
 mod crc32;
 mod crc64;
 mod enums;
+mod error;
 mod feature_detection;
 #[cfg(feature = "ffi")]
 mod ffi;
@@ -260,7 +262,7 @@ mod test;
 mod traits;
 
 /// Supported CRC-16, CRC-32, and CRC-64 variants
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CrcAlgorithm {
     /// Generic custom CRC variant that works with any supported width (16, 32, 64).
     /// The actual width is determined by the `width` field in `CrcParams`.
@@ -551,6 +553,11 @@ impl Digest {
     ///
     /// assert_eq!(checksum, 0xcbf43926);
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// For the `Custom` algorithms, which need [`Digest::new_with_params`];
+    /// [`Digest::try_new`] returns the error instead.
     #[inline(always)]
     pub fn new(algorithm: CrcAlgorithm) -> Self {
         let (calculator, params) = get_calculator_params(algorithm);
@@ -561,6 +568,49 @@ impl Digest {
             params,
             calculator,
         }
+    }
+
+    /// [`Digest::new`] that returns [`CrcError::MissingParams`] for the `Custom` algorithms
+    /// instead of panicking.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use crc_turbo::{CrcAlgorithm, CrcError, Digest};
+    ///
+    /// assert!(Digest::try_new(CrcAlgorithm::Crc32IsoHdlc).is_ok());
+    /// assert_eq!(
+    ///     Digest::try_new(CrcAlgorithm::CrcCustom).unwrap_err(),
+    ///     CrcError::MissingParams(CrcAlgorithm::CrcCustom)
+    /// );
+    /// ```
+    #[inline]
+    pub fn try_new(algorithm: CrcAlgorithm) -> Result<Self, CrcError> {
+        let (calculator, params) = try_get_calculator_params(algorithm)?;
+
+        Ok(Self {
+            state: params.init_algorithm,
+            amount: 0,
+            params,
+            calculator,
+        })
+    }
+
+    /// [`Digest::new_with_init_state`] that returns [`CrcError::MissingParams`] for the `Custom`
+    /// algorithms instead of panicking.
+    #[inline]
+    pub fn try_new_with_init_state(
+        algorithm: CrcAlgorithm,
+        init_state: u64,
+    ) -> Result<Self, CrcError> {
+        let (calculator, params) = try_get_calculator_params(algorithm)?;
+
+        Ok(Self {
+            state: init_state,
+            amount: 0,
+            params,
+            calculator,
+        })
     }
 
     /// Creates a new `Digest` instance for the specified CRC algorithm with a custom initial state.
@@ -586,6 +636,11 @@ impl Digest {
     /// // same initial state as the default, so checksum will be the same
     /// assert_eq!(checksum, 0xcbf43926);
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// For the `Custom` algorithms, which need [`Digest::new_with_params`];
+    /// [`Digest::try_new_with_init_state`] returns the error instead.
     #[inline(always)]
     pub fn new_with_init_state(algorithm: CrcAlgorithm, init_state: u64) -> Self {
         let (calculator, params) = get_calculator_params(algorithm);
@@ -741,6 +796,28 @@ impl Write for Digest {
     }
 }
 
+/// [`checksum`] that returns [`CrcError::MissingParams`] for the `Custom` algorithms instead of
+/// panicking.
+///
+/// # Examples
+///
+/// ```rust
+/// use crc_turbo::{try_checksum, CrcAlgorithm, CrcError};
+///
+/// assert_eq!(try_checksum(CrcAlgorithm::Crc32IsoHdlc, b"123456789"), Ok(0xcbf43926));
+/// assert_eq!(
+///     try_checksum(CrcAlgorithm::CrcCustom, b"123456789"),
+///     Err(CrcError::MissingParams(CrcAlgorithm::CrcCustom))
+/// );
+/// ```
+#[inline]
+pub fn try_checksum(algorithm: CrcAlgorithm, buf: &[u8]) -> Result<u64, CrcError> {
+    if algorithm.needs_params() {
+        return Err(CrcError::MissingParams(algorithm));
+    }
+    Ok(checksum(algorithm, buf))
+}
+
 /// Computes the CRC checksum for the given data using the specified algorithm.
 ///
 ///```rust
@@ -749,6 +826,11 @@ impl Write for Digest {
 ///
 /// assert_eq!(checksum, 0xcbf43926);
 /// ```
+///
+/// # Panics
+///
+/// For the `Custom` algorithms, which need [`checksum_with_params`]; [`try_checksum`] returns
+/// the error instead.
 #[inline]
 #[allow(deprecated)]
 pub fn checksum(algorithm: CrcAlgorithm, buf: &[u8]) -> u64 {
@@ -876,9 +958,7 @@ pub fn checksum(algorithm: CrcAlgorithm, buf: &[u8]) -> u64 {
         CrcAlgorithm::Crc32Cksum => {
             Calculator::calculate(CRC32_CKSUM.init, buf, &CRC32_CKSUM) ^ CRC32_CKSUM.xorout
         }
-        CrcAlgorithm::Crc32Custom => {
-            panic!("Custom CRC-32 requires parameters via CrcParams::new()")
-        }
+        CrcAlgorithm::Crc32Custom => missing_params(algorithm),
         CrcAlgorithm::Crc32Iscsi => {
             crc32_iscsi_calculator(CRC32_ISCSI.init, buf, &CRC32_ISCSI) ^ CRC32_ISCSI.xorout
         }
@@ -898,12 +978,8 @@ pub fn checksum(algorithm: CrcAlgorithm, buf: &[u8]) -> u64 {
         CrcAlgorithm::Crc32Xfer => {
             Calculator::calculate(CRC32_XFER.init, buf, &CRC32_XFER) ^ CRC32_XFER.xorout
         }
-        CrcAlgorithm::CrcCustom => {
-            panic!("Custom CRC requires parameters via CrcParams::new()")
-        }
-        CrcAlgorithm::Crc64Custom => {
-            panic!("Custom CRC-64 requires parameters via CrcParams::new()")
-        }
+        CrcAlgorithm::CrcCustom => missing_params(algorithm),
+        CrcAlgorithm::Crc64Custom => missing_params(algorithm),
         CrcAlgorithm::Crc64Ecma182 => {
             Calculator::calculate(CRC64_ECMA_182.init, buf, &CRC64_ECMA_182) ^ CRC64_ECMA_182.xorout
         }
@@ -1074,6 +1150,11 @@ fn checksum_file_with_digest(
 ///
 /// assert_eq!(checksum, 0xcbf43926);
 /// ```
+///
+/// # Panics
+///
+/// For the `Custom` algorithms, which need [`checksum_combine_with_params`];
+/// [`CrcCombine::try_new`] returns the error instead.
 #[inline(always)]
 pub fn checksum_combine(
     algorithm: CrcAlgorithm,
@@ -1127,6 +1208,12 @@ impl CrcCombine {
     /// For the `Custom` algorithms, which need [`CrcCombine::new_with_params`].
     pub fn new(algorithm: CrcAlgorithm, len: u64) -> Self {
         Self::from_params(&get_calculator_params(algorithm).1, len)
+    }
+
+    /// [`CrcCombine::new`] that returns [`CrcError::MissingParams`] for the `Custom` algorithms
+    /// instead of panicking.
+    pub fn try_new(algorithm: CrcAlgorithm, len: u64) -> Result<Self, CrcError> {
+        Self::try_from_params(&try_get_calculator_params(algorithm)?.1, len)
     }
 }
 
@@ -1263,7 +1350,42 @@ pub fn get_calculator_target(_algorithm: CrcAlgorithm) -> String {
     "software-fallback-tables".to_string()
 }
 
+impl CrcAlgorithm {
+    /// Whether this variant is a placeholder for custom parameters rather than an algorithm.
+    #[inline(always)]
+    #[allow(deprecated)]
+    pub(crate) fn needs_params(self) -> bool {
+        matches!(
+            self,
+            CrcAlgorithm::CrcCustom | CrcAlgorithm::Crc32Custom | CrcAlgorithm::Crc64Custom
+        )
+    }
+}
+
+/// The panic the infallible entry points raise for a `Custom` algorithm.
+#[cold]
+#[inline(never)]
+fn missing_params(algorithm: CrcAlgorithm) -> ! {
+    panic!("{}", CrcError::MissingParams(algorithm))
+}
+
+/// [`get_calculator_params`] that returns [`CrcError::MissingParams`] for the `Custom`
+/// algorithms instead of panicking.
+#[inline(always)]
+fn try_get_calculator_params(
+    algorithm: CrcAlgorithm,
+) -> Result<(CalculatorFn, CrcParams), CrcError> {
+    if algorithm.needs_params() {
+        return Err(CrcError::MissingParams(algorithm));
+    }
+    Ok(get_calculator_params(algorithm))
+}
+
 /// Returns the calculator function and parameters for the specified CRC algorithm.
+///
+/// # Panics
+///
+/// For the `Custom` algorithms, which carry no parameters.
 #[inline(always)]
 #[allow(deprecated)]
 fn get_calculator_params(algorithm: CrcAlgorithm) -> (CalculatorFn, CrcParams) {
@@ -1312,21 +1434,15 @@ fn get_calculator_params(algorithm: CrcAlgorithm) -> (CalculatorFn, CrcParams) {
         CrcAlgorithm::Crc32Bzip2 => (Calculator::calculate as CalculatorFn, CRC32_BZIP2),
         CrcAlgorithm::Crc32CdRomEdc => (Calculator::calculate as CalculatorFn, CRC32_CD_ROM_EDC),
         CrcAlgorithm::Crc32Cksum => (Calculator::calculate as CalculatorFn, CRC32_CKSUM),
-        CrcAlgorithm::Crc32Custom => {
-            panic!("Custom CRC-32 requires parameters via CrcParams::new()")
-        }
+        CrcAlgorithm::Crc32Custom => missing_params(algorithm),
         CrcAlgorithm::Crc32Iscsi => (crc32_iscsi_calculator as CalculatorFn, CRC32_ISCSI),
         CrcAlgorithm::Crc32IsoHdlc => (crc32_iso_hdlc_calculator as CalculatorFn, CRC32_ISO_HDLC),
         CrcAlgorithm::Crc32Jamcrc => (Calculator::calculate as CalculatorFn, CRC32_JAMCRC),
         CrcAlgorithm::Crc32Mef => (Calculator::calculate as CalculatorFn, CRC32_MEF),
         CrcAlgorithm::Crc32Mpeg2 => (Calculator::calculate as CalculatorFn, CRC32_MPEG_2),
         CrcAlgorithm::Crc32Xfer => (Calculator::calculate as CalculatorFn, CRC32_XFER),
-        CrcAlgorithm::CrcCustom => {
-            panic!("Custom CRC requires parameters via CrcParams::new()")
-        }
-        CrcAlgorithm::Crc64Custom => {
-            panic!("Custom CRC-64 requires parameters via CrcParams::new()")
-        }
+        CrcAlgorithm::CrcCustom => missing_params(algorithm),
+        CrcAlgorithm::Crc64Custom => missing_params(algorithm),
         CrcAlgorithm::Crc64Ecma182 => (Calculator::calculate as CalculatorFn, CRC64_ECMA_182),
         CrcAlgorithm::Crc64GoIso => (Calculator::calculate as CalculatorFn, CRC64_GO_ISO),
         CrcAlgorithm::Crc64Ms => (Calculator::calculate as CalculatorFn, CRC64_MS),
