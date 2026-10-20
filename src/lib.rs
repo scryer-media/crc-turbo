@@ -1133,6 +1133,10 @@ impl CrcCombine {
 /// The CRC of `len` zero bytes, computed in a few dozen field multiplies rather than by reading
 /// `len` bytes.
 ///
+/// # Panics
+///
+/// For the `Custom` algorithms, which need [`checksum_zeros_with_params`].
+///
 /// # Examples
 ///
 /// ```rust
@@ -1153,10 +1157,10 @@ pub fn checksum_zeros_with_params(params: CrcParams, len: u64) -> u64 {
 ///
 /// This function provides visibility into the active performance tier being used for CRC calculations.
 /// The target string follows the format `{architecture}-{intrinsics-family}-{intrinsics-features}`,
-/// such as `aarch64-aes-sha3` or `x86_64-avx512-vpclmulqdq`.
+/// such as `aarch64-neon-pmull-sha3` or `x86_64-avx512-vpclmulqdq`.
 ///
 /// The performance tier system provides graceful degradation across different hardware capabilities:
-/// - **AArch64**: `aarch64-aes-sha3` (highest) → `aarch64-aes-pmull` (baseline)
+/// - **AArch64**: `aarch64-neon-pmull-sha3` (highest) → `aarch64-neon-pmull` (baseline)
 /// - **x86_64**: `x86_64-avx512-vpclmulqdq` (highest) → `x86_64-avx512-pclmulqdq` (mid) →
 ///   `x86_64-avx2-vpclmulqdq` (VPCLMULQDQ without AVX-512) → `x86_64-sse-pclmulqdq` (baseline)
 /// - **x86**: `x86-sse-pclmulqdq` (baseline) → `software-fallback-tables` (fallback)
@@ -1175,7 +1179,7 @@ pub fn checksum_zeros_with_params(params: CrcParams, len: u64) -> u64 {
 /// let target = get_calculator_target(Crc32IsoHdlc);
 /// println!("Using performance tier: {}", target);
 /// // Example outputs:
-/// // "aarch64-aes-sha3" - AArch64 with SHA3 and AES support
+/// // "aarch64-neon-pmull-sha3" - AArch64 with SHA3 and AES support
 /// // "x86_64-avx512-vpclmulqdq" - x86_64 with VPCLMULQDQ support
 /// // "x86_64-sse-pclmulqdq" - x86_64 baseline with SSE4.1 and PCLMULQDQ
 /// ```
@@ -1344,12 +1348,21 @@ fn crc32_iscsi_calculator(state: u64, data: &[u8], _params: &CrcParams) -> u64 {
     {
         use crate::feature_detection::PerformanceTier;
 
+        // The pinned tier holds the fusion kernel too: `aarch64-neon-pmull` on a CPU with SHA3
+        // runs the PMULL kernel, not the EOR3 one.
+        // The fusion kernels also use the CRC32 instructions, an optional extension on ARMv8.0
+        // that the tier does not imply.
         let arch_ops = get_arch_ops();
-        match arch_ops.get_tier() {
-            PerformanceTier::AArch64AesSha3 | PerformanceTier::AArch64Aes => {
-                return fusion::crc32_iscsi(state as u32, data) as u64;
+        if std::arch::is_aarch64_feature_detected!("crc") {
+            match arch_ops.get_tier() {
+                PerformanceTier::AArch64AesSha3 => {
+                    return fusion::crc32_iscsi(state as u32, data) as u64;
+                }
+                PerformanceTier::AArch64Aes => {
+                    return fusion::crc32_iscsi_pmull(state as u32, data) as u64;
+                }
+                _ => {}
             }
-            _ => {}
         }
     }
 
@@ -1357,16 +1370,28 @@ fn crc32_iscsi_calculator(state: u64, data: &[u8], _params: &CrcParams) -> u64 {
     {
         use crate::feature_detection::PerformanceTier;
 
+        // The fusion path requires pclmulqdq (every tier here has it) and sse4.2 (for the CRC32
+        // instructions). The VPCLMULQDQ tier lets the kernel pick its widest form; the tiers
+        // below it, which a pinned `CRC_TURBO_TIER` can select on a wider part, hold the kernel
+        // to their own width.
         let arch_ops = get_arch_ops();
         match arch_ops.get_tier() {
-            PerformanceTier::X86_64Avx512Vpclmulqdq
-            | PerformanceTier::X86_64Avx512Pclmulqdq
-            | PerformanceTier::X86_64Avx2Vpclmulqdq
-            | PerformanceTier::X86_64SsePclmulqdq
-            | PerformanceTier::X86SsePclmulqdq => {
-                // fusion path requires both pclmulqdq (checked by tier) and sse4.2 (for CRC32 instructions)
+            PerformanceTier::X86_64Avx512Vpclmulqdq => {
                 if is_x86_feature_detected!("sse4.2") {
                     return fusion::crc32_iscsi(state as u32, data) as u64;
+                }
+            }
+            #[cfg(target_arch = "x86_64")]
+            PerformanceTier::X86_64Avx512Pclmulqdq => {
+                if is_x86_feature_detected!("sse4.2") {
+                    return fusion::crc32_iscsi_avx512_pclmulqdq(state as u32, data) as u64;
+                }
+            }
+            PerformanceTier::X86_64Avx2Vpclmulqdq
+            | PerformanceTier::X86_64SsePclmulqdq
+            | PerformanceTier::X86SsePclmulqdq => {
+                if is_x86_feature_detected!("sse4.2") {
+                    return fusion::crc32_iscsi_sse(state as u32, data) as u64;
                 }
             }
             _ => {}
@@ -1389,11 +1414,18 @@ fn crc32_iso_hdlc_calculator(state: u64, data: &[u8], _params: &CrcParams) -> u6
         use crate::feature_detection::{get_arch_ops, PerformanceTier};
         let arch_ops = get_arch_ops();
 
-        match arch_ops.get_tier() {
-            PerformanceTier::AArch64AesSha3 | PerformanceTier::AArch64Aes => {
-                return fusion::crc32_iso_hdlc(state as u32, data) as u64;
+        // The fusion kernels also use the CRC32 instructions, an optional extension on ARMv8.0
+        // that the tier does not imply.
+        if std::arch::is_aarch64_feature_detected!("crc") {
+            match arch_ops.get_tier() {
+                PerformanceTier::AArch64AesSha3 => {
+                    return fusion::crc32_iso_hdlc(state as u32, data) as u64;
+                }
+                PerformanceTier::AArch64Aes => {
+                    return fusion::crc32_iso_hdlc_pmull(state as u32, data) as u64;
+                }
+                _ => {}
             }
-            _ => {}
         }
     }
 

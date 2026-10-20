@@ -38,9 +38,23 @@ int main(void) {
 
   failed |= check("no error", crc_turbo_get_last_error(), Success);
 
+  /* The custom variants carry no parameters: an error, never an abort. */
+  failed |= check("custom without params", crc_turbo_checksum(CrcCustom, "1", 1), 0);
+  failed |= check("custom error", crc_turbo_get_last_error(), UnsupportedAlgorithm);
+  crc_turbo_clear_error();
+
+  /* Mismatched reflection is refused at the boundary, never an abort. */
+  struct CrcTurboParams mixed =
+      crc_turbo_get_custom_params("mixed", 32, 0x04c11db7, 0xffffffff, true, 0xffffffff, 0xcbf43926);
+  mixed.refout = false;
+  failed |= check("mixed reflection", crc_turbo_checksum_with_params(mixed, data, len), 0);
+  failed |= check("mixed reflection error", crc_turbo_get_last_error(), MismatchedReflection);
+  crc_turbo_clear_error();
+
   if (!failed) {
-    printf("libcrc_turbo %s: ok (%s)\n", crc_turbo_get_version(),
-           crc_turbo_get_calculator_target(Crc32IsoHdlc));
+    char *target = (char *)crc_turbo_get_calculator_target(Crc32IsoHdlc);
+    printf("libcrc_turbo %s: ok (%s)\n", crc_turbo_get_version(), target);
+    crc_turbo_free_string(target);
   }
   return failed;
 }

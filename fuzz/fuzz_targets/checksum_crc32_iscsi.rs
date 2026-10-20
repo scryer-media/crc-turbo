@@ -3,7 +3,7 @@
 
 #![no_main]
 
-use crc_turbo::{CrcAlgorithm, checksum};
+use crc_turbo::{checksum, CrcAlgorithm};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

@@ -14,13 +14,15 @@ zlib's CRC combination, as the reference its tests check against (Zlib
 licence; the notice is kept in that file). Its x^(2^k) table for one-shot
 combines follows zlib's `x2n_table`.
 
-## Changes taken from crc-fast's open pull requests
+## Changes taken from crc-fast's open pull requests and issues
 
-These were proposed to crc-fast and had not been merged when the fork was
-taken. Each commit that carries one names its author.
+These were proposed or reported to crc-fast and had not been merged or
+answered when the fork was taken. Each commit that carries one names its
+author.
 
 - **netsbot**: `core::arch` in the AVX-512 tier, for `no_std` builds
   (crc-fast#42).
+- **MuntasirSZN**: the report of that `no_std` build failure (crc-fast#57).
 - **onur-ozkan**: embedded `no_std` builds that do not force a panic
   handler on the consumer (crc-fast#49).
 - **MggMuggins**: `rand` 0.10 and `ffi` requiring `std`, from the Debian

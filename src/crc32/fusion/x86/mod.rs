@@ -64,6 +64,45 @@ pub fn crc32_iscsi(crc: u32, data: &[u8]) -> u32 {
     unsafe { crc32_iscsi_sse_v4s3x3(crc, data.as_ptr(), data_len) }
 }
 
+/// [`crc32_iscsi`] held to the SSE kernel, for the tiers below AVX-512: a pinned `CRC_TURBO_TIER`
+/// can select those on an AVX-512 part, and the pin covers these kernels too.
+#[inline(always)]
+pub fn crc32_iscsi_sse(crc: u32, data: &[u8]) -> u32 {
+    let data_len = data.len();
+
+    // SSE4.2 is required for native CRC32 instructions used in small buffer path
+    if data_len <= 256 && is_x86_feature_detected!("sse4.2") {
+        unsafe {
+            return crc32_iscsi_small_fast(crc, data);
+        }
+    }
+
+    unsafe { crc32_iscsi_sse_v4s3x3(crc, data.as_ptr(), data_len) }
+}
+
+/// [`crc32_iscsi`] held to the AVX-512 PCLMULQDQ kernel, for the `x86_64-avx512-pclmulqdq` tier
+/// pinned on a part that also has VPCLMULQDQ. Without AVX-512 it is the SSE kernel.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub fn crc32_iscsi_avx512_pclmulqdq(crc: u32, data: &[u8]) -> u32 {
+    let data_len = data.len();
+
+    // SSE4.2 is required for native CRC32 instructions used in small buffer path
+    if data_len <= 256 && is_x86_feature_detected!("sse4.2") {
+        unsafe {
+            return crc32_iscsi_small_fast(crc, data);
+        }
+    }
+
+    if is_x86_feature_detected!("avx512vl") {
+        unsafe {
+            return crc32_iscsi_avx512_v4s3x3(crc, data.as_ptr(), data_len);
+        }
+    }
+
+    unsafe { crc32_iscsi_sse_v4s3x3(crc, data.as_ptr(), data_len) }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[inline]
 #[target_feature(enable = "avx512vl,vpclmulqdq")]
@@ -219,6 +258,39 @@ mod tests {
     use rand::{rng, RngExt};
 
     const RUST_CRC32_ISCSI: Crc<u32, Table<16>> = Crc::<u32, Table<16>>::new(&crc::CRC_32_ISCSI);
+
+    /// The kernels a pinned tier is held to agree with the reference at every length through
+    /// the small path, across the fold boundary and at a megabyte, from aligned and unaligned
+    /// starts.
+    #[test]
+    fn held_kernels_agree_with_the_reference() {
+        if !(is_x86_feature_detected!("sse4.2") && is_x86_feature_detected!("pclmulqdq")) {
+            return;
+        }
+        let mut data = vec![0u8; 1_048_577 + 3];
+        rng().fill(&mut data[..]);
+        for len in (0..=1024).chain(1_048_575..=1_048_577) {
+            for offset in [0, 3] {
+                let slice = &data[offset..offset + len];
+                let expected = RUST_CRC32_ISCSI.checksum(slice);
+                assert_eq!(
+                    crc32_iscsi_sse(0xffffffff, slice) ^ 0xffffffff,
+                    expected,
+                    "sse len {len} offset {offset}"
+                );
+                #[cfg(target_arch = "x86_64")]
+                {
+                    if is_x86_feature_detected!("avx512vl") {
+                        assert_eq!(
+                            crc32_iscsi_avx512_pclmulqdq(0xffffffff, slice) ^ 0xffffffff,
+                            expected,
+                            "avx512-pclmulqdq len {len} offset {offset}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_crc32_iscsi_check() {

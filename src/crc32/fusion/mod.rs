@@ -18,6 +18,35 @@ pub(crate) fn crc32_iso_hdlc(state: u32, data: &[u8]) -> u32 {
     aarch64::crc32_iso_hdlc(state, data)
 }
 
+/// [`crc32_iso_hdlc`] held to the PMULL kernel, for the `aarch64-neon-pmull` tier.
+#[inline(always)]
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn crc32_iso_hdlc_pmull(state: u32, data: &[u8]) -> u32 {
+    aarch64::crc32_iso_hdlc_pmull(state, data)
+}
+
+/// [`crc32_iscsi`] held to the PMULL kernel, for the `aarch64-neon-pmull` tier.
+#[inline(always)]
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn crc32_iscsi_pmull(state: u32, data: &[u8]) -> u32 {
+    aarch64::crc32_iscsi_pmull(state, data)
+}
+
+/// [`crc32_iscsi`] held to the SSE kernel, for the x86 tiers below AVX-512.
+#[inline(always)]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+pub(crate) fn crc32_iscsi_sse(state: u32, data: &[u8]) -> u32 {
+    x86::crc32_iscsi_sse(state, data)
+}
+
+/// [`crc32_iscsi`] held to the AVX-512 PCLMULQDQ kernel, for that tier pinned on a part that
+/// also has VPCLMULQDQ.
+#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn crc32_iscsi_avx512_pclmulqdq(state: u32, data: &[u8]) -> u32 {
+    x86::crc32_iscsi_avx512_pclmulqdq(state, data)
+}
+
 /// Both AArch64 and x86 have native CRC-32/ISCSI instructions
 #[inline(always)]
 pub(crate) fn crc32_iscsi(state: u32, data: &[u8]) -> u32 {

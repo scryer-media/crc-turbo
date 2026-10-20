@@ -909,7 +909,9 @@ mod table_tests {
     use crate::test::consts::TEST_ALL_CONFIGS;
 
     /// Every built-in algorithm's table, stored or generated on first use, is the one its
-    /// catalogued parameters generate, with the matching reflection.
+    /// catalogued parameters generate, with the matching reflection. Under `generated-tables`
+    /// both sides are generated; the default-features run is the one that checks the stored
+    /// tables.
     #[test]
     fn every_built_in_algorithm_has_its_generated_table() {
         for config in TEST_ALL_CONFIGS {

@@ -50,7 +50,10 @@ pub(crate) unsafe fn crc32_iso_hdlc_eor3_v9s3x2e_s3(
         let blk = len / 192;
         let klen = blk * 16;
         let buf2 = buf.add(klen * 3);
-        let limit = buf.add(klen).sub(32);
+        // For fewer than two blocks this address lies before `buf` and the loop below does not
+        // run; wrapping arithmetic keeps that comparison from being out-of-bounds pointer
+        // arithmetic (Miri reports `sub` here as undefined behaviour).
+        let limit = buf.add(klen).wrapping_sub(32);
         let mut crc1 = 0u32;
         let mut crc2 = 0u32;
 

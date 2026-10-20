@@ -19,6 +19,7 @@ use crate::{
 };
 
 pub mod aarch64;
+pub(crate) mod clmul;
 pub mod software;
 pub mod x86;
 pub mod x86_64;

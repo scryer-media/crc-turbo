@@ -46,6 +46,19 @@ pub fn crc32_iscsi(crc: u32, data: &[u8]) -> u32 {
     }
 }
 
+/// [`crc32_iscsi`] held to the PMULL kernel, for the `aarch64-neon-pmull` tier: a pinned
+/// `CRC_TURBO_TIER` can select it on a CPU with SHA3, and the pin covers these kernels too.
+#[inline(always)]
+pub fn crc32_iscsi_pmull(crc: u32, data: &[u8]) -> u32 {
+    let data_len = data.len();
+
+    if data_len < 128 {
+        return unsafe { crc32_iscsi_small_fast(crc, data) };
+    }
+
+    unsafe { crc32_iscsi_aes(crc, data, data_len) }
+}
+
 #[inline(always)]
 pub fn crc32_iso_hdlc(crc: u32, data: &[u8]) -> u32 {
     let data_len = data.len();
@@ -66,6 +79,18 @@ pub fn crc32_iso_hdlc(crc: u32, data: &[u8]) -> u32 {
     } else {
         unsafe { crc32_iso_hdlc_aes(crc, data, data_len) }
     }
+}
+
+/// [`crc32_iso_hdlc`] held to the PMULL kernel, for the `aarch64-neon-pmull` tier.
+#[inline(always)]
+pub fn crc32_iso_hdlc_pmull(crc: u32, data: &[u8]) -> u32 {
+    let data_len = data.len();
+
+    if data_len < 128 {
+        return unsafe { crc32_iso_hdlc_small_fast(crc, data) };
+    }
+
+    unsafe { crc32_iso_hdlc_aes(crc, data, data_len) }
 }
 
 #[inline]
@@ -231,6 +256,30 @@ mod tests {
         Crc::<u32, Table<16>>::new(&crc::CRC_32_ISO_HDLC);
 
     const RUST_CRC32_ISCSI: Crc<u32, Table<16>> = Crc::<u32, Table<16>>::new(&crc::CRC_32_ISCSI);
+
+    /// The PMULL kernels the `aarch64-neon-pmull` tier is held to agree with the reference at
+    /// every length through the small path, across the fold boundary and at a megabyte, from
+    /// aligned and unaligned starts; on an SHA3 part dispatch would never reach them.
+    #[test]
+    fn held_kernels_agree_with_the_reference() {
+        let mut data = vec![0u8; 1_048_577 + 3];
+        rng().fill(&mut data[..]);
+        for len in (0..=1024).chain(1_048_575..=1_048_577) {
+            for offset in [0, 3] {
+                let slice = &data[offset..offset + len];
+                assert_eq!(
+                    crc32_iscsi_pmull(0xffffffff, slice) ^ 0xffffffff,
+                    RUST_CRC32_ISCSI.checksum(slice),
+                    "iscsi len {len} offset {offset}"
+                );
+                assert_eq!(
+                    crc32_iso_hdlc_pmull(0xffffffff, slice) ^ 0xffffffff,
+                    RUST_CRC32_ISO_HDLC.checksum(slice),
+                    "iso-hdlc len {len} offset {offset}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_crc32_iso_hdlc_check() {

@@ -16,10 +16,8 @@ ifeq ($(UNAME_S),Linux)
     CAPI_RUN_ENV := LD_LIBRARY_PATH=capi/target/release
 else ifeq ($(UNAME_S),Darwin)
     DESTDIR ?=
-    # on macOS, there's not really a default location, so require DESTDIR
-    ifeq ($(DESTDIR),)
-        $(error On macOS, DESTDIR must be set for installation. Common locations include /usr/local or /opt/homebrew)
-    endif
+    # on macOS, there's not really a default location, so `install` requires DESTDIR
+    DESTDIR_REQUIRED := 1
     LIB_EXTENSION := dylib
     CAPI_RUN_ENV := DYLD_LIBRARY_PATH=capi/target/release
     STATIC_LIB_EXTENSION := a
@@ -65,9 +63,17 @@ build: test
 test:
 	cargo test --locked --all-features
 
+# Refuse to install without a destination where the OS has no default one
+.PHONY: check-destdir
+check-destdir:
+	@if [ -n "$(DESTDIR_REQUIRED)" ] && [ -z "$(DESTDIR)" ]; then \
+		echo "DESTDIR must be set for installation. Common locations include /usr/local or /opt/homebrew" >&2; \
+		exit 1; \
+	fi
+
 # Install the library and headers
 .PHONY: install
-install: print-paths build
+install: check-destdir print-paths build
 	@install -d $(DESTDIR)$(INSTALL_LIB_DIR)
 	@install -d $(DESTDIR)$(INSTALL_BIN_DIR)
 	@install -d $(DESTDIR)$(INSTALL_INCLUDE_DIR)

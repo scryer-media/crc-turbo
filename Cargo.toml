@@ -12,7 +12,7 @@ repository = "https://github.com/scryer-media/crc-turbo"
 description = "SIMD-accelerated CRC-16, CRC-32 and CRC-64 for every known variant, with a C-compatible library; a maintained fork of crc-fast"
 readme = "README.md"
 # Repository scaffolding that has no business in the crate archive.
-exclude = [".github/", ".githooks/", ".gitleaks.toml", ".gitattributes", ".kiro/", "renovate.json", "AGENTS.md", ".cargo/", "xtask/", "fuzz/", "rust-toolchain.toml"]
+exclude = [".github/", ".githooks/", ".gitleaks.toml", ".gitattributes", ".kiro/", "renovate.json", "AGENTS.md", ".cargo/", "xtask/", "fuzz/", "rust-toolchain.toml", "Makefile", "docs/"]
 
 # important intrinsics stabilization notes:
 # 1.69.0 added VPCLMULQDQ x86 detection support

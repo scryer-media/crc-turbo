@@ -34,7 +34,7 @@ pub enum CrcTurboError {
     NullPointer = 2,
     /// Invalid key count for CRC parameters
     InvalidKeyCount = 3,
-    /// Unsupported CRC width (must be 32 or 64)
+    /// Unsupported CRC width (must be 16, 32 or 64)
     UnsupportedWidth = 4,
     /// Invalid UTF-8 string
     InvalidUtf8 = 5,
@@ -42,20 +42,33 @@ pub enum CrcTurboError {
     IoError = 6,
     /// Internal string conversion error
     StringConversionError = 7,
+    /// The algorithm is a custom variant, which carries its parameters in a CrcTurboParams:
+    /// use the `_with_params` function
+    UnsupportedAlgorithm = 8,
+    /// `refin` and `refout` differ, which the library does not support
+    MismatchedReflection = 9,
 }
 
 impl CrcTurboError {
     /// Returns a static string describing the error
-    fn message(&self) -> &'static str {
+    fn message(&self) -> &'static CStr {
         match self {
-            CrcTurboError::Success => "Operation completed successfully",
-            CrcTurboError::LockPoisoned => "Lock was poisoned (thread panicked while holding lock)",
-            CrcTurboError::NullPointer => "Null pointer was passed where non-null required",
-            CrcTurboError::InvalidKeyCount => "Invalid key count for CRC parameters",
-            CrcTurboError::UnsupportedWidth => "Unsupported CRC width (must be 32 or 64)",
-            CrcTurboError::InvalidUtf8 => "Invalid UTF-8 string",
-            CrcTurboError::IoError => "File I/O error",
-            CrcTurboError::StringConversionError => "Internal string conversion error",
+            CrcTurboError::Success => c"Operation completed successfully",
+            CrcTurboError::LockPoisoned => {
+                c"Lock was poisoned (thread panicked while holding lock)"
+            }
+            CrcTurboError::NullPointer => c"Null pointer was passed where non-null required",
+            CrcTurboError::InvalidKeyCount => c"Invalid key count for CRC parameters",
+            CrcTurboError::UnsupportedWidth => c"Unsupported CRC width (must be 16, 32 or 64)",
+            CrcTurboError::InvalidUtf8 => c"Invalid UTF-8 string",
+            CrcTurboError::IoError => c"File I/O error",
+            CrcTurboError::StringConversionError => c"Internal string conversion error",
+            CrcTurboError::UnsupportedAlgorithm => {
+                c"Custom algorithm without parameters (use the _with_params function)"
+            }
+            CrcTurboError::MismatchedReflection => {
+                c"refin and refout differ (both must be true or both false)"
+            }
         }
     }
 }
@@ -135,6 +148,11 @@ fn create_stable_key_pointer(keys: &crate::CrcKeysStorage) -> (*const u64, u32) 
 pub struct CrcTurboDigestHandle(*mut Digest);
 
 /// The supported CRC algorithms
+///
+/// As with any C enum passed by value, a value outside this list is undefined behaviour. The
+/// custom variants carry no parameters of their own: they are valid only inside a
+/// CrcTurboParams, and the functions that take an algorithm alone report UnsupportedAlgorithm
+/// for them.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub enum CrcTurboAlgorithm {
@@ -273,17 +291,7 @@ pub extern "C" fn crc_turbo_clear_error() {
 /// Returns a pointer to a static string (do not free)
 #[no_mangle]
 pub extern "C" fn crc_turbo_error_message(error: CrcTurboError) -> *const c_char {
-    let message = error.message();
-    // These are static strings, so we can safely return them as C strings
-    // The strings are guaranteed to be valid UTF-8 and null-terminated
-    match std::ffi::CString::new(message) {
-        Ok(c_str) => {
-            // Leak the string so it remains valid for the lifetime of the program
-            // This is safe because error messages are static and small
-            Box::leak(Box::new(c_str)).as_ptr()
-        }
-        Err(_) => std::ptr::null(),
-    }
+    error.message().as_ptr()
 }
 
 /// Custom CRC parameters
@@ -302,36 +310,39 @@ pub struct CrcTurboParams {
 }
 
 /// Fallible conversion from FFI struct to internal struct
-/// Returns None if the parameters are invalid (unsupported key count)
-fn try_params_from_ffi(value: &CrcTurboParams) -> Option<CrcParams> {
-    // Validate key pointer
-    if value.keys.is_null() {
-        return None;
+///
+/// Rejects a null or misaligned key pointer (`NullPointer`), a key count other than 23 or 25
+/// (`InvalidKeyCount`), a width other than 16, 32 or 64 (`UnsupportedWidth`) and `refin`
+/// differing from `refout` (`MismatchedReflection`), so that no caller-supplied value reaches a
+/// panic inside the library.
+fn try_params_from_ffi(value: &CrcTurboParams) -> Result<CrcParams, CrcTurboError> {
+    if value.keys.is_null() || !value.keys.is_aligned() {
+        return Err(CrcTurboError::NullPointer);
+    }
+    if !matches!(value.width, 16 | 32 | 64) {
+        return Err(CrcTurboError::UnsupportedWidth);
+    }
+    if value.refin != value.refout {
+        return Err(CrcTurboError::MismatchedReflection);
     }
 
-    // Convert C array back to appropriate CrcKeysStorage
-    let keys = unsafe { std::slice::from_raw_parts(value.keys, value.key_count as usize) };
-
+    // The keys are read only once the count names one of the two supported array sizes, so the
+    // read never runs past the array a caller passes with that count.
     let storage = match value.key_count {
-        23 => match keys.try_into() {
-            Ok(arr) => crate::CrcKeysStorage::from_keys_fold_256(arr),
-            Err(_) => return None,
-        },
-        25 => match keys.try_into() {
-            Ok(arr) => crate::CrcKeysStorage::from_keys_fold_future_test(arr),
-            Err(_) => return None,
-        },
-        _ => return None, // Unsupported key count
+        23 => {
+            let keys = unsafe { *(value.keys as *const [u64; 23]) };
+            crate::CrcKeysStorage::from_keys_fold_256(keys)
+        }
+        25 => {
+            let keys = unsafe { *(value.keys as *const [u64; 25]) };
+            crate::CrcKeysStorage::from_keys_fold_future_test(keys)
+        }
+        _ => return Err(CrcTurboError::InvalidKeyCount),
     };
 
-    // For reflected CRC-16, bit-reverse the init value for the SIMD algorithm
-    let init_algorithm = if value.width == 16 && value.refin {
-        (value.init as u16).reverse_bits() as u64
-    } else {
-        value.init
-    };
+    let init_algorithm = crate::structs::initial_state(value.width, value.init, value.refin);
 
-    Some(CrcParams {
+    Ok(CrcParams {
         algorithm: value.algorithm.into(),
         name: "custom", // C interface doesn't need the name field
         width: value.width,
@@ -431,23 +442,50 @@ impl From<CrcParams> for CrcTurboParams {
     }
 }
 
+/// The library's algorithm for a C enum value, or `UnsupportedAlgorithm` for the custom
+/// variants, whose parameters the library would otherwise panic looking for.
+fn builtin_algorithm(algorithm: CrcTurboAlgorithm) -> Result<CrcAlgorithm, CrcTurboError> {
+    match algorithm {
+        CrcTurboAlgorithm::CrcCustom
+        | CrcTurboAlgorithm::Crc32Custom
+        | CrcTurboAlgorithm::Crc64Custom => Err(CrcTurboError::UnsupportedAlgorithm),
+        builtin => Ok(builtin.into()),
+    }
+}
+
 /// Creates a new Digest to compute CRC checksums using algorithm
+/// Returns NULL for a custom algorithm variant (use crc_turbo_digest_new_with_params)
 #[no_mangle]
 pub extern "C" fn crc_turbo_digest_new(algorithm: CrcTurboAlgorithm) -> *mut CrcTurboDigestHandle {
+    let algorithm = match builtin_algorithm(algorithm) {
+        Ok(algorithm) => algorithm,
+        Err(error) => {
+            set_last_error(error);
+            return std::ptr::null_mut();
+        }
+    };
     clear_last_error();
-    let digest = Box::new(Digest::new(algorithm.into()));
+    let digest = Box::new(Digest::new(algorithm));
     let handle = Box::new(CrcTurboDigestHandle(Box::into_raw(digest)));
     Box::into_raw(handle)
 }
 
 /// Creates a new Digest with a custom initial state
+/// Returns NULL for a custom algorithm variant
 #[no_mangle]
 pub extern "C" fn crc_turbo_digest_new_with_init_state(
     algorithm: CrcTurboAlgorithm,
     init_state: u64,
 ) -> *mut CrcTurboDigestHandle {
+    let algorithm = match builtin_algorithm(algorithm) {
+        Ok(algorithm) => algorithm,
+        Err(error) => {
+            set_last_error(error);
+            return std::ptr::null_mut();
+        }
+    };
     clear_last_error();
-    let digest = Box::new(Digest::new_with_init_state(algorithm.into(), init_state));
+    let digest = Box::new(Digest::new_with_init_state(algorithm, init_state));
     let handle = Box::new(CrcTurboDigestHandle(Box::into_raw(digest)));
     Box::into_raw(handle)
 }
@@ -461,18 +499,13 @@ pub extern "C" fn crc_turbo_digest_new_with_params(
 ) -> *mut CrcTurboDigestHandle {
     clear_last_error();
     match try_params_from_ffi(&params) {
-        Some(crc_params) => {
+        Ok(crc_params) => {
             let digest = Box::new(Digest::new_with_params(crc_params));
             let handle = Box::new(CrcTurboDigestHandle(Box::into_raw(digest)));
             Box::into_raw(handle)
         }
-        None => {
-            // Set appropriate error based on the failure
-            if params.keys.is_null() {
-                set_last_error(CrcTurboError::NullPointer);
-            } else {
-                set_last_error(CrcTurboError::InvalidKeyCount);
-            }
+        Err(error) => {
+            set_last_error(error);
             std::ptr::null_mut()
         }
     }
@@ -580,10 +613,12 @@ pub extern "C" fn crc_turbo_digest_combine(
     }
 
     clear_last_error();
+    // The second digest is copied out first, so the same handle passed twice never holds a
+    // mutable and a shared reference to one object at once.
     unsafe {
+        let digest2 = *(*handle2).0;
         let digest1 = &mut *(*handle1).0;
-        let digest2 = &*(*handle2).0;
-        digest1.combine(digest2);
+        digest1.combine(&digest2);
     }
 }
 
@@ -630,11 +665,18 @@ pub extern "C" fn crc_turbo_checksum(
         set_last_error(CrcTurboError::NullPointer);
         return 0;
     }
+    let algorithm = match builtin_algorithm(algorithm) {
+        Ok(algorithm) => algorithm,
+        Err(error) => {
+            set_last_error(error);
+            return 0;
+        }
+    };
     clear_last_error();
     unsafe {
         #[allow(clippy::unnecessary_cast)]
         let bytes = slice::from_raw_parts(data as *const u8, len);
-        crate::checksum(algorithm.into(), bytes)
+        crate::checksum(algorithm, bytes)
     }
 }
 
@@ -652,7 +694,7 @@ pub extern "C" fn crc_turbo_checksum_with_params(
         return 0;
     }
     match try_params_from_ffi(&params) {
-        Some(crc_params) => {
+        Ok(crc_params) => {
             clear_last_error();
             unsafe {
                 #[allow(clippy::unnecessary_cast)]
@@ -660,12 +702,8 @@ pub extern "C" fn crc_turbo_checksum_with_params(
                 crate::checksum_with_params(crc_params, bytes)
             }
         }
-        None => {
-            if params.keys.is_null() {
-                set_last_error(CrcTurboError::NullPointer);
-            } else {
-                set_last_error(CrcTurboError::InvalidKeyCount);
-            }
+        Err(error) => {
+            set_last_error(error);
             0
         }
     }
@@ -685,12 +723,15 @@ pub extern "C" fn crc_turbo_checksum_file(
         return 0;
     }
 
+    let algorithm = match builtin_algorithm(algorithm) {
+        Ok(algorithm) => algorithm,
+        Err(error) => {
+            set_last_error(error);
+            return 0;
+        }
+    };
     unsafe {
-        match crate::checksum_file(
-            algorithm.into(),
-            &convert_to_string(path_ptr, path_len),
-            None,
-        ) {
+        match crate::checksum_file(algorithm, &convert_to_string(path_ptr, path_len), None) {
             Ok(result) => {
                 clear_last_error();
                 result
@@ -718,7 +759,7 @@ pub extern "C" fn crc_turbo_checksum_file_with_params(
     }
 
     match try_params_from_ffi(&params) {
-        Some(crc_params) => unsafe {
+        Ok(crc_params) => unsafe {
             match crate::checksum_file_with_params(
                 crc_params,
                 &convert_to_string(path_ptr, path_len),
@@ -734,12 +775,8 @@ pub extern "C" fn crc_turbo_checksum_file_with_params(
                 }
             }
         },
-        None => {
-            if params.keys.is_null() {
-                set_last_error(CrcTurboError::NullPointer);
-            } else {
-                set_last_error(CrcTurboError::InvalidKeyCount);
-            }
+        Err(error) => {
+            set_last_error(error);
             0
         }
     }
@@ -753,8 +790,15 @@ pub extern "C" fn crc_turbo_checksum_combine(
     checksum2: u64,
     checksum2_len: u64,
 ) -> u64 {
+    let algorithm = match builtin_algorithm(algorithm) {
+        Ok(algorithm) => algorithm,
+        Err(error) => {
+            set_last_error(error);
+            return 0;
+        }
+    };
     clear_last_error();
-    crate::checksum_combine(algorithm.into(), checksum1, checksum2, checksum2_len)
+    crate::checksum_combine(algorithm, checksum1, checksum2, checksum2_len)
 }
 
 /// Combine two CRC checksums using custom parameters
@@ -768,23 +812,20 @@ pub extern "C" fn crc_turbo_checksum_combine_with_params(
     checksum2_len: u64,
 ) -> u64 {
     match try_params_from_ffi(&params) {
-        Some(crc_params) => {
+        Ok(crc_params) => {
             clear_last_error();
             crate::checksum_combine_with_params(crc_params, checksum1, checksum2, checksum2_len)
         }
-        None => {
-            if params.keys.is_null() {
-                set_last_error(CrcTurboError::NullPointer);
-            } else {
-                set_last_error(CrcTurboError::InvalidKeyCount);
-            }
+        Err(error) => {
+            set_last_error(error);
             0
         }
     }
 }
 
 /// Returns the custom CRC parameters for a given set of Rocksoft CRC parameters
-/// If width is not 32 or 64, sets error to UnsupportedWidth
+/// If width is not 16, 32 or 64, sets error to UnsupportedWidth and returns parameters without
+/// keys, which every _with_params function rejects
 #[no_mangle]
 pub extern "C" fn crc_turbo_get_custom_params(
     name_ptr: *const c_char,
@@ -795,12 +836,24 @@ pub extern "C" fn crc_turbo_get_custom_params(
     xorout: u64,
     check: u64,
 ) -> CrcTurboParams {
-    // Validate width
-    if width != 32 && width != 64 {
+    // An unsupported width would panic inside CrcParams::new; hand back parameters with no keys
+    // instead, which every _with_params function rejects with NullPointer.
+    if !matches!(width, 16 | 32 | 64) {
         set_last_error(CrcTurboError::UnsupportedWidth);
-    } else {
-        clear_last_error();
+        return CrcTurboParams {
+            algorithm: CrcTurboAlgorithm::CrcCustom,
+            width,
+            poly,
+            init,
+            refin: reflected,
+            refout: reflected,
+            xorout,
+            check,
+            key_count: 0,
+            keys: std::ptr::null(),
+        };
     }
+    clear_last_error();
 
     let name = if name_ptr.is_null() {
         "custom"
@@ -848,6 +901,7 @@ pub extern "C" fn crc_turbo_get_custom_params(
 /// Gets the target build properties (CPU architecture and fine-tuning parameters) for this algorithm
 /// Returns NULL if string conversion fails
 /// Call crc_turbo_get_last_error() to get the specific error code
+/// The string is allocated for the caller: release it with crc_turbo_free_string()
 #[no_mangle]
 pub extern "C" fn crc_turbo_get_calculator_target(algorithm: CrcTurboAlgorithm) -> *const c_char {
     let target = get_calculator_target(algorithm.into());
@@ -861,6 +915,15 @@ pub extern "C" fn crc_turbo_get_calculator_target(algorithm: CrcTurboAlgorithm) 
             set_last_error(CrcTurboError::StringConversionError);
             std::ptr::null_mut()
         }
+    }
+}
+
+/// Frees a string returned by crc_turbo_get_calculator_target()
+/// A NULL pointer is ignored
+#[no_mangle]
+pub extern "C" fn crc_turbo_free_string(string: *mut c_char) {
+    if !string.is_null() {
+        unsafe { drop(std::ffi::CString::from_raw(string)) };
     }
 }
 
@@ -962,4 +1025,51 @@ fn get_or_leak_string(s: &str) -> &'static str {
     let leaked: &'static str = Box::leak(s.to_string().into_boxed_str());
     cache.insert(leaked);
     leaked
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn params(width: u8, init: u64, refin: bool, refout: bool, keys: &[u64; 23]) -> CrcTurboParams {
+        CrcTurboParams {
+            algorithm: CrcTurboAlgorithm::Crc32Custom,
+            width,
+            poly: 0x04c1_1db7,
+            init,
+            refin,
+            refout,
+            xorout: 0,
+            check: 0,
+            key_count: 23,
+            keys: keys.as_ptr(),
+        }
+    }
+
+    #[test]
+    fn mismatched_reflection_is_rejected_at_the_boundary() {
+        let keys = [0u64; 23];
+        assert!(matches!(
+            try_params_from_ffi(&params(32, 0, true, false, &keys)),
+            Err(CrcTurboError::MismatchedReflection)
+        ));
+        assert!(matches!(
+            try_params_from_ffi(&params(32, 0, false, true, &keys)),
+            Err(CrcTurboError::MismatchedReflection)
+        ));
+        assert!(try_params_from_ffi(&params(32, 0, true, true, &keys)).is_ok());
+        assert!(try_params_from_ffi(&params(32, 0, false, false, &keys)).is_ok());
+    }
+
+    #[test]
+    fn a_reflected_init_is_reversed_within_its_width() {
+        let keys = [0u64; 23];
+        let reflected = try_params_from_ffi(&params(32, 0x1234_5678, true, true, &keys))
+            .expect("valid parameters");
+        assert_eq!(reflected.init, 0x1234_5678);
+        assert_eq!(reflected.init_algorithm, 0x1e6a_2c48);
+        let forward = try_params_from_ffi(&params(32, 0x1234_5678, false, false, &keys))
+            .expect("valid parameters");
+        assert_eq!(forward.init_algorithm, 0x1234_5678);
+    }
 }

@@ -77,7 +77,7 @@ pub struct ArchCapabilities {
     pub has_sse41: bool,
     pub has_sse42: bool, // provides native CRC32C instructions for fusion techniques
     pub has_pclmulqdq: bool,
-    pub has_avx512vl: bool, // implicitly enables avx512f, has XOR3 operations
+    pub has_avx512vl: bool, // with avx512bw; implicitly enables avx512f, has XOR3 operations
     pub has_vpclmulqdq: bool,
     pub has_avx2: bool, // with vpclmulqdq and no avx512vl, enables the 256-bit tier
 }
@@ -196,7 +196,11 @@ unsafe fn detect_x86_features() -> ArchCapabilities {
     let has_sse41 = is_x86_feature_detected!("sse4.1");
     let has_pclmulqdq = has_sse41 && is_x86_feature_detected!("pclmulqdq");
 
-    let has_avx512vl = has_pclmulqdq && is_x86_feature_detected!("avx512vl");
+    // The AVX-512 kernels also shuffle bytes across 512-bit vectors, which is AVX512BW. Every
+    // CPU with AVX512VL ships it; a hypervisor that masks it gets the tiers below.
+    let has_avx512vl = has_pclmulqdq
+        && is_x86_feature_detected!("avx512vl")
+        && is_x86_feature_detected!("avx512bw");
     // VPCLMULQDQ is its own CPUID feature, not part of AVX-512: AMD Zen 3 and Intel Alder Lake
     // through Arrow Lake have it with AVX2 and no AVX-512, and use the 256-bit tier.
     let has_vpclmulqdq = has_pclmulqdq && is_x86_feature_detected!("vpclmulqdq");
@@ -852,7 +856,7 @@ mod tests {
         // Test that x86 feature hierarchy is properly maintained
         // SSE4.1 is required for PCLMULQDQ
         // AVX512VL requires PCLMULQDQ
-        // VPCLMULQDQ requires AVX512VL
+        // VPCLMULQDQ is used with AVX512VL (512-bit tier) or with AVX2 (256-bit tier)
 
         // Test feature dependencies are enforced
         let capabilities_full = ArchCapabilities {
@@ -901,7 +905,7 @@ mod tests {
                 PerformanceTier::SoftwareTable
             );
 
-            // VPCLMULQDQ without AVX512VL should not be possible
+            // VPCLMULQDQ without AVX512VL and without AVX2 has no tier that can use it
             let invalid_vpclmul_caps = ArchCapabilities {
                 has_aes: false,
                 has_crc: false,
@@ -910,11 +914,11 @@ mod tests {
                 has_sse42: false,
                 has_pclmulqdq: true,
                 has_avx512vl: false,  // Missing required dependency
-                has_vpclmulqdq: true, // This should be impossible in real detection
+                has_vpclmulqdq: true, // usable only with AVX512VL or AVX2
                 has_avx2: false,
             };
 
-            // Should fall back to SSE tier since AVX512VL is required for VPCLMULQDQ
+            // Falls back to the SSE tier: neither VPCLMULQDQ tier can run
             assert_eq!(
                 select_performance_tier_for_test(&invalid_vpclmul_caps),
                 PerformanceTier::X86_64SsePclmulqdq
@@ -1259,7 +1263,7 @@ mod tests {
                 PerformanceTier::SoftwareTable
             );
 
-            // x86_64: VPCLMULQDQ available but AVX512VL not (impossible in real hardware)
+            // x86_64: VPCLMULQDQ without AVX512VL or AVX2, which no tier can use
             let x86_64_partial = ArchCapabilities {
                 has_aes: false,
                 has_crc: false,
@@ -1268,10 +1272,10 @@ mod tests {
                 has_sse42: false,
                 has_pclmulqdq: true,
                 has_avx512vl: false,
-                has_vpclmulqdq: true, // This would be impossible in real detection
+                has_vpclmulqdq: true, // usable only with AVX512VL or AVX2
                 has_avx2: false,
             };
-            // Should fall back to SSE tier since AVX512VL is required for VPCLMULQDQ
+            // Falls back to the SSE tier: neither VPCLMULQDQ tier can run
             assert_eq!(
                 select_performance_tier_for_test(&x86_64_partial),
                 PerformanceTier::X86_64SsePclmulqdq

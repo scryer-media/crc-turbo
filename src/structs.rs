@@ -106,12 +106,7 @@ impl CrcParams {
             panic!("Unsupported width: {width}");
         }
 
-        // For reflected CRC-16, bit-reverse the init value for the SIMD algorithm
-        let init_algorithm = if width == 16 && reflected {
-            (init as u16).reverse_bits() as u64
-        } else {
-            init
-        };
+        let init_algorithm = initial_state(width, init, reflected);
 
         Self {
             algorithm: CrcAlgorithm::CrcCustom,
@@ -150,5 +145,51 @@ impl CrcParams {
     #[inline(always)]
     pub fn key_count(&self) -> usize {
         self.keys.key_count()
+    }
+}
+
+/// The register a kernel starts from. The Rocksoft model gives `init` as the register before
+/// reflection, and the reflected kernels hold the register bit-reversed, so a reflected CRC
+/// starts from `init` reversed within its width. The catalogued reflected CRC-32s and CRC-64s
+/// start from 0 or all ones, which the reversal leaves alone; CRC-16/RIELLO (init 0xB2AA) is
+/// one it does not.
+pub(crate) fn initial_state(width: u8, init: u64, reflected: bool) -> u64 {
+    match (reflected, width) {
+        (false, _) => init,
+        (true, 16) => (init as u16).reverse_bits() as u64,
+        (true, 32) => (init as u32).reverse_bits() as u64,
+        (true, _) => init.reverse_bits(),
+    }
+}
+
+#[cfg(test)]
+mod initial_state_tests {
+    use super::*;
+
+    /// Custom reflected parameters whose init is not a bit palindrome, against the catalogue
+    /// (CRC-16/RIELLO) and a bitwise Rocksoft model (the 32- and 64-bit cases).
+    #[test]
+    fn a_reflected_custom_init_is_the_catalogued_register() {
+        let data = b"123456789";
+        let riello = CrcParams::new("CRC-16/RIELLO", 16, 0x1021, 0xb2aa, true, 0, 0x63d0);
+        assert_eq!(crate::checksum_with_params(riello, data), 0x63d0);
+        let custom32 = CrcParams::new("custom32", 32, 0x04c11db7, 0x12345678, true, 0, 0xf0748bce);
+        assert_eq!(crate::checksum_with_params(custom32, data), 0xf0748bce);
+        let custom64 = CrcParams::new(
+            "custom64",
+            64,
+            0x42f0e1eba9ea3693,
+            0x123456789abcdef0,
+            true,
+            0,
+            0x71730ebfa0af8ee8,
+        );
+        assert_eq!(
+            crate::checksum_with_params(custom64, data),
+            0x71730ebfa0af8ee8
+        );
+        // The forward form starts from init as given.
+        assert_eq!(initial_state(32, 0x12345678, false), 0x12345678);
+        assert_eq!(initial_state(32, 0x12345678, true), 0x1e6a2c48);
     }
 }

@@ -19,8 +19,12 @@ crc-turbo = "1.11"
 What differs is recorded in the `## Fork` section of the
 [CHANGELOG](CHANGELOG.md): the security and hygiene fixes that were waiting on
 upstream, an AVX2 + VPCLMULQDQ tier for x86_64 CPUs that have 256-bit
-carry-less multiply but no AVX-512, and the C library's symbols, which are
-`crc_turbo_*` so that `crc-fast` and `crc-turbo` can be linked into one binary.
+carry-less multiply but no AVX-512, `checksum_combine` in a few field
+multiplies with [`CrcCombine`](#crccombine) and
+[`checksum_zeros`](#checksum_zeros) beside it, the `generated-tables` and
+`digest-0-11` features, the `CRC_TURBO_TIER` [tier pin](#pinning-a-tier),
+and the C library's symbols, which are `crc_turbo_*` so that `crc-fast` and
+`crc-turbo` can be linked into one binary.
 
 The rest of this document is upstream's, adapted to the new name.
 
@@ -273,9 +277,10 @@ assert_eq!(checksum, 0xcbf43926);
 ### CrcCombine
 
 When the same length is combined many times, as with fixed-size blocks
-hashed in parallel, build the operator once. Each `combine` is then a single
-carry-less multiply. `uncombine` runs it backwards, and `zeros` gives the CRC
-of that many zero bytes without reading them.
+hashed in parallel, build the operator once. Each `combine` is then one field
+multiply: three carry-less multiplies on x86_64 and aarch64. `uncombine` runs
+it backwards, and `zeros` gives the CRC of that many zero bytes without reading
+them.
 
 ```rust
 use crc_turbo::{checksum, CrcAlgorithm::Crc32IsoHdlc, CrcCombine};
@@ -529,7 +534,8 @@ tier against another on the same binary or running a narrower tier than the CPU 
 value is a target string as `arch-check` and `get_calculator_target` report it, such as
 `x86_64-avx2-vpclmulqdq`, `x86_64-sse-pclmulqdq` or `software-fallback-tables`. It is read once,
 when the first CRC is computed. It only ever narrows the choice: a tier the CPU cannot run, or a
-value that names no tier, is ignored.
+value that names no tier, is ignored. The pin covers the CRC-32/ISCSI and CRC-32/ISO-HDLC fusion
+kernels as well: a tier below AVX-512 or below SHA3 runs their SSE or PMULL forms.
 
 ```
 CRC_TURBO_TIER=x86_64-sse-pclmulqdq cargo bench

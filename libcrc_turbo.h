@@ -30,7 +30,7 @@ typedef enum CrcTurboError {
    */
   InvalidKeyCount = 3,
   /**
-   * Unsupported CRC width (must be 32 or 64)
+   * Unsupported CRC width (must be 16, 32 or 64)
    */
   UnsupportedWidth = 4,
   /**
@@ -45,10 +45,24 @@ typedef enum CrcTurboError {
    * Internal string conversion error
    */
   StringConversionError = 7,
+  /**
+   * The algorithm is a custom variant, which carries its parameters in a CrcTurboParams:
+   * use the `_with_params` function
+   */
+  UnsupportedAlgorithm = 8,
+  /**
+   * `refin` and `refout` differ, which the library does not support
+   */
+  MismatchedReflection = 9,
 } CrcTurboError;
 
 /**
  * The supported CRC algorithms
+ *
+ * As with any C enum passed by value, a value outside this list is undefined behaviour. The
+ * custom variants carry no parameters of their own: they are valid only inside a
+ * CrcTurboParams, and the functions that take an algorithm alone report UnsupportedAlgorithm
+ * for them.
  */
 typedef enum CrcTurboAlgorithm {
   CrcCustom,
@@ -161,11 +175,13 @@ const char *crc_turbo_error_message(enum CrcTurboError error);
 
 /**
  * Creates a new Digest to compute CRC checksums using algorithm
+ * Returns NULL for a custom algorithm variant (use crc_turbo_digest_new_with_params)
  */
 struct CrcTurboDigestHandle *crc_turbo_digest_new(enum CrcTurboAlgorithm algorithm);
 
 /**
  * Creates a new Digest with a custom initial state
+ * Returns NULL for a custom algorithm variant
  */
 struct CrcTurboDigestHandle *crc_turbo_digest_new_with_init_state(enum CrcTurboAlgorithm algorithm,
                                                                   uint64_t init_state);
@@ -275,7 +291,8 @@ uint64_t crc_turbo_checksum_combine_with_params(struct CrcTurboParams params,
 
 /**
  * Returns the custom CRC parameters for a given set of Rocksoft CRC parameters
- * If width is not 32 or 64, sets error to UnsupportedWidth
+ * If width is not 16, 32 or 64, sets error to UnsupportedWidth and returns parameters without
+ * keys, which every _with_params function rejects
  */
 struct CrcTurboParams crc_turbo_get_custom_params(const char *name_ptr,
                                                   uint8_t width,
@@ -289,8 +306,15 @@ struct CrcTurboParams crc_turbo_get_custom_params(const char *name_ptr,
  * Gets the target build properties (CPU architecture and fine-tuning parameters) for this algorithm
  * Returns NULL if string conversion fails
  * Call crc_turbo_get_last_error() to get the specific error code
+ * The string is allocated for the caller: release it with crc_turbo_free_string()
  */
 const char *crc_turbo_get_calculator_target(enum CrcTurboAlgorithm algorithm);
+
+/**
+ * Frees a string returned by crc_turbo_get_calculator_target()
+ * A NULL pointer is ignored
+ */
+void crc_turbo_free_string(char *string);
 
 /**
  * Gets the version of this library

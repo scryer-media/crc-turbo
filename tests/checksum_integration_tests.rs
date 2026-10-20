@@ -8,18 +8,8 @@ use std::process::Command;
 #[test]
 #[cfg_attr(miri, ignore)] // Miri doesn't allow this due to isolation restrictions
 fn test_benchmark_flag_parsing() {
-    let output = Command::new("cargo")
-        .args([
-            "run",
-            "--features",
-            "cli",
-            "--bin",
-            "checksum",
-            "--",
-            "-a",
-            "CRC-32/ISCSI",
-            "-b",
-        ])
+    let output = Command::new(env!("CARGO_BIN_EXE_checksum"))
+        .args(["-a", "CRC-32/ISCSI", "-b"])
         .output()
         .expect("Failed to execute command");
 
@@ -36,20 +26,8 @@ fn test_benchmark_flag_parsing() {
 #[test]
 #[cfg_attr(miri, ignore)] // Miri doesn't allow this due to isolation restrictions
 fn test_benchmark_with_size_parameter() {
-    let output = Command::new("cargo")
-        .args([
-            "run",
-            "--features",
-            "cli",
-            "--bin",
-            "checksum",
-            "--",
-            "-a",
-            "CRC-32/ISCSI",
-            "-b",
-            "--size",
-            "1024",
-        ])
+    let output = Command::new(env!("CARGO_BIN_EXE_checksum"))
+        .args(["-a", "CRC-32/ISCSI", "-b", "--size", "1024"])
         .output()
         .expect("Failed to execute command");
 
@@ -61,45 +39,22 @@ fn test_benchmark_with_size_parameter() {
 #[test]
 #[cfg_attr(miri, ignore)] // Miri doesn't allow this due to isolation restrictions
 fn test_benchmark_with_duration_parameter() {
-    let output = Command::new("cargo")
-        .args([
-            "run",
-            "--features",
-            "cli",
-            "--bin",
-            "checksum",
-            "--",
-            "-a",
-            "CRC-32/ISCSI",
-            "-b",
-            "--duration",
-            "1.0",
-        ])
+    let output = Command::new(env!("CARGO_BIN_EXE_checksum"))
+        .args(["-a", "CRC-32/ISCSI", "-b", "--duration", "1.0"])
         .output()
         .expect("Failed to execute command");
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Duration: 1."));
+    // The measured duration is wall-clock time, so only the line is asserted, not its value.
+    assert!(stdout.contains("Duration:"));
 }
 
 #[test]
 #[cfg_attr(miri, ignore)] // Miri doesn't allow this due to isolation restrictions
 fn test_benchmark_invalid_size() {
-    let output = Command::new("cargo")
-        .args([
-            "run",
-            "--features",
-            "cli",
-            "--bin",
-            "checksum",
-            "--",
-            "-a",
-            "CRC-32/ISCSI",
-            "-b",
-            "--size",
-            "0",
-        ])
+    let output = Command::new(env!("CARGO_BIN_EXE_checksum"))
+        .args(["-a", "CRC-32/ISCSI", "-b", "--size", "0"])
         .output()
         .expect("Failed to execute command");
 
@@ -111,20 +66,8 @@ fn test_benchmark_invalid_size() {
 #[test]
 #[cfg_attr(miri, ignore)] // Miri doesn't allow this due to isolation restrictions
 fn test_benchmark_invalid_duration() {
-    let output = Command::new("cargo")
-        .args([
-            "run",
-            "--features",
-            "cli",
-            "--bin",
-            "checksum",
-            "--",
-            "-a",
-            "CRC-32/ISCSI",
-            "-b",
-            "--duration",
-            "0",
-        ])
+    let output = Command::new(env!("CARGO_BIN_EXE_checksum"))
+        .args(["-a", "CRC-32/ISCSI", "-b", "--duration", "0"])
         .output()
         .expect("Failed to execute command");
 
@@ -140,14 +83,8 @@ fn test_benchmark_with_file_input() {
     let test_file = "test_benchmark_file.txt";
     fs::write(test_file, "Hello, benchmark world!").expect("Failed to create test file");
 
-    let output = Command::new("cargo")
+    let output = Command::new(env!("CARGO_BIN_EXE_checksum"))
         .args([
-            "run",
-            "--features",
-            "cli",
-            "--bin",
-            "checksum",
-            "--",
             "-a",
             "CRC-32/ISCSI",
             "-b",
@@ -170,14 +107,8 @@ fn test_benchmark_with_file_input() {
 #[test]
 #[cfg_attr(miri, ignore)] // Miri doesn't allow this due to isolation restrictions
 fn test_benchmark_with_string_input() {
-    let output = Command::new("cargo")
+    let output = Command::new(env!("CARGO_BIN_EXE_checksum"))
         .args([
-            "run",
-            "--features",
-            "cli",
-            "--bin",
-            "checksum",
-            "--",
             "-a",
             "CRC-32/ISCSI",
             "-b",
@@ -200,20 +131,8 @@ fn test_benchmark_different_algorithms() {
     let algorithms = ["CRC-32/ISCSI", "CRC-64/NVME"];
 
     for algorithm in &algorithms {
-        let output = Command::new("cargo")
-            .args([
-                "run",
-                "--features",
-                "cli",
-                "--bin",
-                "checksum",
-                "--",
-                "-a",
-                algorithm,
-                "-b",
-                "--duration",
-                "0.5",
-            ])
+        let output = Command::new(env!("CARGO_BIN_EXE_checksum"))
+            .args(["-a", algorithm, "-b", "--duration", "0.5"])
             .output()
             .expect("Failed to execute command");
 
@@ -230,19 +149,8 @@ fn test_benchmark_different_algorithms() {
 #[test]
 #[cfg_attr(miri, ignore)] // Miri doesn't allow this due to isolation restrictions
 fn test_benchmark_size_without_benchmark_flag() {
-    let output = Command::new("cargo")
-        .args([
-            "run",
-            "--features",
-            "cli",
-            "--bin",
-            "checksum",
-            "--",
-            "-a",
-            "CRC-32/ISCSI",
-            "--size",
-            "1024",
-        ])
+    let output = Command::new(env!("CARGO_BIN_EXE_checksum"))
+        .args(["-a", "CRC-32/ISCSI", "--size", "1024"])
         .output()
         .expect("Failed to execute command");
 
@@ -254,20 +162,8 @@ fn test_benchmark_size_without_benchmark_flag() {
 #[test]
 #[cfg_attr(miri, ignore)] // Miri doesn't allow this due to isolation restrictions
 fn test_benchmark_nonexistent_file() {
-    let output = Command::new("cargo")
-        .args([
-            "run",
-            "--features",
-            "cli",
-            "--bin",
-            "checksum",
-            "--",
-            "-a",
-            "CRC-32/ISCSI",
-            "-b",
-            "-f",
-            "nonexistent_file.txt",
-        ])
+    let output = Command::new(env!("CARGO_BIN_EXE_checksum"))
+        .args(["-a", "CRC-32/ISCSI", "-b", "-f", "nonexistent_file.txt"])
         .output()
         .expect("Failed to execute command");
 

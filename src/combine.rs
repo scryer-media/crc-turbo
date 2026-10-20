@@ -49,6 +49,7 @@
  madler@alumni.caltech.edu
 */
 
+use crate::arch::clmul::Clmul;
 use crate::CrcParams;
 
 /// The low `width` bits.
@@ -113,75 +114,6 @@ const fn barrett_mu(poly: u64, width: u8) -> u64 {
     quotient & mask
 }
 
-/// The full 128-bit carry-less product of two 64-bit polynomials.
-///
-/// # Safety
-/// The CPU must support PCLMULQDQ.
-#[cfg(target_arch = "x86_64")]
-#[inline]
-#[target_feature(enable = "pclmulqdq,sse2")]
-unsafe fn clmul(a: u64, b: u64) -> u128 {
-    use core::arch::x86_64::*;
-
-    let product = _mm_clmulepi64_si128(_mm_set_epi64x(0, a as i64), _mm_set_epi64x(0, b as i64), 0);
-    let low = _mm_cvtsi128_si64(product) as u64;
-    let high = _mm_cvtsi128_si64(_mm_srli_si128::<8>(product)) as u64;
-
-    ((high as u128) << 64) | low as u128
-}
-
-/// The full 128-bit carry-less product of two 64-bit polynomials.
-///
-/// # Safety
-/// The CPU must support PMULL (the `aes` feature).
-#[cfg(target_arch = "aarch64")]
-#[inline]
-#[target_feature(enable = "aes")]
-unsafe fn clmul(a: u64, b: u64) -> u128 {
-    core::arch::aarch64::vmull_p64(a, b)
-}
-
-/// `a * b mod P(x)` by a carry-less multiply and a Barrett reduction.
-///
-/// With `T = a * b` (degree below `2 * width - 1`), `upper = floor(T / x^width)` and
-/// `mu = floor(x^(2 * width) / P(x))`, the quotient `floor(T / P(x))` is exactly
-/// `floor(upper * mu / x^width)`: GF(2) has no carries for the discarded low terms to lift. The
-/// remainder is then the low `width` bits of `T + quotient * P(x)`, where only `poly` reaches
-/// them.
-///
-/// # Safety
-/// The CPU must support the carry-less multiply `clmul` is compiled for.
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-#[inline]
-#[cfg_attr(target_arch = "x86_64", target_feature(enable = "pclmulqdq,sse2"))]
-#[cfg_attr(target_arch = "aarch64", target_feature(enable = "aes"))]
-unsafe fn mul_mod_clmul(a: u64, b: u64, field: &Field) -> u64 {
-    let width = field.width as u32;
-    let mask = mask(field.width);
-
-    let product = clmul(a, b);
-    let upper = (product >> width) as u64;
-    let lower = product as u64 & mask;
-
-    // mu's implicit x^width term contributes `upper` itself.
-    let quotient = (clmul(upper, field.mu) >> width) as u64 ^ upper;
-
-    lower ^ (clmul(quotient, field.poly) as u64 & mask)
-}
-
-/// Whether the field multiply can use a carry-less multiply instruction.
-///
-/// Follows the selected tier, so the software tier (detected or forced) keeps combining in
-/// software too: every accelerated x86_64 tier has PCLMULQDQ and every aarch64 one has PMULL.
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-#[inline]
-fn has_clmul() -> bool {
-    !matches!(
-        crate::feature_detection::get_arch_ops().get_tier(),
-        crate::feature_detection::PerformanceTier::SoftwareTable
-    )
-}
-
 /// `GF(2)[x] / P(x)` for one CRC polynomial, in normal form.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Field {
@@ -190,35 +122,31 @@ struct Field {
     width: u8,
     /// [`barrett_mu`] of `poly`.
     mu: u64,
-    /// Whether [`Field::mul`] may use the carry-less multiply.
-    clmul: bool,
+    /// The carry-less multiply [`Field::mul`] may use, when the selected tier has one.
+    clmul: Option<Clmul>,
 }
 
 impl Field {
     #[inline]
     fn new(poly: u64, width: u8) -> Self {
-        assert!((16..=64).contains(&width), "Unsupported CRC width: {width}");
-
-        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-        let clmul = has_clmul();
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        let clmul = false;
+        assert!(
+            matches!(width, 16 | 32 | 64),
+            "Unsupported CRC width: {width}"
+        );
 
         Self {
             poly: poly & mask(width),
             width,
             mu: barrett_mu(poly & mask(width), width),
-            clmul,
+            clmul: Clmul::detect(),
         }
     }
 
     /// `a * b mod P(x)`.
     #[inline]
     fn mul(&self, a: u64, b: u64) -> u64 {
-        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-        if self.clmul {
-            // SAFETY: `clmul` is set only when the selected tier has the instruction.
-            return unsafe { mul_mod_clmul(a, b, self) };
+        if let Some(clmul) = self.clmul {
+            return clmul.mul_mod(a, b, self.poly, self.mu, self.width);
         }
 
         mul_mod_portable(a, b, self.poly, self.width)
@@ -480,7 +408,8 @@ impl CrcCombine {
     /// `len` bytes, and `checksum2`, the CRC of those `len` bytes: [`CrcCombine::combine`]
     /// undone.
     ///
-    /// Costs as much as building the operator, because it needs the inverse of its power.
+    /// Costs more than building the operator: the inverse of its power is a full
+    /// square-and-multiply on every call.
     /// `None` only for a custom polynomial without an `x^0` term, whose CRC loses information
     /// and so cannot be undone.
     pub fn uncombine(&self, combined: u64, checksum2: u64) -> Option<u64> {
@@ -547,7 +476,8 @@ mod tests {
         }
     }
 
-    /// crc-fast 1.10's combine: Mark Adler's zeros operator, unchanged but for its name. The
+    /// crc-fast 1.10's combine: Mark Adler's zeros operator, unchanged but for its name and the
+    /// `reflect` it calls. The
     /// independent reference the field arithmetic is checked against.
     fn combine_by_matrix(mut crc1: u64, crc2: u64, mut len2: u64, params: &CrcParams) -> u64 {
         let mut col: u64;
@@ -689,7 +619,7 @@ mod tests {
                 );
 
                 // the same operator built and applied in software
-                op.field.clmul = false;
+                op.field.clmul = None;
                 op.power = op.field.pow_bytes(1 << 1, len2);
                 assert_eq!(
                     op.combine(crc1, crc2),
@@ -841,10 +771,10 @@ mod tests {
             let params = config.get_params();
             let clmul = Field::new(params.poly, params.width);
             let portable = Field {
-                clmul: false,
+                clmul: None,
                 ..clmul
             };
-            if !clmul.clmul {
+            if clmul.clmul.is_none() {
                 eprintln!("skipping: no carry-less multiply on this host");
                 return;
             }

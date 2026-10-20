@@ -13,8 +13,8 @@ security bumps, `no_std` fixes, `digest` 0.11, a 256-bit x86 tier - waiting
 without an answer. This crate exists so that work can ship. It is a hard
 fork: it is not rebased onto crc-fast and is not kept in step with it, though
 a fix that lands there is still welcome here. Every change taken from one of
-crc-fast's open pull requests credits its author below and in the commit
-that carries it. This section is the record of how the crate differs from
+crc-fast's open pull requests or issues credits its author below and in the
+commit that carries it. This section is the record of how the crate differs from
 the release it was taken at, kept for readers who know crc-fast. crc-fast's
 own changelog up to the fork point continues below, unchanged.
 
@@ -51,8 +51,9 @@ own changelog up to the fork point continues below, unchanged.
 ### Fixes taken from crc-fast's open pull requests
 
 - `no_std` builds for x86_64 compile again: the AVX-512 tier imported
-  `std::arch` rather than `core::arch` (crc-fast#57). From crc-fast#42 by
-  netsbot; crc-fast#49 by onur-ozkan carries the same fix.
+  `std::arch` rather than `core::arch` (crc-fast#57, reported by
+  MuntasirSZN). From crc-fast#42 by netsbot; crc-fast#49 by onur-ozkan
+  carries the same fix.
 - A `crc-turbo` dependency is an ordinary Rust library again. The crate
   declared `cdylib` and `staticlib` crate types as well, which Cargo builds
   even for a dependency, and a `no_std` static library needs a panic handler
@@ -131,6 +132,73 @@ own changelog up to the fork point continues below, unchanged.
   An integration test runs the CLI tools under every tier string and checks
   the check values and the selection rule.
 - Forcing the software tier on an aarch64 CPU with PMULL no longer panics.
+- The pin covers the CRC-32/ISCSI and CRC-32/ISO-HDLC fusion kernels, which
+  chose their form from the CPU alone: `x86_64-sse-pclmulqdq` or
+  `x86_64-avx2-vpclmulqdq` on an AVX-512 part now runs the SSE kernel, and
+  `aarch64-neon-pmull` on a CPU with SHA3 the PMULL kernel. A test hashes a
+  64 KiB buffer under every tier against the software tier, so every fold
+  and fusion kernel a tier can reach is compared, not only the 9-byte check
+  string.
+
+### Fixes found in the pre-release review
+
+- The C library no longer aborts the process on a caller-supplied value.
+  A custom algorithm variant passed to a function that takes an algorithm
+  alone (`crc_turbo_checksum`, `crc_turbo_digest_new`, …) sets the new
+  `UnsupportedAlgorithm` error and returns 0 or NULL instead of panicking
+  across the FFI boundary; a `CrcTurboParams` with a width other than 16,
+  32 or 64 is rejected with `UnsupportedWidth` before it reaches the
+  library, and `crc_turbo_get_custom_params` returns keyless parameters for
+  such a width instead of panicking. Width 16, which the library supports,
+  is no longer reported as unsupported.
+- Two undefined-behaviour paths in the C library are closed: the key array
+  of a `CrcTurboParams` was turned into a slice of `key_count` elements
+  before the count was checked, and `crc_turbo_digest_combine` with the
+  same handle twice held a mutable and a shared reference to one digest.
+  The key pointer is also checked for alignment.
+- `crc_turbo_error_message` returns the static strings it documents rather
+  than leaking a copy per call, and the new `crc_turbo_free_string` releases
+  the string `crc_turbo_get_calculator_target` allocates.
+- The aarch64 CRC-32 EOR3 kernels computed their loop limit as an address
+  before the buffer when the input was under 384 bytes, which Miri reports
+  as undefined behaviour (the address was compared, never read). It is
+  wrapping arithmetic now. Upstream's Miri lane runs on x86_64 only, so it
+  never saw this.
+- The combine field asserts a width of exactly 16, 32 or 64, as its
+  documentation says, instead of accepting any width from 16 to 64.
+- `checksum_combine` masks both checksums to the CRC width; crc-fast 1.10
+  passed stray high bits of a malformed `checksum2` through. Catalogued
+  inputs are unaffected.
+- The carry-less multiply behind the combine operator lives in
+  `src/arch/clmul.rs`, reached through a token that only detection builds,
+  so `src/combine.rs` holds no `unsafe`.
+- `make capi-test` and the other non-install targets run on macOS without
+  `DESTDIR`; only `make install` requires it.
+- The crate archive no longer carries the `Makefile` and `docs/`, which
+  refer to the repository's `capi/` package.
+- The CLI test that asserted a measured duration of one second asserts only
+  that the duration is printed. The CLI tests run the built `checksum`
+  binary rather than a nested `cargo run`, which re-linked it under
+  concurrent tests and killed the siblings executing it; the tier pin test
+  checks that every tier below the detected one is selected when pinned,
+  not merely accepted.
+- A `CrcTurboParams` with `refin` differing from `refout` is rejected with
+  the new `MismatchedReflection` error. It reached an assertion in the
+  combine field, which aborted the process, and the plain checksum ignored
+  `refout`.
+- Custom reflected CRC-32 and CRC-64 parameters start from the reflected
+  `init`, as the Rocksoft model says and as the CRC-16 path already did.
+  crc-fast reversed the init for width 16 only, so a reflected 32- or
+  64-bit custom CRC whose init is not a bit palindrome checksummed wrongly;
+  no catalogued CRC of those widths is affected, as they all start from 0
+  or all ones.
+- The aarch64 CRC-32/ISCSI and CRC-32/ISO-HDLC fusion kernels, which use
+  the CRC32 instructions, run only on a CPU that reports the `crc`
+  extension; it is optional on ARMv8.0 and crc-fast never checked it.
+- The AVX-512 tiers also require AVX512BW, which their byte shuffles use.
+- `CRC_TURBO_TIER=x86_64-avx512-pclmulqdq` on a part with VPCLMULQDQ holds
+  CRC-32/ISCSI to the PCLMULQDQ kernel; the kernel re-detected VPCLMULQDQ
+  and ran the wider one.
 
 ### Combine
 
@@ -159,10 +227,11 @@ own changelog up to the fork point continues below, unchanged.
 - New `checksum_zeros` and `checksum_zeros_with_params`: the CRC of `len`
   zero bytes in O(log len), without touching memory.
 
-## 1.11.0
+## 1.11.0 - 2026-10-20
 
-The first release of the fork. It is everything in the [Fork](#fork) section
-above.
+The first release of the fork. It is everything in the
+[Fork](https://github.com/scryer-media/crc-turbo/blob/main/CHANGELOG.md#fork)
+section of `CHANGELOG.md`.
 
 ## [1.10.0](https://github.com/awesomized/crc-fast-rust/releases/tag/1.10.0) - 2025-12-26
 * [Rust 1.89 baseline](https://github.com/awesomized/crc-fast-rust/pull/27)
