@@ -45,7 +45,8 @@ own changelog up to the fork point continues below, unchanged.
   (cargo-audit over both lockfiles, zizmor); `codeql`; gitleaks pre-commit
   hooks; renovate; issue templates; `AGENTS.md`, `SECURITY.md`,
   `CONTRIBUTORS.md`. Upstream's `tests.yml` and `release.yml` were replaced
-  as duplicates of these.
+  as duplicates of these. The Linux lanes run on `ubuntu-26.04` and
+  `ubuntu-26.04-arm`, the current hosted images.
 - The crate archive no longer carries the repository's CI, hook, fuzz and
   agent files, nor upstream's `.kiro/` design notes, which stay in the
   repository.

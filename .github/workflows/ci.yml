@@ -32,7 +32,7 @@ env:
 jobs:
   hygiene:
     name: hygiene
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -86,7 +86,7 @@ jobs:
 
   fmt:
     name: fmt
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -110,9 +110,9 @@ jobs:
       matrix:
         include:
           - platform: linux-x86_64
-            runner: ubuntu-24.04
+            runner: ubuntu-26.04
           - platform: linux-aarch64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
           - platform: macos-aarch64
             runner: macos-15
           - platform: windows-x86_64
@@ -140,7 +140,7 @@ jobs:
 
   docs:
     name: docs
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     env:
       RUSTDOCFLAGS: -D warnings
@@ -162,9 +162,9 @@ jobs:
       matrix:
         include:
           - platform: linux-x86_64
-            runner: ubuntu-24.04
+            runner: ubuntu-26.04
           - platform: linux-aarch64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
           - platform: macos-aarch64
             runner: macos-15
           - platform: macos-x86_64
@@ -191,7 +191,7 @@ jobs:
   # toolchain; upstream ran the same targets through cross.
   test-x86-linux:
     name: test-${{ matrix.target }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -235,7 +235,7 @@ jobs:
   # The table-driven fallback, on big-endian targets with no accelerated tier.
   test-software:
     name: test-${{ matrix.target }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -258,7 +258,7 @@ jobs:
 
   miri:
     name: miri-x86_64
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -278,7 +278,7 @@ jobs:
 
   no-std:
     name: no-std-${{ matrix.target }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -310,7 +310,7 @@ jobs:
 
   wasm:
     name: wasm-${{ matrix.target }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -367,9 +367,9 @@ jobs:
           - checksum_crc64_nvme
         include:
           - platform: linux-x86_64
-            runner: ubuntu-24.04
+            runner: ubuntu-26.04
           - platform: linux-aarch64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -395,7 +395,7 @@ jobs:
 
   msrv:
     name: msrv
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -420,7 +420,7 @@ jobs:
 
   package:
     name: package
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -439,7 +439,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, windows-2025]
+        os: [ubuntu-26.04, ubuntu-26.04-arm, macos-15, windows-2025]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -458,7 +458,7 @@ jobs:
     name: ci-complete
     if: always()
     needs: [hygiene, fmt, clippy, docs, test, test-x86-linux, test-x86-windows, test-software, miri, no-std, wasm, fuzz, msrv, package, capi]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
       # Every required lane must have succeeded: a skipped lane is as much a

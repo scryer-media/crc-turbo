@@ -40,7 +40,7 @@ env:
 jobs:
   verify:
     name: verify
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     permissions:
       contents: read
@@ -147,7 +147,7 @@ jobs:
     if: >-
       !cancelled() && !inputs.dry_run
       && needs.verify.result == 'success'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     environment: crates-io
     permissions:
@@ -185,7 +185,7 @@ jobs:
     name: github release
     needs: [verify, publish]
     if: ${{ !cancelled() && needs.publish.result == 'success' }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
       contents: write
