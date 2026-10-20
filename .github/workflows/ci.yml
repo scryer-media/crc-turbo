@@ -334,13 +334,6 @@ jobs:
         run: cargo build --locked --target ${{ matrix.target }} --no-default-features --features alloc,panic-handler --lib --release
       - name: WASM tests (on the host)
         run: cargo test --locked --test wasm_tests
-      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
-        if: matrix.target == 'wasm32-unknown-unknown'
-        with:
-          tool: wasm-pack@0.15.0
-      - name: Browser package with wasm-pack
-        if: matrix.target == 'wasm32-unknown-unknown'
-        run: wasm-pack build --target web --no-default-features --features alloc,panic-handler
 
   # A short run of every target on both architectures with accelerated tiers.
   # A crash fails the lane; the input is kept as an artifact.
