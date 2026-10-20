@@ -3,7 +3,7 @@
 #![allow(dead_code)]
 
 use crate::traits::{CrcCalculator, CrcWidth};
-use crate::{arch, cache, CrcAlgorithm, CrcParams};
+use crate::{arch, cache, CrcAlgorithm, CrcError, CrcParams};
 
 /// CRC algorithm parameters matching the CRC catalogue specification.
 ///
@@ -89,6 +89,10 @@ impl CrcParams {
     /// Does not support mis-matched refin/refout parameters, so both must be true or both false.
     ///
     /// Rocksoft parameters for lots of variants: <https://reveng.sourceforge.io/crc-catalogue/all.htm>
+    ///
+    /// # Panics
+    ///
+    /// If `width` is not 16, 32 or 64; [`CrcParams::try_new`] returns the error instead.
     pub fn new(
         name: &'static str,
         width: u8,
@@ -98,17 +102,46 @@ impl CrcParams {
         xorout: u64,
         check: u64,
     ) -> Self {
+        match Self::try_new(name, width, poly, init, reflected, xorout, check) {
+            Ok(params) => params,
+            Err(error) => panic!("{error}"),
+        }
+    }
+
+    /// [`CrcParams::new`] that returns [`CrcError::UnsupportedWidth`] instead of panicking.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use crc_turbo::{checksum_with_params, CrcError, CrcParams};
+    ///
+    /// let params = CrcParams::try_new("CRC-32/CUSTOM", 32, 0x04c11db7, 0xffffffff, true, 0xffffffff, 0xcbf43926)
+    ///     .expect("a supported width");
+    /// assert_eq!(checksum_with_params(params, b"123456789"), 0xcbf43926);
+    ///
+    /// let error = CrcParams::try_new("CRC-8/CUSTOM", 8, 0x07, 0, false, 0, 0xf4).unwrap_err();
+    /// assert_eq!(error, CrcError::UnsupportedWidth(8));
+    /// ```
+    pub fn try_new(
+        name: &'static str,
+        width: u8,
+        poly: u64,
+        init: u64,
+        reflected: bool,
+        xorout: u64,
+        check: u64,
+    ) -> Result<Self, CrcError> {
+        // Checked before the keys are generated, which the generator cannot do for another width.
+        if !matches!(width, 16 | 32 | 64) {
+            return Err(CrcError::UnsupportedWidth(width));
+        }
+
         let keys_array = cache::get_or_generate_keys(width, poly, reflected);
         let keys = crate::CrcKeysStorage::from_keys_fold_256(keys_array);
 
-        // Validate width is supported
-        if width != 16 && width != 32 && width != 64 {
-            panic!("Unsupported width: {width}");
-        }
-
         let init_algorithm = initial_state(width, init, reflected);
 
-        Self {
+        Ok(Self {
             algorithm: CrcAlgorithm::CrcCustom,
             name,
             width,
@@ -120,7 +153,7 @@ impl CrcParams {
             xorout,
             check,
             keys,
-        }
+        })
     }
 
     /// Gets a key at the specified index, returning 0 if out of bounds.

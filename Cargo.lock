@@ -263,6 +263,7 @@ dependencies = [
  "digest 0.10.7",
  "digest 0.11.3",
  "hashbrown",
+ "libc",
  "proptest",
  "rand 0.10.3",
  "regex",

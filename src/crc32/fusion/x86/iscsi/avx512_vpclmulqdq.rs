@@ -48,7 +48,7 @@ pub unsafe fn crc32_iscsi_avx512_vpclmulqdq_v3x2(
         let mut k = _mm512_broadcast_i32x4(k_128);
 
         // XOR the CRC into the first vector's low 32 bits
-        let crc_vec = _mm512_castsi128_si512(_mm_cvtsi32_si128(crc0 as i32));
+        let crc_vec = _mm512_zextsi128_si512(_mm_cvtsi32_si128(crc0 as i32));
         x0 = _mm512_xor_si512(crc_vec, x0);
 
         // First round of polynomial multiplication

@@ -39,6 +39,11 @@ author.
   (crc-fast#56), written independently of and before the one this crate
   ships, whose feature-detection model this crate adopts; and the field
   arithmetic behind `checksum_combine` and `CrcCombine` (crc-fast#60).
+- **GiorgioRegni**: the review of CRC-32/ISCSI on 1.10.0 that found the
+  undefined upper bits in the AVX-512 kernel, the aarch64 `crc` and
+  AVX512BW detection gaps and the missing test coverage (crc-fast#64).
+- **dengyt2018**: the request for error values in place of panics for
+  `no_std` callers (crc-fast#37).
 
 ## This fork
 

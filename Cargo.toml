@@ -90,6 +90,10 @@ rand = "0.10"
 regex = "1.12"
 wasm-bindgen-test = "0.3"
 
+# The guard-page test maps and protects memory directly.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
 # lto=true has a big improvement in performance
 [profile.release]
 lto = true

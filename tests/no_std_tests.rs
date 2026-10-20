@@ -134,6 +134,49 @@ fn test_no_std_custom_params() {
     assert_eq!(result, 0xcbf43926, "Custom params failed");
 }
 
+/// The fallible entry points report misuse as a value, with no panic for an embedded caller to
+/// abort on.
+#[test]
+fn test_no_std_errors_are_values() {
+    use crc_turbo::{try_checksum, CrcCombine, CrcError, CrcParams};
+
+    assert_eq!(
+        CrcParams::try_new("CRC-8/CUSTOM", 8, 0x07, 0, false, 0, 0xf4).unwrap_err(),
+        CrcError::UnsupportedWidth(8)
+    );
+    assert_eq!(
+        try_checksum(CrcAlgorithm::CrcCustom, b"123456789").unwrap_err(),
+        CrcError::MissingParams(CrcAlgorithm::CrcCustom)
+    );
+    assert_eq!(
+        Digest::try_new(CrcAlgorithm::CrcCustom).unwrap_err(),
+        CrcError::MissingParams(CrcAlgorithm::CrcCustom)
+    );
+    assert_eq!(
+        CrcCombine::try_new(CrcAlgorithm::CrcCustom, 5).unwrap_err(),
+        CrcError::MissingParams(CrcAlgorithm::CrcCustom)
+    );
+    let mut mismatched = CrcParams::new(
+        "CRC-32/CUSTOM",
+        32,
+        0x04c11db7,
+        0xffffffff,
+        true,
+        0xffffffff,
+        0xcbf43926,
+    );
+    mismatched.refout = false;
+    assert_eq!(
+        CrcCombine::try_new_with_params(mismatched, 5).unwrap_err(),
+        CrcError::MismatchedReflection
+    );
+
+    assert_eq!(
+        try_checksum(CrcAlgorithm::Crc32IsoHdlc, b"123456789"),
+        Ok(0xcbf43926)
+    );
+}
+
 /// Test that Digest can be reused
 #[test]
 fn test_no_std_digest_reuse() {
