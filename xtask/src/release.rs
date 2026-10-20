@@ -21,7 +21,8 @@ cargo xtask release [--dry-run] [--publish] [--skip-tests]
   --publish     after tagging, `cargo publish` from this machine, then push
                 the tag (the first release, before trusted publishing exists)
   --skip-tests  leave out `cargo test`; CI on the release commit and the
-                workflow's own verify job both run it";
+                workflow's own verify job both run it. Not with --publish,
+                which uploads from this machine without either";
 
 struct Release {
     dry_run: bool,
@@ -54,6 +55,12 @@ pub fn release(args: impl Iterator<Item = String>) -> ExitCode {
                 return ExitCode::from(2);
             }
         }
+    }
+    if publish && skip_tests {
+        eprintln!(
+            "release: --publish uploads from this machine, so the tests run here: drop --skip-tests"
+        );
+        return ExitCode::from(2);
     }
     let mut run = Release {
         dry_run,
@@ -90,6 +97,18 @@ impl Release {
         }
         if !succeeds("git", &["verify-commit", "HEAD"]) {
             self.problem("HEAD is not a signed commit")?;
+        }
+        // The release commit is one CI has checked, which means it is on origin/main already.
+        if !succeeds(
+            "git",
+            &[
+                "merge-base",
+                "--is-ancestor",
+                "HEAD",
+                "refs/remotes/origin/main",
+            ],
+        ) {
+            self.problem("HEAD is not on origin/main; push main and let CI pass first")?;
         }
         // A release that got as far as the tag and then failed - a refused
         // publish, a refused push - is picked up where it stopped, as long as

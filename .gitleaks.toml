@@ -1,5 +1,9 @@
 title = "crc-turbo gitleaks config"
 
+# A config file replaces the built-in rules; without this the scan has none.
+[extend]
+useDefault = true
+
 [allowlist]
 description = "allow obvious examples and test placeholders"
 regexes = [

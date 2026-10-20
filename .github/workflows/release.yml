@@ -2,11 +2,11 @@ name: release
 
 # Two ways in, the same checks and the same publish (see docs/publishing.md):
 #
-# - Run from the Actions tab (workflow_dispatch) on main with the version to
-#   release. The run refuses unless that commit already passed ci.yml, then
-#   publishes the crate to crates.io through trusted publishing and creates
-#   the tag v<version> and the GitHub release. dry_run (the default) stops
-#   after the checks.
+# - Run from the Actions tab (workflow_dispatch) on main. It releases the
+#   version main's Cargo.toml names. The run refuses unless that commit
+#   already passed ci.yml, then publishes the crate to crates.io through
+#   trusted publishing and creates the tag v<version> and the GitHub release.
+#   dry_run (the default) stops after the checks.
 # - Push a signed tag v<version> on main, as `cargo xtask release` does. The
 #   run tests the tag itself, then publishes the same way.
 #
@@ -19,10 +19,6 @@ on:
       - "v*"
   workflow_dispatch:
     inputs:
-      version:
-        description: "Version to release, exactly as in Cargo.toml (e.g. 1.11.0)"
-        required: true
-        type: string
       dry_run:
         description: "Run the checks only; publish nothing"
         required: true
@@ -55,40 +51,39 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
+      # A dispatched release is whatever version main's manifest names; a
+      # pushed tag has to name the manifest's version.
       - name: The version being released
         id: version
-        env:
-          INPUT_VERSION: ${{ inputs.version }}
         run: |
+          manifest="$(cargo pkgid -p "$CRATE" | sed 's/.*[#@]//')"
           if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
-            version="$INPUT_VERSION"
             if [ "$GITHUB_REF" != refs/heads/main ]; then
               echo "::error::a release is dispatched from main, not $GITHUB_REF"
               exit 1
             fi
+            version="$manifest"
           else
             version="${GITHUB_REF_NAME#v}"
+            if [ "$version" != "$manifest" ]; then
+              echo "::error::tag $GITHUB_REF_NAME names $version, the manifest $manifest"
+              exit 1
+            fi
           fi
           if ! echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
             echo "::error::'$version' is not a version"
             exit 1
           fi
+          echo "releasing $CRATE $version"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-      - name: The manifest has this version
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          manifest="$(cargo pkgid -p "$CRATE" | sed 's/.*[#@]//')"
-          echo "manifest $manifest, releasing $VERSION"
-          test "$manifest" = "$VERSION"
       - name: The changelog has a dated section for this version
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          heading="$(grep -m1 "^## .*$VERSION" CHANGELOG.md || true)"
+          heading="$(grep -m1 -E "^## \[?${VERSION//./\\.}([^0-9.]|$)" CHANGELOG.md || true)"
           echo "$heading"
           test -n "$heading"
           ! echo "$heading" | grep -qi unreleased
@@ -127,9 +122,9 @@ jobs:
       - name: Test
         if: github.event_name == 'push'
         run: cargo test --locked --workspace --all-features --no-fail-fast
-      # semver-checks needs a published baseline. The first release has none
-      # (its API is crc-fast 1.10.0's under another name, which the checker
-      # cannot compare across), so the check starts with the second.
+      # semver-checks needs a published baseline. The 0.0.0 placeholder that
+      # reserves the name is one (1.11.0 is a major bump over it, so the first
+      # release passes); the check is skipped only if the crate is absent.
       - name: Is there a published baseline
         id: baseline
         run: |
@@ -162,7 +157,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       # `cargo xtask release --publish` uploads from the releaser's machine (the

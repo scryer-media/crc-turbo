@@ -30,7 +30,8 @@ own changelog up to the fork point continues below, unchanged.
   and its types `CrcTurbo*`. With crc-fast's names, a binary linking both
   crates under the default `ffi` feature would fail on duplicate symbols.
 - Released by `.github/workflows/release.yml`, dispatched from the Actions tab
-  on `main` (it creates the tag) or started by the signed `v<version>` tag
+  on `main` (it releases the version `Cargo.toml` names and creates the tag)
+  or started by the signed `v<version>` tag
   `cargo xtask release` pushes; crates.io trusted publishing either way. See
   `docs/publishing.md`. Upstream's release workflow, which also built and
   attested binary packages of the C library and the CLI tools, is not
@@ -38,11 +39,12 @@ own changelog up to the fork point continues below, unchanged.
 - Repository hygiene adopted from the scryer-media house style: SHA-pinned CI
   ending in a required `ci-complete` job that keeps all of upstream's lanes
   (aarch64, x86_64, 32-bit x86, the software fallback on big-endian PowerPC,
-  Miri, `no_std`, WASM and a fuzz smoke of every target) and adds `clippy -D
-  warnings` across feature sets, docs, MSRV and packaging; `security`
+  Miri, `no_std`, WASM and a fuzz smoke of every target) and adds a `hygiene`
+  lane (no binaries, home paths or credential-shaped strings in the tree),
+  `clippy -D warnings` across feature sets, docs, MSRV and packaging; `security`
   (cargo-audit over both lockfiles, zizmor); `codeql`; gitleaks pre-commit
   hooks; renovate; issue templates; `AGENTS.md`, `SECURITY.md`,
-  `CONTRIBUTORS.md`. Upstream's `tests.yml` and `release.yml` were removed
+  `CONTRIBUTORS.md`. Upstream's `tests.yml` and `release.yml` were replaced
   as duplicates of these.
 - The crate archive no longer carries the repository's CI, hook, fuzz and
   agent files, nor upstream's `.kiro/` design notes, which stay in the
@@ -176,6 +178,8 @@ own changelog up to the fork point continues below, unchanged.
   `DESTDIR`; only `make install` requires it.
 - The crate archive no longer carries the `Makefile` and `docs/`, which
   refer to the repository's `capi/` package.
+- `cargo xtask release --publish` refuses `--skip-tests` and a HEAD that is
+  not on `origin/main`.
 - The CLI test that asserted a measured duration of one second asserts only
   that the duration is printed. The CLI tests run the built `checksum`
   binary rather than a nested `cargo run`, which re-linked it under
@@ -199,6 +203,9 @@ own changelog up to the fork point continues below, unchanged.
 - `CRC_TURBO_TIER=x86_64-avx512-pclmulqdq` on a part with VPCLMULQDQ holds
   CRC-32/ISCSI to the PCLMULQDQ kernel; the kernel re-detected VPCLMULQDQ
   and ran the wider one.
+- `.gitleaks.toml` extends the default rule set; a config without
+  `[extend]` has no rules at all, so the pre-commit scan could never find
+  a secret. The hook also fails closed when `git diff --cached` fails.
 
 ### Combine
 

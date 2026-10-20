@@ -41,8 +41,13 @@ fn personal_references() -> bool {
             "--",
             ".",
         ],
-    )
-    .unwrap_or_default();
+    );
+    let Some(diff) = diff else {
+        eprintln!(
+            "pre-commit blocked: `git diff --cached` failed, so the staged changes were not checked."
+        );
+        return false;
+    };
 
     let mut file = "unknown";
     let mut hits = Vec::new();
