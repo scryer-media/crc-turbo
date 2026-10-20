@@ -64,7 +64,9 @@ own changelog up to the fork point continues below, unchanged.
   Makefile builds and installs from there, and `make capi-test` runs a C smoke
   test against the static and the shared library. From crc-fast#49 by
   onur-ozkan, which dropped the extra crate types; the `capi/` package keeps
-  the C library.
+  the C library. `wasm-pack`, which packages only a `cdylib`, no longer
+  builds the crate itself, so upstream's browser-package CI step is gone; a
+  browser package wraps the crate in a `cdylib` crate of its own.
 - The `ffi` feature enables `std`. The C functions use `std` throughout,
   so `--no-default-features --features ffi` did not compile. From
   crc-fast#48 by MggMuggins.
@@ -183,9 +185,11 @@ own changelog up to the fork point continues below, unchanged.
 - The CLI test that asserted a measured duration of one second asserts only
   that the duration is printed. The CLI tests run the built `checksum`
   binary rather than a nested `cargo run`, which re-linked it under
-  concurrent tests and killed the siblings executing it; the tier pin test
-  checks that every tier below the detected one is selected when pinned,
-  not merely accepted.
+  concurrent tests and killed the siblings executing it. Where the target has
+  a runner (`CARGO_TARGET_<TRIPLE>_RUNNER`, as under `cross test` on the
+  PowerPC lanes, where the binary is of a foreign architecture), the tests
+  run the binary through it. The tier pin test checks that every tier below
+  the detected one is selected when pinned, not merely accepted.
 - A `CrcTurboParams` with `refin` differing from `refout` is rejected with
   the new `MismatchedReflection` error. It reached an assertion in the
   combine field, which aborted the process, and the plain checksum ignored

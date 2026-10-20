@@ -5,7 +5,7 @@
 
 #![cfg(feature = "cli")]
 
-use std::process::Command;
+mod common;
 
 const TIERS: &[&str] = &[
     "aarch64-neon-pmull-sha3",
@@ -19,7 +19,7 @@ const TIERS: &[&str] = &[
 ];
 
 fn run(bin: &str, tier: Option<&str>, args: &[&str]) -> String {
-    let mut command = Command::new(bin);
+    let mut command = common::bin(bin);
     command.args(args).env_remove(crc_turbo::TIER_ENV);
     if let Some(tier) = tier {
         command.env(crc_turbo::TIER_ENV, tier);

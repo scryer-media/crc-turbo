@@ -2,13 +2,14 @@
 
 #![cfg(feature = "cli")]
 
+mod common;
+
 use std::fs;
-use std::process::Command;
 
 #[test]
 #[cfg_attr(miri, ignore)] // Miri doesn't allow this due to isolation restrictions
 fn test_benchmark_flag_parsing() {
-    let output = Command::new(env!("CARGO_BIN_EXE_checksum"))
+    let output = common::bin(env!("CARGO_BIN_EXE_checksum"))
         .args(["-a", "CRC-32/ISCSI", "-b"])
         .output()
         .expect("Failed to execute command");
@@ -26,7 +27,7 @@ fn test_benchmark_flag_parsing() {
 #[test]
 #[cfg_attr(miri, ignore)] // Miri doesn't allow this due to isolation restrictions
 fn test_benchmark_with_size_parameter() {
-    let output = Command::new(env!("CARGO_BIN_EXE_checksum"))
+    let output = common::bin(env!("CARGO_BIN_EXE_checksum"))
         .args(["-a", "CRC-32/ISCSI", "-b", "--size", "1024"])
         .output()
         .expect("Failed to execute command");
@@ -39,7 +40,7 @@ fn test_benchmark_with_size_parameter() {
 #[test]
 #[cfg_attr(miri, ignore)] // Miri doesn't allow this due to isolation restrictions
 fn test_benchmark_with_duration_parameter() {
-    let output = Command::new(env!("CARGO_BIN_EXE_checksum"))
+    let output = common::bin(env!("CARGO_BIN_EXE_checksum"))
         .args(["-a", "CRC-32/ISCSI", "-b", "--duration", "1.0"])
         .output()
         .expect("Failed to execute command");
@@ -53,7 +54,7 @@ fn test_benchmark_with_duration_parameter() {
 #[test]
 #[cfg_attr(miri, ignore)] // Miri doesn't allow this due to isolation restrictions
 fn test_benchmark_invalid_size() {
-    let output = Command::new(env!("CARGO_BIN_EXE_checksum"))
+    let output = common::bin(env!("CARGO_BIN_EXE_checksum"))
         .args(["-a", "CRC-32/ISCSI", "-b", "--size", "0"])
         .output()
         .expect("Failed to execute command");
@@ -66,7 +67,7 @@ fn test_benchmark_invalid_size() {
 #[test]
 #[cfg_attr(miri, ignore)] // Miri doesn't allow this due to isolation restrictions
 fn test_benchmark_invalid_duration() {
-    let output = Command::new(env!("CARGO_BIN_EXE_checksum"))
+    let output = common::bin(env!("CARGO_BIN_EXE_checksum"))
         .args(["-a", "CRC-32/ISCSI", "-b", "--duration", "0"])
         .output()
         .expect("Failed to execute command");
@@ -83,7 +84,7 @@ fn test_benchmark_with_file_input() {
     let test_file = "test_benchmark_file.txt";
     fs::write(test_file, "Hello, benchmark world!").expect("Failed to create test file");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_checksum"))
+    let output = common::bin(env!("CARGO_BIN_EXE_checksum"))
         .args([
             "-a",
             "CRC-32/ISCSI",
@@ -107,7 +108,7 @@ fn test_benchmark_with_file_input() {
 #[test]
 #[cfg_attr(miri, ignore)] // Miri doesn't allow this due to isolation restrictions
 fn test_benchmark_with_string_input() {
-    let output = Command::new(env!("CARGO_BIN_EXE_checksum"))
+    let output = common::bin(env!("CARGO_BIN_EXE_checksum"))
         .args([
             "-a",
             "CRC-32/ISCSI",
@@ -131,7 +132,7 @@ fn test_benchmark_different_algorithms() {
     let algorithms = ["CRC-32/ISCSI", "CRC-64/NVME"];
 
     for algorithm in &algorithms {
-        let output = Command::new(env!("CARGO_BIN_EXE_checksum"))
+        let output = common::bin(env!("CARGO_BIN_EXE_checksum"))
             .args(["-a", algorithm, "-b", "--duration", "0.5"])
             .output()
             .expect("Failed to execute command");
@@ -149,7 +150,7 @@ fn test_benchmark_different_algorithms() {
 #[test]
 #[cfg_attr(miri, ignore)] // Miri doesn't allow this due to isolation restrictions
 fn test_benchmark_size_without_benchmark_flag() {
-    let output = Command::new(env!("CARGO_BIN_EXE_checksum"))
+    let output = common::bin(env!("CARGO_BIN_EXE_checksum"))
         .args(["-a", "CRC-32/ISCSI", "--size", "1024"])
         .output()
         .expect("Failed to execute command");
@@ -162,7 +163,7 @@ fn test_benchmark_size_without_benchmark_flag() {
 #[test]
 #[cfg_attr(miri, ignore)] // Miri doesn't allow this due to isolation restrictions
 fn test_benchmark_nonexistent_file() {
-    let output = Command::new(env!("CARGO_BIN_EXE_checksum"))
+    let output = common::bin(env!("CARGO_BIN_EXE_checksum"))
         .args(["-a", "CRC-32/ISCSI", "-b", "-f", "nonexistent_file.txt"])
         .output()
         .expect("Failed to execute command");
