@@ -205,6 +205,8 @@ own changelog up to the fork point continues below, unchanged.
   the CRC32 instructions, run only on a CPU that reports the `crc`
   extension; it is optional on ARMv8.0 and crc-fast never checked it.
 - The AVX-512 tiers also require AVX512BW, which their byte shuffles use.
+  From 1.11.1 the `no_std` build's compile-time detection requires it too;
+  in 1.11.0 only the runtime detection of `std` builds did.
 - `CRC_TURBO_TIER=x86_64-avx512-pclmulqdq` on a part with VPCLMULQDQ holds
   CRC-32/ISCSI to the PCLMULQDQ kernel; the kernel re-detected VPCLMULQDQ
   and ran the wider one.
@@ -262,6 +264,16 @@ own changelog up to the fork point continues below, unchanged.
   of `A`. `zeros` returns the CRC of that many zero bytes.
 - New `checksum_zeros` and `checksum_zeros_with_params`: the CRC of `len`
   zero bytes in O(log len), without touching memory.
+
+## 1.11.1 - 2026-11-08
+
+- A `no_std` build for x86_64 chose the AVX-512 tiers from its compile-time
+  target features on AVX512VL alone. Those kernels also use AVX512BW, so a
+  target that enables AVX512VL without AVX512BW, as for a guest whose
+  hypervisor masks it, reached instructions the CPU may not have. It now
+  takes the tiers below, as `std` builds already did; both detection paths
+  decide through one rule. `std` builds are unchanged. The gap is item 3 of
+  crc-fast#64 by GiorgioRegni, which 1.11.0 closed for `std` builds only.
 
 ## 1.11.0 - 2026-10-20
 

@@ -1,6 +1,6 @@
 [package]
 name = "crc-turbo"
-version = "1.11.0"
+version = "1.11.1"
 edition = "2021"
 authors = ["Don MacAskill", "NZB Man"]
 # src/combine.rs carries Zlib-licensed code; its notice is in that file.
