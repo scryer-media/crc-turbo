@@ -84,5 +84,10 @@ major version and a reason, not convenience.
   commit is proposed.
 - The C header `libcrc_turbo.h` is generated: `test_ffi_header` rewrites it
   when it is stale and fails, and the rewritten file is committed.
-- Any code change bumps the crate version, `Cargo.lock` and `CHANGELOG.md` in
-  the same change.
+- Any code change bumps the version in the same change, everywhere it is
+  written: `Cargo.toml`, `capi/Cargo.toml` (its own version and its `=`
+  pin on `crc-turbo`), the `crc-turbo` entries in `Cargo.lock`,
+  `capi/Cargo.lock` and `fuzz/Cargo.lock`, and `CHANGELOG.md`.
+- The `CHANGELOG.md` section is headed `## <version> - <YYYY-MM-DD>`, dated
+  the day of the change. Never mark it unreleased: the release workflow
+  refuses a section that is (`docs/publishing.md`).
