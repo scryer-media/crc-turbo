@@ -1,6 +1,6 @@
 [package]
 name = "crc-turbo-capi"
-version = "1.11.0"
+version = "1.11.1"
 edition = "2021"
 rust-version = "1.89"
 authors = ["Don MacAskill", "NZB Man"]
@@ -19,7 +19,7 @@ crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
 # Renamed: this package's own library is also called `crc_turbo`.
-turbo = { package = "crc-turbo", path = "..", version = "=1.11.0" }
+turbo = { package = "crc-turbo", path = "..", version = "=1.11.1" }
 
 [profile.release]
 lto = true

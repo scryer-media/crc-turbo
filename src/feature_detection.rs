@@ -186,6 +186,16 @@ unsafe fn detect_aarch64_features() -> ArchCapabilities {
     }
 }
 
+/// Whether the AVX-512 tiers may run, which `has_avx512vl` records. Their kernels need AVX512VL
+/// and also shuffle bytes across 512-bit vectors, which is AVX512BW. Every CPU with AVX512VL
+/// ships AVX512BW; a hypervisor that masks it, or a `no_std` target that enables AVX512VL
+/// alone, gets the tiers below. Both detection paths decide through this one rule.
+#[inline(always)]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64", test))]
+const fn avx512_tiers_usable(has_pclmulqdq: bool, has_avx512vl: bool, has_avx512bw: bool) -> bool {
+    has_pclmulqdq && has_avx512vl && has_avx512bw
+}
+
 /// x86/x86_64-specific feature detection
 #[inline(always)]
 #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "std"))]
@@ -196,11 +206,11 @@ unsafe fn detect_x86_features() -> ArchCapabilities {
     let has_sse41 = is_x86_feature_detected!("sse4.1");
     let has_pclmulqdq = has_sse41 && is_x86_feature_detected!("pclmulqdq");
 
-    // The AVX-512 kernels also shuffle bytes across 512-bit vectors, which is AVX512BW. Every
-    // CPU with AVX512VL ships it; a hypervisor that masks it gets the tiers below.
-    let has_avx512vl = has_pclmulqdq
-        && is_x86_feature_detected!("avx512vl")
-        && is_x86_feature_detected!("avx512bw");
+    let has_avx512vl = avx512_tiers_usable(
+        has_pclmulqdq,
+        is_x86_feature_detected!("avx512vl"),
+        is_x86_feature_detected!("avx512bw"),
+    );
     // VPCLMULQDQ is its own CPUID feature, not part of AVX-512: AMD Zen 3 and Intel Alder Lake
     // through Arrow Lake have it with AVX2 and no AVX-512, and use the 256-bit tier.
     let has_vpclmulqdq = has_pclmulqdq && is_x86_feature_detected!("vpclmulqdq");
@@ -227,7 +237,11 @@ unsafe fn detect_x86_features() -> ArchCapabilities {
     let has_sse41 = cfg!(target_feature = "sse4.1");
     let has_sse42 = cfg!(target_feature = "sse4.2");
     let has_pclmulqdq = has_sse41 && cfg!(target_feature = "pclmulqdq");
-    let has_avx512vl = has_pclmulqdq && cfg!(target_feature = "avx512vl");
+    let has_avx512vl = avx512_tiers_usable(
+        has_pclmulqdq,
+        cfg!(target_feature = "avx512vl"),
+        cfg!(target_feature = "avx512bw"),
+    );
     let has_vpclmulqdq = has_pclmulqdq && cfg!(target_feature = "vpclmulqdq");
     let has_avx2 = cfg!(target_feature = "avx2");
 
@@ -636,16 +650,22 @@ mod tests {
     /// and no AVX-512VL, and the 512-bit tier on parts with both.
     #[test]
     fn test_x86_64_tier_selection_by_cpu() {
-        let x86 = |avx2: bool, avx512vl: bool, vpclmulqdq: bool| ArchCapabilities {
-            has_aes: false,
-            has_crc: false,
-            has_sha3: false,
-            has_sse41: true,
-            has_sse42: true,
-            has_pclmulqdq: true,
-            has_avx512vl: avx512vl,
-            has_vpclmulqdq: vpclmulqdq,
-            has_avx2: avx2,
+        // `avx512bw` is what the CPU reports; detection folds it into `has_avx512vl` through
+        // `avx512_tiers_usable`, as both detection paths do.
+        let x86_bw =
+            |avx2: bool, avx512vl: bool, avx512bw: bool, vpclmulqdq: bool| ArchCapabilities {
+                has_aes: false,
+                has_crc: false,
+                has_sha3: false,
+                has_sse41: true,
+                has_sse42: true,
+                has_pclmulqdq: true,
+                has_avx512vl: avx512_tiers_usable(true, avx512vl, avx512bw),
+                has_vpclmulqdq: vpclmulqdq,
+                has_avx2: avx2,
+            };
+        let x86 = |avx2: bool, avx512vl: bool, vpclmulqdq: bool| {
+            x86_bw(avx2, avx512vl, avx512vl, vpclmulqdq)
         };
 
         let cpus = [
@@ -703,6 +723,18 @@ mod tests {
             (
                 "masked",
                 x86(false, false, true),
+                PerformanceTier::X86_64SsePclmulqdq,
+            ),
+            // An Ice Lake-SP guest whose hypervisor, or whose `no_std` target features, leave
+            // out AVX512BW: the AVX-512 kernels' byte shuffles need it, so the tiers below run
+            (
+                "Ice Lake-SP without AVX512BW",
+                x86_bw(true, true, false, true),
+                PerformanceTier::X86_64Avx2Vpclmulqdq,
+            ),
+            (
+                "Skylake-SP without AVX512BW",
+                x86_bw(true, true, false, false),
                 PerformanceTier::X86_64SsePclmulqdq,
             ),
         ];
