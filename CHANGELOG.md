@@ -265,7 +265,7 @@ own changelog up to the fork point continues below, unchanged.
 - New `checksum_zeros` and `checksum_zeros_with_params`: the CRC of `len`
   zero bytes in O(log len), without touching memory.
 
-## 1.11.1 - Unreleased
+## 1.11.1 - 2026-11-08
 
 - A `no_std` build for x86_64 chose the AVX-512 tiers from its compile-time
   target features on AVX512VL alone. Those kernels also use AVX512BW, so a
