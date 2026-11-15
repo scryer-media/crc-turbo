@@ -28,6 +28,11 @@ env:
   NIGHTLY_TOOLCHAIN: nightly-2026-09-01
   CARGO_FUZZ_VERSION: 0.13.2
   CROSS_VERSION: 0.2.5
+  # Pinned runtimes for the wasm-test lanes. Bump the emsdk release and the
+  # commit its tag names together.
+  WASMTIME_VERSION: 50.0.1
+  EMSDK_VERSION: 7.0.0
+  EMSDK_COMMIT: 1693ce7359fc9694f198694f902a2cc061239b86
 
 jobs:
   hygiene:
@@ -335,6 +340,96 @@ jobs:
       - name: WASM tests (on the host)
         run: cargo test --locked --test wasm_tests
 
+  # The test suite compiled for WebAssembly and run there: WASI 0.1 and 0.2
+  # under wasmtime, Emscripten under Node. WebAssembly has no CRC instructions,
+  # so this is the table-driven software path, checked by the same tests as
+  # every native tier. Tests that spawn threads, and the C header check that
+  # regenerates the header from the host checkout, are ignored on wasm.
+  # Emscripten runs the library and integration tests but not the doctests:
+  # rustdoc runs each doctest outside the checkout, where the examples' input
+  # file is not found.
+  wasm-test:
+    name: wasm-test-${{ matrix.target }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [wasm32-wasip1, wasm32-wasip2, wasm32-unknown-emscripten]
+    env:
+      TARGET: ${{ matrix.target }}
+      CARGO_TARGET_WASM32_WASIP1_RUNNER: wasmtime run --dir .
+      CARGO_TARGET_WASM32_WASIP2_RUNNER: wasmtime run --dir .
+      CARGO_TARGET_WASM32_UNKNOWN_EMSCRIPTEN_RUNNER: node
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+      - name: Set up wasmtime
+        if: matrix.target != 'wasm32-unknown-emscripten'
+        uses: bytecodealliance/actions/wasmtime/setup@9152e710e9f7182e4c29ad218e4f335a7b203613 # v1.1.3
+        with:
+          version: ${{ env.WASMTIME_VERSION }}
+      - name: Verify the pinned wasmtime is the one on PATH
+        if: matrix.target != 'wasm32-unknown-emscripten'
+        run: |
+          set -euo pipefail
+          wasmtime --version
+          wasmtime --version | grep -qF "wasmtime $WASMTIME_VERSION"
+      - name: Set up Emscripten
+        if: matrix.target == 'wasm32-unknown-emscripten'
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/emsdk"
+          # Fetched by commit, not by tag: a tag can be moved, a commit cannot.
+          git init -q "$root"
+          git -C "$root" fetch -q --depth 1 \
+            https://github.com/emscripten-core/emsdk.git "$EMSDK_COMMIT"
+          git -C "$root" checkout -q FETCH_HEAD
+          "$root/emsdk" install "$EMSDK_VERSION"
+          "$root/emsdk" activate "$EMSDK_VERSION"
+          # emsdk_env.sh reads variables that may be unset.
+          set +u
+          # shellcheck disable=SC1091
+          source "$root/emsdk_env.sh"
+          set -u
+          emcc --version | head -n 1 | grep -qF "$EMSDK_VERSION"
+          node --version
+          {
+            echo "$EMSDK/upstream/emscripten"
+            dirname "$EMSDK_NODE"
+          } >> "$GITHUB_PATH"
+          {
+            echo "EMSDK=$EMSDK"
+            echo "EM_CONFIG=$EMSDK/.emscripten"
+            # The host filesystem through Node, a heap that grows past the
+            # fixed 16 MiB default, and a 1 MiB stack in place of the 64 KiB
+            # default.
+            echo "RUSTFLAGS=-C link-arg=-sNODERAWFS=1 -C link-arg=-sALLOW_MEMORY_GROWTH=1 -C link-arg=-sSTACK_SIZE=1MB"
+          } >> "$GITHUB_ENV"
+      - name: Test default features
+        run: |
+          set -euo pipefail
+          if [ "$TARGET" = wasm32-unknown-emscripten ]; then
+            cargo test --locked --target "$TARGET" --lib --tests --no-fail-fast
+          else
+            cargo test --locked --target "$TARGET" --no-fail-fast
+          fi
+      - name: Test with cache, generated tables and digest 0.11
+        run: |
+          set -euo pipefail
+          if [ "$TARGET" = wasm32-unknown-emscripten ]; then
+            cargo test --locked --target "$TARGET" --lib --tests --no-fail-fast \
+              --features cache,generated-tables,digest-0-11
+          else
+            cargo test --locked --target "$TARGET" --no-fail-fast \
+              --features cache,generated-tables,digest-0-11
+          fi
+
   # A short run of every target on both architectures with accelerated tiers.
   # A crash fails the lane; the input is kept as an artifact.
   fuzz:
@@ -450,7 +545,7 @@ jobs:
   ci-complete:
     name: ci-complete
     if: always()
-    needs: [hygiene, fmt, clippy, docs, test, test-x86-linux, test-x86-windows, test-software, miri, no-std, wasm, fuzz, msrv, package, capi]
+    needs: [hygiene, fmt, clippy, docs, test, test-x86-linux, test-x86-windows, test-software, miri, no-std, wasm, wasm-test, fuzz, msrv, package, capi]
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:

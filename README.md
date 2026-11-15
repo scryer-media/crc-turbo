@@ -159,7 +159,10 @@ cargo build --target wasm32-unknown-unknown --no-default-features --features all
 The crate is a plain Rust library (`rlib`), so a browser package wraps it in a `cdylib` crate of
 its own; `wasm-pack` does not package `crc-turbo` directly.
 
-Tested on `wasm32-unknown-unknown`, `wasm32-wasip1`, and `wasm32-wasip2` targets.
+WebAssembly has no CRC instructions, so every wasm target uses the table-driven software path. CI
+builds the library for `wasm32-unknown-unknown`, `wasm32-wasip1` and `wasm32-wasip2`, and runs the
+test suite on `wasm32-wasip1` and `wasm32-wasip2` under wasmtime and on `wasm32-unknown-emscripten`
+under Node. The tests that spawn threads are skipped there.
 
 ## Usage
 

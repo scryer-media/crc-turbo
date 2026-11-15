@@ -2079,6 +2079,7 @@ mod lib {
     /// Tests whether the FFI header is up-to-date
     #[test]
     #[cfg_attr(miri, ignore)]
+    #[cfg_attr(target_family = "wasm", ignore = "regenerates the header from the host checkout")]
     fn test_ffi_header() -> Result<(), String> {
         #[cfg(target_os = "windows")]
         {

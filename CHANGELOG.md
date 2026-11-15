@@ -41,7 +41,10 @@ own changelog up to the fork point continues below, unchanged.
   (aarch64, x86_64, 32-bit x86, the software fallback on big-endian PowerPC,
   Miri, `no_std`, WASM and a fuzz smoke of every target) and adds a `hygiene`
   lane (no binaries, home paths or credential-shaped strings in the tree),
-  `clippy -D warnings` across feature sets, docs, MSRV and packaging; `security`
+  `clippy -D warnings` across feature sets, docs, MSRV and packaging, and a
+  `wasm-test` lane that runs the test suite on `wasm32-wasip1` and
+  `wasm32-wasip2` under wasmtime and on `wasm32-unknown-emscripten` under
+  Node, where upstream only compiled for WASM; `security`
   (cargo-audit over both lockfiles, zizmor); `codeql`; gitleaks pre-commit
   hooks; renovate; issue templates; `AGENTS.md`, `SECURITY.md`,
   `CONTRIBUTORS.md`. Upstream's `tests.yml` and `release.yml` were replaced
@@ -264,6 +267,19 @@ own changelog up to the fork point continues below, unchanged.
   of `A`. `zeros` returns the CRC of that many zero bytes.
 - New `checksum_zeros` and `checksum_zeros_with_params`: the CRC of `len`
   zero bytes in O(log len), without touching memory.
+
+## 1.11.2 - 2026-11-15
+
+- CI now runs the test suite on WebAssembly, not only compiles for it: on
+  `wasm32-wasip1` and `wasm32-wasip2` under wasmtime and on
+  `wasm32-unknown-emscripten` under Node, with the default features and with
+  `cache`, `generated-tables` and `digest-0-11`. Every wasm target takes the
+  table-driven software path. The tests that spawn threads and the C header
+  check are ignored on wasm; Emscripten does not run the doctests. The library
+  itself is unchanged.
+- `proptest` is a dev-dependency without its `fork` and `timeout` features,
+  which no test used and which do not build for WASI, and `criterion` is a
+  dev-dependency only off WebAssembly.
 
 ## 1.11.1 - 2026-11-08
 
