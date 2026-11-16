@@ -471,6 +471,7 @@ mod tests {
 
     // Thread safety tests
     #[test]
+    #[cfg_attr(target_family = "wasm", ignore = "spawns threads")]
     fn test_concurrent_cache_reads() {
         use std::sync::{Arc, Barrier};
         use std::thread;
@@ -516,6 +517,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(target_family = "wasm", ignore = "spawns threads")]
     #[allow(clippy::needless_range_loop)] // Intentionally testing concurrent indexed access
     fn test_concurrent_cache_writes() {
         use std::sync::{Arc, Barrier};
@@ -582,6 +584,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(target_family = "wasm", ignore = "spawns threads")]
     fn test_read_write_contention() {
         use std::sync::{Arc, Barrier};
         use std::thread;
@@ -677,6 +680,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(target_family = "wasm", ignore = "spawns threads")]
     fn test_cache_consistency_under_concurrent_access() {
         use std::sync::{Arc, Barrier};
         use std::thread;
@@ -736,6 +740,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(target_family = "wasm", ignore = "spawns threads")]
     fn test_mixed_concurrent_operations() {
         use std::sync::{Arc, Barrier};
         use std::thread;
@@ -818,6 +823,7 @@ mod tests {
 
     // Error handling tests
     #[test]
+    #[cfg_attr(target_family = "wasm", ignore = "spawns threads")]
     fn test_cache_lock_poisoning_recovery() {
         use std::panic;
         use std::sync::{Arc, Mutex};
@@ -1000,6 +1006,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(target_family = "wasm", ignore = "spawns threads")]
     fn test_cache_concurrent_error_scenarios() {
         use std::sync::{Arc, Barrier};
         use std::thread;
@@ -1580,6 +1587,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(target_family = "wasm", ignore = "spawns threads")]
     fn test_crc_params_concurrent_creation() {
         use std::sync::{Arc, Barrier};
         use std::thread;
@@ -1650,6 +1658,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(target_family = "wasm", ignore = "spawns threads")]
     fn test_lock_poisoning_recovery() {
         use std::sync::{Arc, Barrier};
         use std::thread;
@@ -1719,6 +1728,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(target_family = "wasm", ignore = "spawns threads")]
     fn test_cache_behavior_with_thread_local_access() {
         use std::thread;
 

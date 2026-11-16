@@ -1,6 +1,6 @@
 [package]
 name = "crc-turbo"
-version = "1.11.1"
+version = "1.11.2"
 edition = "2021"
 authors = ["Don MacAskill", "NZB Man"]
 # src/combine.rs carries Zlib-licensed code; its notice is in that file.
@@ -83,9 +83,9 @@ spin = { version = "0.10.1", default-features = false, features = [
 
 [dev-dependencies]
 crc = "3.4"
-criterion = "0.7"
 cbindgen = "0.29"
-proptest = "1.9"
+# Without the `fork` and `timeout` features, which no test uses and which do not build for WASI.
+proptest = { version = "1.9", default-features = false, features = ["std", "bit-set"] }
 rand = "0.10"
 regex = "1.12"
 wasm-bindgen-test = "0.3"
@@ -93,6 +93,11 @@ wasm-bindgen-test = "0.3"
 # The guard-page test maps and protects memory directly.
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
+
+# The benchmark harness. Its rayon default does not build for WebAssembly, where the benchmarks are
+# not run.
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+criterion = "0.7"
 
 # lto=true has a big improvement in performance
 [profile.release]
