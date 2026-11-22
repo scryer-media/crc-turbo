@@ -185,7 +185,9 @@ unsafe fn scalar_round(crc: &mut [u32; SCALAR_STREAMS], data: *const u8, klen: u
 /// # Safety
 ///
 /// `buf` must be valid for reads of `len` bytes, and the CPU must have SSE4.2 and PCLMULQDQ.
-#[inline]
+// Out of line: inlined into its entry point, the registers it saves are saved for the short
+// buffers that return before reaching it
+#[inline(never)]
 #[target_feature(enable = "sse4.2,pclmulqdq")]
 pub unsafe fn crc32_iscsi_sse_v4x2s4x4(mut crc0: u32, mut buf: *const u8, mut len: usize) -> u32 {
     // Align to an 8-byte boundary with the CRC32 instruction

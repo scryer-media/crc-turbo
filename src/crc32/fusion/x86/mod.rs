@@ -16,6 +16,7 @@
 mod iscsi;
 
 use iscsi::sse_pclmulqdq::crc32_iscsi_sse_v4x2s4x4;
+use iscsi::sse_pclmulqdq_far::crc32_iscsi_sse_v4s3x3;
 
 #[cfg(target_arch = "x86")]
 use core::arch::x86::*;
@@ -36,6 +37,17 @@ const SMALL_BUFFER_MAX: usize = 256;
 /// The same for the SSE kernel. Its shifts come from a table, so its fixed cost is lower: on a
 /// Xeon 6731E it overtakes the CRC32 instruction alone at 200 bytes.
 const SSE_SMALL_BUFFER_MAX: usize = 199;
+
+/// Buffers longer than this go to the three-stream SSE kernel. The four-stream kernel reads five
+/// places in the buffer at once, and once the buffer no longer fits in the cache that is one more
+/// than the prefetchers keep up with: on a Xeon 6731E, with 4 MiB of L2 cache, it is 3% ahead of
+/// the three-stream kernel at 3 MiB, 2% behind at 4 MiB and 14% behind from 8 MiB up.
+const SSE_FAR_MIN: usize = 3 << 20;
+
+/// Buffers up to this length never reach a kernel: [`crc32_iscsi_small_unaligned`] is called for
+/// them directly, so they pay neither the indirect call nor a kernel's entry. It is the lowest
+/// of the kernels' own limits, so none is kept from a length it would have fused.
+pub(crate) const DIRECT_SMALL_MAX: usize = SSE_SMALL_BUFFER_MAX;
 
 /// The CRC-32/ISCSI fusion kernel a tier runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,6 +109,10 @@ pub(crate) fn iscsi_kernel_fn(kernel: IscsiKernel) -> unsafe fn(u32, &[u8]) -> u
 pub(crate) unsafe fn crc32_iscsi_sse(crc: u32, data: &[u8]) -> u32 {
     if data.len() <= SSE_SMALL_BUFFER_MAX {
         return crc32_iscsi_small_fast(crc, data);
+    }
+
+    if data.len() > SSE_FAR_MIN {
+        return crc32_iscsi_sse_v4s3x3(crc, data.as_ptr(), data.len());
     }
 
     crc32_iscsi_sse_v4x2s4x4(crc, data.as_ptr(), data.len())
@@ -165,7 +181,6 @@ unsafe fn clmul_scalar_sse(a: u32, b: u32) -> __m128i {
 }
 
 // x^n mod P, in log(n) time
-#[cfg(any(target_arch = "x86_64", test))]
 #[target_feature(enable = "sse4.2,pclmulqdq")]
 unsafe fn xnmodp_iscsi_sse(mut n: u64) -> u32 {
     let mut stack = !1u64;
@@ -201,7 +216,6 @@ unsafe fn xnmodp_iscsi_sse(mut n: u64) -> u32 {
 
 // Only the AVX-512 kernels shift a partial CRC after the data; the SSE kernel works its
 // multipliers out ahead of it.
-#[cfg(target_arch = "x86_64")]
 #[inline]
 #[target_feature(enable = "pclmulqdq")]
 unsafe fn crc_shift_iscsi_sse(crc: u32, nbytes: usize) -> __m128i {
@@ -277,6 +291,55 @@ pub unsafe fn crc32_iscsi_small_fast(mut crc: u32, data: &[u8]) -> u32 {
     }
 
     for &byte in suffix {
+        crc = _mm_crc32_u8(crc, byte);
+    }
+
+    crc
+}
+
+/// CRC-32/ISCSI for the shortest buffers: the CRC32 instruction alone, a word at a time from
+/// wherever the buffer starts, then at most one each of four, two and one bytes.
+///
+/// Nothing is aligned first. An unaligned load costs nothing on a CPU with SSE4.2, and aligning
+/// spends a byte-at-a-time loop on each end: on a Xeon 6731E this takes 64 bytes in 18.5 cycles
+/// from any start, where the aligning loop took 22.5 from an aligned start and 44 from an
+/// unaligned one.
+///
+/// # Safety
+///
+/// The CPU must have SSE4.2.
+#[inline]
+#[target_feature(enable = "sse4.2")]
+pub unsafe fn crc32_iscsi_small_unaligned(mut crc: u32, data: &[u8]) -> u32 {
+    let word = |bytes: &[u8]| u64::from_le_bytes(bytes.try_into().unwrap());
+
+    let mut blocks = data.chunks_exact(64);
+    for block in &mut blocks {
+        crc = mm_crc32_u64(crc, word(&block[0..8]));
+        crc = mm_crc32_u64(crc, word(&block[8..16]));
+        crc = mm_crc32_u64(crc, word(&block[16..24]));
+        crc = mm_crc32_u64(crc, word(&block[24..32]));
+        crc = mm_crc32_u64(crc, word(&block[32..40]));
+        crc = mm_crc32_u64(crc, word(&block[40..48]));
+        crc = mm_crc32_u64(crc, word(&block[48..56]));
+        crc = mm_crc32_u64(crc, word(&block[56..64]));
+    }
+
+    let mut words = blocks.remainder().chunks_exact(8);
+    for bytes in &mut words {
+        crc = mm_crc32_u64(crc, word(bytes));
+    }
+
+    let mut tail = words.remainder();
+    if tail.len() >= 4 {
+        crc = _mm_crc32_u32(crc, u32::from_le_bytes(tail[..4].try_into().unwrap()));
+        tail = &tail[4..];
+    }
+    if tail.len() >= 2 {
+        crc = _mm_crc32_u16(crc, u16::from_le_bytes(tail[..2].try_into().unwrap()));
+        tail = &tail[2..];
+    }
+    if let Some(&byte) = tail.first() {
         crc = _mm_crc32_u8(crc, byte);
     }
 
@@ -421,6 +484,90 @@ mod tests {
                         "offset {offset} len {len} state {state:#x}"
                     );
                 }
+            }
+        }
+    }
+
+    /// The short-buffer path against the table-driven software implementation: every length
+    /// through the longest it is given and past it, from every alignment of the start within 16
+    /// bytes, from the init state and a carried state.
+    #[test]
+    fn small_unaligned_matches_software() {
+        use crate::crc32::consts::CRC32_ISCSI;
+
+        if !is_x86_feature_detected!("sse4.2") {
+            eprintln!("skipping small_unaligned_matches_software: no SSE4.2");
+            return;
+        }
+
+        let mut data = vec![0u8; 2 * DIRECT_SMALL_MAX + 80];
+        rng().fill(&mut data[..]);
+
+        let init = CRC32_ISCSI.init_algorithm;
+        let carried = crate::arch::software::update(init, &data[40..47], &CRC32_ISCSI);
+
+        for offset in 0..16 {
+            for len in 0..=2 * DIRECT_SMALL_MAX + 64 {
+                let input = &data[offset..offset + len];
+                for state in [init, carried] {
+                    let expected = crate::arch::software::update(state, input, &CRC32_ISCSI);
+                    let actual = unsafe { crc32_iscsi_small_unaligned(state as u32, input) } as u64;
+
+                    assert_eq!(
+                        actual, expected,
+                        "offset {offset} len {len} state {state:#x}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The three-stream kernel that takes the longest buffers, against the table-driven software
+    /// implementation: every length through its first turns, a megabyte, and through the SSE
+    /// entry point the lengths either side of where it takes over.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn far_kernel_matches_software() {
+        use crate::crc32::consts::CRC32_ISCSI;
+
+        if !(is_x86_feature_detected!("sse4.2") && is_x86_feature_detected!("pclmulqdq")) {
+            eprintln!("skipping far_kernel_matches_software: no SSE4.2 + PCLMULQDQ");
+            return;
+        }
+
+        let mut data = vec![0u8; SSE_FAR_MIN + 96];
+        rng().fill(&mut data[..]);
+
+        let init = CRC32_ISCSI.init_algorithm;
+        let carried = crate::arch::software::update(init, &data[4096..4096 + 7], &CRC32_ISCSI);
+
+        let mut lengths: Vec<usize> = (0..=700).collect();
+        lengths.extend(1_048_575..=1_048_577);
+
+        for offset in [0usize, 1, 3, 7, 8, 9, 15] {
+            for &len in &lengths {
+                let input = &data[offset..offset + len];
+                for state in [init, carried] {
+                    let expected = crate::arch::software::update(state, input, &CRC32_ISCSI);
+                    let actual = unsafe {
+                        crc32_iscsi_sse_v4s3x3(state as u32, input.as_ptr(), input.len())
+                    } as u64;
+
+                    assert_eq!(
+                        actual, expected,
+                        "offset {offset} len {len} state {state:#x}"
+                    );
+                }
+            }
+        }
+
+        for offset in [0usize, 5] {
+            for len in SSE_FAR_MIN - 8..=SSE_FAR_MIN + 72 {
+                let input = &data[offset..offset + len];
+                let expected = crate::arch::software::update(init, input, &CRC32_ISCSI);
+                let actual = run(crc32_iscsi_sse, init as u32, input) as u64;
+
+                assert_eq!(actual, expected, "entry offset {offset} len {len}");
             }
         }
     }

@@ -13,7 +13,9 @@
 /// Modified as necessary for this Rust implementation.
 ///
 /// Uses AVX-512 VPCLMULQDQ instructions
-#[inline]
+// Out of line: inlined into its entry point, the registers it saves are saved for the short
+// buffers that return before reaching it
+#[inline(never)]
 #[target_feature(enable = "avx512vl,vpclmulqdq")]
 pub unsafe fn crc32_iscsi_avx512_vpclmulqdq_v3x2(
     mut crc0: u32,

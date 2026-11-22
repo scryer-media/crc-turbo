@@ -49,6 +49,13 @@ pub(crate) fn crc32_iscsi(state: u32, data: &[u8]) -> Option<u32> {
         }
     }))?;
 
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if data.len() <= x86::DIRECT_SMALL_MAX {
+        // A short buffer is a direct call, ahead of the kernel's pointer.
+        // SAFETY: a kernel is only selected after detecting SSE4.2
+        return Some(unsafe { x86::crc32_iscsi_small_unaligned(state, data) });
+    }
+
     // SAFETY: the kernel was selected for the tier this CPU runs, which has the carry-less
     // multiply it needs, after detecting the CRC32 instructions
     Some(unsafe { kernel(state, data) })

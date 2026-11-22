@@ -13,7 +13,9 @@
 /// Modified as necessary for this Rust implementation.
 ///
 /// Uses AVX-512 instructions
-#[inline]
+// Out of line: inlined into its entry point, the registers it saves are saved for the short
+// buffers that return before reaching it
+#[inline(never)]
 #[target_feature(enable = "avx512vl,pclmulqdq")]
 pub unsafe fn crc32_iscsi_avx512_v4s3x3(mut crc0: u32, mut buf: *const u8, mut len: usize) -> u32 {
     use crate::fusion::x86::*;
