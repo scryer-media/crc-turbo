@@ -310,7 +310,6 @@ own changelog up to the fork point continues below, unchanged.
   | 64 | 24.9 | 18.5 | 1.34x |
   | 128 | 38.0 | 34.0 | 1.12x |
   | 191 | 73.4 | 59.0 | 1.24x |
-  | 256 | 79.8 | 64.3 | 1.24x |
   | 264 | 151.2 | 58.2 | 2.60x |
   | 1024 | 278.8 | 125.0 | 2.23x |
   | 4096 | 602.4 | 342.3 | 1.76x |
@@ -326,11 +325,21 @@ own changelog up to the fork point continues below, unchanged.
   23.0. From 4 MiB to 128 MiB the two releases run the same kernel and
   measured within 1%. CRC-32/ISO-HDLC and CRC-64/NVME, which do not use this
   kernel, measured the same in both releases, and the same held with the
-  tier pinned to `x86_64-sse-pclmulqdq`. No other CPU without AVX-512 was
-  measured: the kernel also serves Zen 3, Alder Lake through Arrow Lake and
-  every x86 CPU with SSE4.2 and PCLMULQDQ but no AVX-512, where the size of
-  the gain is not known. The AVX-512 tiers and aarch64 keep their kernels
-  and still compute their shifts per buffer.
+  tier pinned to `x86_64-sse-pclmulqdq`. Those figures are from a build in
+  which the kernel took over at 200 bytes; it now takes over at 257 (below),
+  and 200 to 256 bytes run the CRC32 instruction loop, as in 1.11.1, which
+  was not timed again on this CPU.
+
+  On an EPYC 7R13 (Zen 3, a c6a.xlarge on EC2, which also selects
+  `x86_64-avx2-vpclmulqdq`), nanoseconds per call, median of nine
+  interleaved rounds, checksums compared first and the test suite run on
+  it: 64 bytes 7.50 to 6.11 (11.96 to 6.11 unaligned), 256 bytes 18.33 to
+  17.50, 257 bytes 37.59 to 24.75, 4 KiB 253 to 196, 1 MiB 1.05x, and the
+  same from 4 MiB up. None of 22 lengths from 1 to 512 bytes, aligned or
+  unaligned, was slower. Alder Lake through Arrow Lake and the other x86
+  CPUs with SSE4.2 and PCLMULQDQ but no AVX-512 were not measured. The
+  AVX-512 tiers and aarch64 keep their kernels and still compute their
+  shifts per buffer.
 - The SSE kernel itself is now the `v4x2s4x4` shape of
   [fast-crc32](https://github.com/corsix/fast-crc32/): two 64-byte vector
   steps beside four CRC32 instruction streams, in place of `v4s3x3`. On the
@@ -339,13 +348,16 @@ own changelog up to the fork point continues below, unchanged.
   ones (keys 16 and 15, 20 and 19, 2 and 1), its halves are sized in
   32-byte units so no more than 31 bytes of a pass fall to the CRC32
   instruction alone, and it takes over from the plain CRC32 instruction
-  loop at 200 bytes, where it was measured to overtake it, rather than 257.
+  loop at 257 bytes, as `v4s3x3` did. On the Xeon 6731E it overtook the
+  loop at 200 bytes, but on the EPYC 7R13 a build that took over there was
+  up to 1.5x slower than 1.11.1 from 200 to 256 bytes (200 bytes 14.72 to
+  22.56 ns).
 - `v4s3x3` stays for buffers over 3 MiB. `v4x2s4x4` reads five places in a
   buffer at once, and on the Xeon 6731E, whose cores share 4 MiB of L2
   cache, it was 2% behind `v4s3x3` at 4 MiB and 12% to 15% behind from
   8 MiB to 128 MiB, whatever the pass size; software prefetch recovered
   part of that and cost the lengths that fit in the cache.
-- CRC-32/ISCSI buffers under 200 bytes no longer align before the CRC32
+- CRC-32/ISCSI buffers up to 256 bytes no longer align before the CRC32
   instruction loop. The loop takes unaligned 8-byte words from the start
   of the buffer and finishes with at most one each of four, two and one
   bytes, where it took up to seven single bytes at each end. On the Xeon
@@ -377,13 +389,20 @@ own changelog up to the fork point continues below, unchanged.
   in a rerun of 15 rounds. From 1 KiB to 1 MiB 1.11.2 was 1.00x to 1.04x.
   From 2 MiB to 64 MiB both CPUs moved by up to 5% either way between runs,
   following which release ran first, and CRC-32/ISO-HDLC and CRC-64/NVME,
-  whose code did not change, moved by as much.
+  whose code did not change, moved by as much. Those runs had the direct
+  call stop at 199 bytes. With it at 256 the 8375C was timed again, and
+  200 to 256 bytes ran 1.16x to 1.27x faster than 1.11.1 (256 bytes 12.79
+  to 10.09 ns, 19.00 to 10.11 unaligned), with no length from 1 to 512
+  bytes slower; the 8124M was not timed again.
 - The fusion kernel is chosen once per process, from the tier and the CRC32
   instructions, and kept as a function pointer; a checksum call loads the
   pointer and calls it. Before, every CRC-32/ISCSI call on x86 and every
   CRC-32/ISCSI and CRC-32/ISO-HDLC call on aarch64 ran feature detection
-  first, up to four atomic loads. aarch64 was checked for correctness
-  only, not timed.
+  first, up to four atomic loads. On a Graviton2 (Neoverse N1, a
+  c6g.xlarge on EC2, `aarch64-neon-pmull`), checksums matched 1.11.1 and the
+  test suite passed; CRC-32/ISCSI and CRC-32/ISO-HDLC were 1.03x to 1.35x
+  faster from 1 to 512 bytes, aligned and unaligned (the closest, 200
+  bytes, 1.00x), and the same from 4 KiB up. Apple CPUs were not timed.
 - These changes come from reports by cemeyer, crc-turbo#3 (dispatch) and
   crc-turbo#4 (the Sierra Forest gap, with the measurements against
   fast-crc32's kernels that showed it).

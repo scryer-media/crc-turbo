@@ -34,9 +34,10 @@ use crate::feature_detection::PerformanceTier;
 #[cfg(target_arch = "x86_64")]
 const SMALL_BUFFER_MAX: usize = 256;
 
-/// The same for the SSE kernel. Its shifts come from a table, so its fixed cost is lower: on a
-/// Xeon 6731E it overtakes the CRC32 instruction alone at 200 bytes.
-const SSE_SMALL_BUFFER_MAX: usize = 199;
+/// The same for the SSE kernel. Its shifts come from a table, so on a Xeon 6731E it overtakes
+/// the CRC32 instruction alone at 200 bytes, but on an EPYC 7R13 (Zen 3) it was up to 1.5x
+/// slower than the loop from 200 to 256 bytes and ahead from 257, so it keeps the same limit.
+const SSE_SMALL_BUFFER_MAX: usize = 256;
 
 /// Buffers longer than this go to the three-stream SSE kernel. The four-stream kernel reads five
 /// places in the buffer at once, and once the buffer no longer fits in the cache that is one more
