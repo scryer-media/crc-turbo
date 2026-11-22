@@ -132,6 +132,21 @@ own changelog up to the fork point continues below, unchanged.
   crc-fast#56, independently and earlier; the feature-detection model here
   (VPCLMULQDQ and AVX2 as separate flags) is taken from it.
 
+- CRC-32/ISCSI on the tiers below AVX-512 takes its shift multipliers from
+  tables built at compile time. crc-fast's fusion kernels work them out for
+  every buffer by repeated squaring (`xnmodp`), which on a Xeon 6731E
+  (Sierra Forest) cost about 90 cycles of a 264-byte checksum's 152 and
+  about 270 of a 4 KiB one's 602. The SSE kernel is also a different shape,
+  `v4x2s4x4` in fast-crc32's naming where crc-fast has `v4s3x3`, with its
+  two halves sized in 32-byte units so that no more than 31 bytes of a
+  pass are left to the CRC32 instruction alone, and it takes over from the
+  plain CRC32 instruction loop at 200 bytes rather than 257. The AVX-512
+  and aarch64 fusion kernels still compute their shifts per buffer.
+- The fusion kernel for CRC-32/ISCSI, and on aarch64 for CRC-32/ISO-HDLC,
+  is chosen once per process and kept as a function pointer. crc-fast, and
+  this crate through 1.11.1, ran feature detection on every checksum call:
+  up to four atomic loads before the first byte.
+
 ### Tier selection
 
 - The `CRC_TURBO_TIER` environment variable (exported as `TIER_ENV`, `std`
@@ -267,6 +282,61 @@ own changelog up to the fork point continues below, unchanged.
   of `A`. `zeros` returns the CRC of that many zero bytes.
 - New `checksum_zeros` and `checksum_zeros_with_params`: the CRC of `len`
   zero bytes in O(log len), without touching memory.
+
+## 1.11.2 - 2026-11-21
+
+- CRC-32/ISCSI is faster on x86 CPUs without AVX-512: the
+  `x86_64-avx2-vpclmulqdq`, `x86_64-sse-pclmulqdq` and `x86-sse-pclmulqdq`
+  tiers. Its fusion kernel shifts five partial CRCs back together at the end
+  of a buffer, and worked out the multipliers for that by repeated squaring
+  on every call. They now come from tables built at compile time (8 KiB for
+  passes up to 32 KiB, and four entries for each doubling beyond that; a
+  longer buffer is taken in a few passes, largest first). Measured on a
+  Xeon 6731E (Sierra Forest, which selects `x86_64-avx2-vpclmulqdq`)
+  against 1.11.1, user-mode cycles per call, median of seven interleaved
+  rounds, checksums compared first:
+
+  | bytes | 1.11.1 | 1.11.2 | |
+  |---:|---:|---:|---:|
+  | 16 | 29.0 | 22.0 | 1.32x |
+  | 64 | 22.4 | 25.0 | 0.90x |
+  | 128 | 37.3 | 37.3 | 1.00x |
+  | 256 | 76.0 | 63.5 | 1.20x |
+  | 264 | 152.1 | 59.5 | 2.55x |
+  | 1024 | 276.1 | 121.4 | 2.28x |
+  | 4096 | 601.8 | 338.0 | 1.78x |
+  | 16384 | 1628 | 1203 | 1.35x |
+  | 65536 | 5375 | 4942 | 1.09x |
+  | 1048576 | 77879 | 75769 | 1.03x |
+
+  That is 6.8 to 12.1 bytes per cycle at 4 KiB and 13.5 to 13.8 at 1 MiB.
+  CRC-32/ISO-HDLC and CRC-64/NVME, which do not use this kernel, measured
+  the same in both releases, and the same held with the tier pinned to
+  `x86_64-sse-pclmulqdq`. No other CPU was measured: the kernel also serves
+  Zen 3, Alder Lake through Arrow Lake and every x86 CPU with SSE4.2 and
+  PCLMULQDQ but no AVX-512, where the size of the gain is not known. The
+  AVX-512 tiers and aarch64 keep their kernels and still compute their
+  shifts per buffer.
+- The SSE kernel itself is now the `v4x2s4x4` shape of
+  [fast-crc32](https://github.com/corsix/fast-crc32/): two 64-byte vector
+  steps beside four CRC32 instruction streams, in place of `v4s3x3`. On the
+  Xeon 6731E the shape alone was worth 3% at 1 MiB and nothing at 4 KiB;
+  the tables above are where the time was. Its fold keys are the generated
+  ones (keys 16 and 15, 20 and 19, 2 and 1), its halves are sized in
+  32-byte units so no more than 31 bytes of a pass fall to the CRC32
+  instruction alone, and it takes over from the plain CRC32 instruction
+  loop at 200 bytes, where it was measured to overtake it, rather than 257.
+- The fusion kernel is chosen once per process, from the tier and the CRC32
+  instructions, and kept as a function pointer; a checksum call loads the
+  pointer and calls it. Before, every CRC-32/ISCSI call on x86 and every
+  CRC-32/ISCSI and CRC-32/ISO-HDLC call on aarch64 ran feature detection
+  first, up to four atomic loads. On the Xeon 6731E an 8-byte CRC-32/ISCSI
+  checksum went from 24.5 to 21.0 cycles and a 32-byte one from 31.0 to
+  24.0; 64 bytes exactly went from 22.4 to 25.0. aarch64 was checked for
+  correctness only, not timed.
+- Both changes come from reports by cemeyer, crc-turbo#3 (dispatch) and
+  crc-turbo#4 (the Sierra Forest gap, with the measurements against
+  fast-crc32's kernels that showed it).
 
 ## 1.11.1 - 2026-11-08
 

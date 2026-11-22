@@ -16,81 +16,120 @@ mod iscsi;
 mod iso_hdlc;
 
 use core::arch::aarch64::*;
-#[cfg(feature = "std")]
-use std::arch::is_aarch64_feature_detected;
+
+use crate::feature_detection::PerformanceTier;
 
 use iscsi::crc_pmull::crc32_iscsi_v12e_v1;
 use iscsi::crc_pmull_sha3::crc32_iscsi_eor3_v9s3x2e_s3;
 use iso_hdlc::crc_pmull::crc32_iso_hdlc_v12e_v1;
 use iso_hdlc::crc_pmull_sha3::crc32_iso_hdlc_eor3_v9s3x2e_s3;
 
-#[inline(always)]
-pub fn crc32_iscsi(crc: u32, data: &[u8]) -> u32 {
-    let data_len = data.len();
+/// Buffers shorter than this run the unrolled CRC32 instruction loop. There's some variance among
+/// different aarch64 CPUs (Apple Silicon, AWS Graviton, etc.), but 127 bytes is the "small"
+/// threshold where this is generally faster.
+const SMALL_BUFFER_END: usize = 128;
 
-    // there's some variance among different aarch64 CPUs (Apple Silicon, AWS Graviton, etc.), but
-    // 127 bytes is the "small" threshold where this is generally faster
-    if data_len < 128 {
-        return unsafe { crc32_iscsi_small_fast(crc, data) };
+/// The fusion kernels a tier runs, for CRC-32/ISCSI and CRC-32/ISO-HDLC alike.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FusionKernel {
+    /// PMULL folds.
+    Pmull,
+    /// PMULL folds with the SHA3 extension's three-way XOR, beside three CRC32 streams.
+    PmullSha3,
+}
+
+/// The fusion kernels for `tier`, or `None` when the CPU has no CRC32 instructions to fuse with.
+///
+/// The CRC32 instructions are an optional extension on ARMv8.0 that no tier implies. Each tier
+/// is held to its own kernels, so a pinned `CRC_TURBO_TIER` covers them: `aarch64-neon-pmull` on
+/// a CPU with SHA3 runs the PMULL kernel, not the EOR3 one.
+pub(crate) fn select_kernel(tier: PerformanceTier, has_crc: bool) -> Option<FusionKernel> {
+    if !has_crc {
+        return None;
     }
 
-    #[cfg(feature = "std")]
-    let has_sha3 = is_aarch64_feature_detected!("sha3");
-    #[cfg(not(feature = "std"))]
-    let has_sha3 = cfg!(target_feature = "sha3");
-
-    if has_sha3 {
-        unsafe { crc32_iscsi_aes_sha3(crc, data, data_len) }
-    } else {
-        unsafe { crc32_iscsi_aes(crc, data, data_len) }
+    match tier {
+        PerformanceTier::AArch64AesSha3 => Some(FusionKernel::PmullSha3),
+        PerformanceTier::AArch64Aes => Some(FusionKernel::Pmull),
+        _ => None,
     }
 }
 
-/// [`crc32_iscsi`] held to the PMULL kernel, for the `aarch64-neon-pmull` tier: a pinned
-/// `CRC_TURBO_TIER` can select it on a CPU with SHA3, and the pin covers these kernels too.
-#[inline(always)]
-pub fn crc32_iscsi_pmull(crc: u32, data: &[u8]) -> u32 {
-    let data_len = data.len();
-
-    if data_len < 128 {
-        return unsafe { crc32_iscsi_small_fast(crc, data) };
-    }
-
-    unsafe { crc32_iscsi_aes(crc, data, data_len) }
-}
-
-#[inline(always)]
-pub fn crc32_iso_hdlc(crc: u32, data: &[u8]) -> u32 {
-    let data_len = data.len();
-
-    // there's some variance among different aarch64 CPUs (Apple Silicon, AWS Graviton, etc.), but
-    // 127 bytes is the "small" threshold where this is generally faster
-    if data_len < 128 {
-        return unsafe { crc32_iso_hdlc_small_fast(crc, data) };
-    }
-
-    #[cfg(feature = "std")]
-    let has_sha3 = is_aarch64_feature_detected!("sha3");
-    #[cfg(not(feature = "std"))]
-    let has_sha3 = cfg!(target_feature = "sha3");
-
-    if has_sha3 {
-        unsafe { crc32_iso_hdlc_aes_sha3(crc, data, data_len) }
-    } else {
-        unsafe { crc32_iso_hdlc_aes(crc, data, data_len) }
+/// The CRC-32/ISCSI function for `kernel`, to be resolved once and then called for every buffer.
+///
+/// It is handed out as it is, `unsafe` and with its target features, rather than behind a safe
+/// wrapper: a wrapper cannot be inlined into, and the extra call it makes costs a short buffer
+/// several cycles. Calling it is sound when `kernel` came from [`select_kernel`] for the tier
+/// the CPU runs.
+pub(crate) fn iscsi_kernel_fn(kernel: FusionKernel) -> unsafe fn(u32, &[u8]) -> u32 {
+    match kernel {
+        FusionKernel::Pmull => crc32_iscsi_pmull,
+        FusionKernel::PmullSha3 => crc32_iscsi_pmull_sha3,
     }
 }
 
-/// [`crc32_iso_hdlc`] held to the PMULL kernel, for the `aarch64-neon-pmull` tier.
-#[inline(always)]
-pub fn crc32_iso_hdlc_pmull(crc: u32, data: &[u8]) -> u32 {
-    let data_len = data.len();
+/// The CRC-32/ISO-HDLC function for `kernel`; see [`iscsi_kernel_fn`].
+pub(crate) fn iso_hdlc_kernel_fn(kernel: FusionKernel) -> unsafe fn(u32, &[u8]) -> u32 {
+    match kernel {
+        FusionKernel::Pmull => crc32_iso_hdlc_pmull,
+        FusionKernel::PmullSha3 => crc32_iso_hdlc_pmull_sha3,
+    }
+}
 
-    if data_len < 128 {
-        return unsafe { crc32_iso_hdlc_small_fast(crc, data) };
+/// CRC-32/ISCSI through the EOR3 kernel, for the `aarch64-neon-pmull-sha3` tier.
+///
+/// # Safety
+///
+/// The CPU must have the CRC32, PMULL and SHA3 extensions.
+#[target_feature(enable = "crc,aes,sha3")]
+pub(crate) unsafe fn crc32_iscsi_pmull_sha3(crc: u32, data: &[u8]) -> u32 {
+    if data.len() < SMALL_BUFFER_END {
+        return crc32_iscsi_small_fast(crc, data);
     }
 
-    unsafe { crc32_iso_hdlc_aes(crc, data, data_len) }
+    crc32_iscsi_aes_sha3(crc, data, data.len())
+}
+
+/// CRC-32/ISCSI through the PMULL kernel, for the `aarch64-neon-pmull` tier.
+///
+/// # Safety
+///
+/// The CPU must have the CRC32 and PMULL extensions.
+#[target_feature(enable = "crc,aes")]
+pub(crate) unsafe fn crc32_iscsi_pmull(crc: u32, data: &[u8]) -> u32 {
+    if data.len() < SMALL_BUFFER_END {
+        return crc32_iscsi_small_fast(crc, data);
+    }
+
+    crc32_iscsi_aes(crc, data, data.len())
+}
+
+/// CRC-32/ISO-HDLC through the EOR3 kernel, for the `aarch64-neon-pmull-sha3` tier.
+///
+/// # Safety
+///
+/// The CPU must have the CRC32, PMULL and SHA3 extensions.
+#[target_feature(enable = "crc,aes,sha3")]
+pub(crate) unsafe fn crc32_iso_hdlc_pmull_sha3(crc: u32, data: &[u8]) -> u32 {
+    if data.len() < SMALL_BUFFER_END {
+        return crc32_iso_hdlc_small_fast(crc, data);
+    }
+
+    crc32_iso_hdlc_aes_sha3(crc, data, data.len())
+}
+
+/// CRC-32/ISO-HDLC through the PMULL kernel, for the `aarch64-neon-pmull` tier.
+///
+/// # Safety
+///
+/// The CPU must have the CRC32 and PMULL extensions.
+#[target_feature(enable = "crc,aes")]
+pub(crate) unsafe fn crc32_iso_hdlc_pmull(crc: u32, data: &[u8]) -> u32 {
+    if data.len() < SMALL_BUFFER_END {
+        return crc32_iso_hdlc_small_fast(crc, data);
+    }
+
+    crc32_iso_hdlc_aes(crc, data, data.len())
 }
 
 #[inline]
@@ -257,6 +296,49 @@ mod tests {
 
     const RUST_CRC32_ISCSI: Crc<u32, Table<16>> = Crc::<u32, Table<16>>::new(&crc::CRC_32_ISCSI);
 
+    /// The kernels of the widest tier this CPU has, as dispatch would resolve them.
+    fn widest_kernel() -> FusionKernel {
+        let tier = if std::arch::is_aarch64_feature_detected!("sha3") {
+            PerformanceTier::AArch64AesSha3
+        } else {
+            PerformanceTier::AArch64Aes
+        };
+
+        select_kernel(tier, true).unwrap()
+    }
+
+    /// Calls a kernel the test has already checked this CPU can run.
+    fn run(kernel: unsafe fn(u32, &[u8]) -> u32, crc: u32, data: &[u8]) -> u32 {
+        // SAFETY: every caller picks the kernel from the features it detected
+        unsafe { kernel(crc, data) }
+    }
+
+    fn crc32_iscsi(crc: u32, data: &[u8]) -> u32 {
+        run(iscsi_kernel_fn(widest_kernel()), crc, data)
+    }
+
+    fn crc32_iso_hdlc(crc: u32, data: &[u8]) -> u32 {
+        run(iso_hdlc_kernel_fn(widest_kernel()), crc, data)
+    }
+
+    /// Every tier resolves to its own kernels, and none of them without the CRC32 instructions.
+    #[test]
+    fn each_tier_selects_its_own_kernel() {
+        let tiers = [
+            (
+                PerformanceTier::AArch64AesSha3,
+                Some(FusionKernel::PmullSha3),
+            ),
+            (PerformanceTier::AArch64Aes, Some(FusionKernel::Pmull)),
+            (PerformanceTier::SoftwareTable, None),
+        ];
+
+        for (tier, kernel) in tiers {
+            assert_eq!(select_kernel(tier, true), kernel, "{tier:?}");
+            assert_eq!(select_kernel(tier, false), None, "{tier:?} without CRC32");
+        }
+    }
+
     /// The PMULL kernels the `aarch64-neon-pmull` tier is held to agree with the reference at
     /// every length through the small path, across the fold boundary and at a megabyte, from
     /// aligned and unaligned starts; on an SHA3 part dispatch would never reach them.
@@ -268,12 +350,12 @@ mod tests {
             for offset in [0, 3] {
                 let slice = &data[offset..offset + len];
                 assert_eq!(
-                    crc32_iscsi_pmull(0xffffffff, slice) ^ 0xffffffff,
+                    run(iscsi_kernel_fn(FusionKernel::Pmull), 0xffffffff, slice) ^ 0xffffffff,
                     RUST_CRC32_ISCSI.checksum(slice),
                     "iscsi len {len} offset {offset}"
                 );
                 assert_eq!(
-                    crc32_iso_hdlc_pmull(0xffffffff, slice) ^ 0xffffffff,
+                    run(iso_hdlc_kernel_fn(FusionKernel::Pmull), 0xffffffff, slice) ^ 0xffffffff,
                     RUST_CRC32_ISO_HDLC.checksum(slice),
                     "iso-hdlc len {len} offset {offset}"
                 );

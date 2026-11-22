@@ -1460,58 +1460,14 @@ fn get_calculator_params(algorithm: CrcAlgorithm) -> (CalculatorFn, CrcParams) {
 /// fusion techniques to accelerate the calculation beyond what SIMD can do alone.
 #[inline(always)]
 fn crc32_iscsi_calculator(state: u64, data: &[u8], _params: &CrcParams) -> u64 {
-    #[cfg(all(target_arch = "aarch64", feature = "std"))]
-    {
-        use crate::feature_detection::PerformanceTier;
-
-        // The pinned tier holds the fusion kernel too: `aarch64-neon-pmull` on a CPU with SHA3
-        // runs the PMULL kernel, not the EOR3 one.
-        // The fusion kernels also use the CRC32 instructions, an optional extension on ARMv8.0
-        // that the tier does not imply.
-        let arch_ops = get_arch_ops();
-        if std::arch::is_aarch64_feature_detected!("crc") {
-            match arch_ops.get_tier() {
-                PerformanceTier::AArch64AesSha3 => {
-                    return fusion::crc32_iscsi(state as u32, data) as u64;
-                }
-                PerformanceTier::AArch64Aes => {
-                    return fusion::crc32_iscsi_pmull(state as u32, data) as u64;
-                }
-                _ => {}
-            }
-        }
-    }
-
-    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "std"))]
-    {
-        use crate::feature_detection::PerformanceTier;
-
-        // The fusion path requires pclmulqdq (every tier here has it) and sse4.2 (for the CRC32
-        // instructions). The VPCLMULQDQ tier lets the kernel pick its widest form; the tiers
-        // below it, which a pinned `CRC_TURBO_TIER` can select on a wider part, hold the kernel
-        // to their own width.
-        let arch_ops = get_arch_ops();
-        match arch_ops.get_tier() {
-            PerformanceTier::X86_64Avx512Vpclmulqdq => {
-                if is_x86_feature_detected!("sse4.2") {
-                    return fusion::crc32_iscsi(state as u32, data) as u64;
-                }
-            }
-            #[cfg(target_arch = "x86_64")]
-            PerformanceTier::X86_64Avx512Pclmulqdq => {
-                if is_x86_feature_detected!("sse4.2") {
-                    return fusion::crc32_iscsi_avx512_pclmulqdq(state as u32, data) as u64;
-                }
-            }
-            PerformanceTier::X86_64Avx2Vpclmulqdq
-            | PerformanceTier::X86_64SsePclmulqdq
-            | PerformanceTier::X86SsePclmulqdq => {
-                if is_x86_feature_detected!("sse4.2") {
-                    return fusion::crc32_iscsi_sse(state as u32, data) as u64;
-                }
-            }
-            _ => {}
-        }
+    // The kernel was chosen once, from the tier and the CPU's CRC32 instructions; a pinned
+    // `CRC_TURBO_TIER` holds it to that tier's width.
+    #[cfg(all(
+        any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "x86"),
+        feature = "std"
+    ))]
+    if let Some(crc) = fusion::crc32_iscsi(state as u32, data) {
+        return crc as u64;
     }
 
     Calculator::calculate(state, data, _params)
@@ -1526,23 +1482,8 @@ fn crc32_iscsi_calculator(state: u64, data: &[u8], _params: &CrcParams) -> u64 {
 #[inline(always)]
 fn crc32_iso_hdlc_calculator(state: u64, data: &[u8], _params: &CrcParams) -> u64 {
     #[cfg(all(target_arch = "aarch64", feature = "std"))]
-    {
-        use crate::feature_detection::{get_arch_ops, PerformanceTier};
-        let arch_ops = get_arch_ops();
-
-        // The fusion kernels also use the CRC32 instructions, an optional extension on ARMv8.0
-        // that the tier does not imply.
-        if std::arch::is_aarch64_feature_detected!("crc") {
-            match arch_ops.get_tier() {
-                PerformanceTier::AArch64AesSha3 => {
-                    return fusion::crc32_iso_hdlc(state as u32, data) as u64;
-                }
-                PerformanceTier::AArch64Aes => {
-                    return fusion::crc32_iso_hdlc_pmull(state as u32, data) as u64;
-                }
-                _ => {}
-            }
-        }
+    if let Some(crc) = fusion::crc32_iso_hdlc(state as u32, data) {
+        return crc as u64;
     }
 
     Calculator::calculate(state, data, _params)

@@ -48,3 +48,6 @@ author.
 ## This fork
 
 - NZB Man (maintainer)
+- **cemeyer**: the reports that CRC-32/ISCSI ran feature detection on every
+  call (crc-turbo#3) and that its SSE kernel fell well short of
+  fast-crc32's on Sierra Forest, with the measurements (crc-turbo#4).
