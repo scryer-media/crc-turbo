@@ -326,11 +326,11 @@ own changelog up to the fork point continues below, unchanged.
   23.0. From 4 MiB to 128 MiB the two releases run the same kernel and
   measured within 1%. CRC-32/ISO-HDLC and CRC-64/NVME, which do not use this
   kernel, measured the same in both releases, and the same held with the
-  tier pinned to `x86_64-sse-pclmulqdq`. No other CPU was measured: the
-  kernel also serves Zen 3, Alder Lake through Arrow Lake and every x86 CPU
-  with SSE4.2 and PCLMULQDQ but no AVX-512, where the size of the gain is not
-  known. The AVX-512 tiers and aarch64 keep their kernels and still compute
-  their shifts per buffer.
+  tier pinned to `x86_64-sse-pclmulqdq`. No other CPU without AVX-512 was
+  measured: the kernel also serves Zen 3, Alder Lake through Arrow Lake and
+  every x86 CPU with SSE4.2 and PCLMULQDQ but no AVX-512, where the size of
+  the gain is not known. The AVX-512 tiers and aarch64 keep their kernels
+  and still compute their shifts per buffer.
 - The SSE kernel itself is now the `v4x2s4x4` shape of
   [fast-crc32](https://github.com/corsix/fast-crc32/): two 64-byte vector
   steps beside four CRC32 instruction streams, in place of `v4s3x3`. On the
@@ -354,7 +354,30 @@ own changelog up to the fork point continues below, unchanged.
   These buffers are a direct call ahead of the kernel's function pointer,
   on every x86 tier with the CRC32 instructions, and the kernels are kept
   out of line so that a short buffer does not pay for the registers a
-  kernel saves. The AVX-512 tiers were not timed.
+  kernel saves. That changes the AVX-512 tiers too, for buffers up to 256
+  bytes, so they were timed on EC2 against 1.11.1: a c6i.xlarge (Xeon
+  Platinum 8375C, Ice Lake, `x86_64-avx512-vpclmulqdq`) and a c5.xlarge
+  (Xeon Platinum 8124M, Skylake-SP, `x86_64-avx512-pclmulqdq`), nanoseconds
+  per call, median of nine interleaved rounds, checksums compared first
+  (lengths 0 to 300 and larger, aligned and unaligned, on each tier pinned
+  down to software), and the full test suite run on both:
+
+  | bytes | 8375C 1.11.1 | 8375C 1.11.2 | 8124M 1.11.1 | 8124M 1.11.2 |
+  |---:|---:|---:|---:|---:|
+  | 8 | 7.45 | 5.44 | 9.43 | 8.14 |
+  | 64 | 6.86 | 5.43 | 8.97 | 8.09 |
+  | 64, unaligned | 14.33 | 5.43 | 15.14 | 8.09 |
+  | 199 | 12.58 | 8.85 | 18.44 | 12.31 |
+  | 256 | 12.76 | 11.20 | 19.27 | 17.84 |
+  | 257 | 13.41 | 12.43 | 44.94 | 41.30 |
+  | 4096 | 95.19 | 94.67 | 160.54 | 155.82 |
+
+  Of the 36 lengths from 1 to 512 bytes, aligned and unaligned, none was
+  slower on either CPU; 512 bytes on the 8375C read 0.97x once and 1.00x
+  in a rerun of 15 rounds. From 1 KiB to 1 MiB 1.11.2 was 1.00x to 1.04x.
+  From 2 MiB to 64 MiB both CPUs moved by up to 5% either way between runs,
+  following which release ran first, and CRC-32/ISO-HDLC and CRC-64/NVME,
+  whose code did not change, moved by as much.
 - The fusion kernel is chosen once per process, from the tier and the CRC32
   instructions, and kept as a function pointer; a checksum call loads the
   pointer and calls it. Before, every CRC-32/ISCSI call on x86 and every
