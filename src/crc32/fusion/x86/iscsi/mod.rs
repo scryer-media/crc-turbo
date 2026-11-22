@@ -8,3 +8,4 @@
 pub(crate) mod avx512_pclmulqdq;
 pub(crate) mod avx512_vpclmulqdq;
 pub(crate) mod sse_pclmulqdq;
+pub(crate) mod sse_pclmulqdq_far;

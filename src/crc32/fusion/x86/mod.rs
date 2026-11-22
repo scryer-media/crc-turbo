@@ -15,7 +15,8 @@
 
 mod iscsi;
 
-use iscsi::sse_pclmulqdq::crc32_iscsi_sse_v4s3x3;
+use iscsi::sse_pclmulqdq::crc32_iscsi_sse_v4x2s4x4;
+use iscsi::sse_pclmulqdq_far::crc32_iscsi_sse_v4s3x3;
 
 #[cfg(target_arch = "x86")]
 use core::arch::x86::*;
@@ -26,81 +27,125 @@ use iscsi::avx512_pclmulqdq::crc32_iscsi_avx512_v4s3x3;
 #[cfg(target_arch = "x86_64")]
 use iscsi::avx512_vpclmulqdq::crc32_iscsi_avx512_vpclmulqdq_v3x2;
 
-/// CRC32 iSCSI calculation using the highest available instruction set (post-AVX-512 support)
-///
-/// This function is called by the wrapper layer after feature detection has been performed.
-/// The wrapper layer ensures that only the appropriate implementation is called based on
-/// cached feature detection results, removing runtime checks from the hot path.
-#[inline(always)]
-pub fn crc32_iscsi(crc: u32, data: &[u8]) -> u32 {
-    let data_len = data.len();
+use crate::feature_detection::PerformanceTier;
 
-    // SSE4.2 is required for native CRC32 instructions used in small buffer path
-    if data_len <= 256 && is_x86_feature_detected!("sse4.2") {
-        unsafe {
-            return crc32_iscsi_small_fast(crc, data);
-        }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        // AVX512 + VPCLMULQDQ
-
-        if is_x86_feature_detected!("avx512vl") && is_x86_feature_detected!("vpclmulqdq") {
-            unsafe {
-                return crc32_iscsi_avx512_vpclmulqdq_v3x2(crc, data.as_ptr(), data_len);
-            }
-        }
-
-        // AVX512
-        if is_x86_feature_detected!("avx512vl") {
-            unsafe {
-                return crc32_iscsi_avx512_v4s3x3(crc, data.as_ptr(), data_len);
-            }
-        }
-    }
-
-    // Fallback to SSE implementation
-    unsafe { crc32_iscsi_sse_v4s3x3(crc, data.as_ptr(), data_len) }
-}
-
-/// [`crc32_iscsi`] held to the SSE kernel, for the tiers below AVX-512: a pinned `CRC_TURBO_TIER`
-/// can select those on an AVX-512 part, and the pin covers these kernels too.
-#[inline(always)]
-pub fn crc32_iscsi_sse(crc: u32, data: &[u8]) -> u32 {
-    let data_len = data.len();
-
-    // SSE4.2 is required for native CRC32 instructions used in small buffer path
-    if data_len <= 256 && is_x86_feature_detected!("sse4.2") {
-        unsafe {
-            return crc32_iscsi_small_fast(crc, data);
-        }
-    }
-
-    unsafe { crc32_iscsi_sse_v4s3x3(crc, data.as_ptr(), data_len) }
-}
-
-/// [`crc32_iscsi`] held to the AVX-512 PCLMULQDQ kernel, for the `x86_64-avx512-pclmulqdq` tier
-/// pinned on a part that also has VPCLMULQDQ. Without AVX-512 it is the SSE kernel.
+/// Buffers up to this length run the unrolled CRC32 instruction loop: below it a fusion kernel's
+/// fixed cost (aligning, and shifting the partial CRCs back together) is more than it saves.
 #[cfg(target_arch = "x86_64")]
-#[inline(always)]
-pub fn crc32_iscsi_avx512_pclmulqdq(crc: u32, data: &[u8]) -> u32 {
-    let data_len = data.len();
+const SMALL_BUFFER_MAX: usize = 256;
 
-    // SSE4.2 is required for native CRC32 instructions used in small buffer path
-    if data_len <= 256 && is_x86_feature_detected!("sse4.2") {
-        unsafe {
-            return crc32_iscsi_small_fast(crc, data);
-        }
+/// The same for the SSE kernel. Its shifts come from a table, so its fixed cost is lower: on a
+/// Xeon 6731E it overtakes the CRC32 instruction alone at 200 bytes.
+const SSE_SMALL_BUFFER_MAX: usize = 199;
+
+/// Buffers longer than this go to the three-stream SSE kernel. The four-stream kernel reads five
+/// places in the buffer at once, and once the buffer no longer fits in the cache that is one more
+/// than the prefetchers keep up with: on a Xeon 6731E, with 4 MiB of L2 cache, it is 3% ahead of
+/// the three-stream kernel at 3 MiB, 2% behind at 4 MiB and 14% behind from 8 MiB up.
+const SSE_FAR_MIN: usize = 3 << 20;
+
+/// Buffers up to this length never reach a kernel: [`crc32_iscsi_small_unaligned`] is called for
+/// them directly, so they pay neither the indirect call nor a kernel's entry. It is the lowest
+/// of the kernels' own limits, so none is kept from a length it would have fused.
+pub(crate) const DIRECT_SMALL_MAX: usize = SSE_SMALL_BUFFER_MAX;
+
+/// The CRC-32/ISCSI fusion kernel a tier runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IscsiKernel {
+    /// 128-bit PCLMULQDQ folds beside four CRC32 instruction streams.
+    Sse,
+    /// 128-bit PCLMULQDQ folds with AVX-512VL ternary logic beside three CRC32 streams.
+    #[cfg(target_arch = "x86_64")]
+    Avx512Pclmulqdq,
+    /// 512-bit VPCLMULQDQ folds.
+    #[cfg(target_arch = "x86_64")]
+    Avx512Vpclmulqdq,
+}
+
+/// The fusion kernel for `tier`, or `None` when the tier has no CRC32 instructions to fuse with.
+///
+/// Every x86 tier above the software one has PCLMULQDQ; `has_sse42` adds the CRC32 instructions,
+/// which no tier implies. Each tier is held to its own width, so a pinned `CRC_TURBO_TIER` covers
+/// the fusion kernels too.
+pub(crate) fn select_iscsi_kernel(tier: PerformanceTier, has_sse42: bool) -> Option<IscsiKernel> {
+    if !has_sse42 {
+        return None;
     }
 
-    if is_x86_feature_detected!("avx512vl") {
-        unsafe {
-            return crc32_iscsi_avx512_v4s3x3(crc, data.as_ptr(), data_len);
-        }
+    match tier {
+        #[cfg(target_arch = "x86_64")]
+        PerformanceTier::X86_64Avx512Vpclmulqdq => Some(IscsiKernel::Avx512Vpclmulqdq),
+        #[cfg(target_arch = "x86_64")]
+        PerformanceTier::X86_64Avx512Pclmulqdq => Some(IscsiKernel::Avx512Pclmulqdq),
+        PerformanceTier::X86_64Avx2Vpclmulqdq
+        | PerformanceTier::X86_64SsePclmulqdq
+        | PerformanceTier::X86SsePclmulqdq => Some(IscsiKernel::Sse),
+        _ => None,
+    }
+}
+
+/// The function for `kernel`, to be resolved once and then called for every buffer.
+///
+/// It is handed out as it is, `unsafe` and with its target features, rather than behind a safe
+/// wrapper: a wrapper cannot be inlined into, and the extra call it makes costs a short buffer
+/// several cycles. Calling it is sound when `kernel` came from [`select_iscsi_kernel`] for the
+/// tier the CPU runs.
+pub(crate) fn iscsi_kernel_fn(kernel: IscsiKernel) -> unsafe fn(u32, &[u8]) -> u32 {
+    match kernel {
+        IscsiKernel::Sse => crc32_iscsi_sse,
+        #[cfg(target_arch = "x86_64")]
+        IscsiKernel::Avx512Pclmulqdq => crc32_iscsi_avx512_pclmulqdq,
+        #[cfg(target_arch = "x86_64")]
+        IscsiKernel::Avx512Vpclmulqdq => crc32_iscsi_avx512_vpclmulqdq,
+    }
+}
+
+/// CRC-32/ISCSI through the SSE kernel, for the tiers below AVX-512.
+///
+/// # Safety
+///
+/// The CPU must have SSE4.2 and PCLMULQDQ.
+#[target_feature(enable = "sse4.2,pclmulqdq")]
+pub(crate) unsafe fn crc32_iscsi_sse(crc: u32, data: &[u8]) -> u32 {
+    if data.len() <= SSE_SMALL_BUFFER_MAX {
+        return crc32_iscsi_small_fast(crc, data);
     }
 
-    unsafe { crc32_iscsi_sse_v4s3x3(crc, data.as_ptr(), data_len) }
+    if data.len() > SSE_FAR_MIN {
+        return crc32_iscsi_sse_v4s3x3(crc, data.as_ptr(), data.len());
+    }
+
+    crc32_iscsi_sse_v4x2s4x4(crc, data.as_ptr(), data.len())
+}
+
+/// CRC-32/ISCSI through the AVX-512 PCLMULQDQ kernel, for the `x86_64-avx512-pclmulqdq` tier.
+///
+/// # Safety
+///
+/// The CPU must have AVX512VL and PCLMULQDQ.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512vl,pclmulqdq")]
+pub(crate) unsafe fn crc32_iscsi_avx512_pclmulqdq(crc: u32, data: &[u8]) -> u32 {
+    if data.len() <= SMALL_BUFFER_MAX {
+        return crc32_iscsi_small_fast(crc, data);
+    }
+
+    crc32_iscsi_avx512_v4s3x3(crc, data.as_ptr(), data.len())
+}
+
+/// CRC-32/ISCSI through the AVX-512 VPCLMULQDQ kernel, for the `x86_64-avx512-vpclmulqdq` tier.
+///
+/// # Safety
+///
+/// The CPU must have AVX512VL and VPCLMULQDQ.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512vl,vpclmulqdq")]
+pub(crate) unsafe fn crc32_iscsi_avx512_vpclmulqdq(crc: u32, data: &[u8]) -> u32 {
+    if data.len() <= SMALL_BUFFER_MAX {
+        return crc32_iscsi_small_fast(crc, data);
+    }
+
+    crc32_iscsi_avx512_vpclmulqdq_v3x2(crc, data.as_ptr(), data.len())
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -169,6 +214,8 @@ unsafe fn xnmodp_iscsi_sse(mut n: u64) -> u32 {
     acc
 }
 
+// Only the AVX-512 kernels shift a partial CRC after the data; the SSE kernel works its
+// multipliers out ahead of it.
 #[inline]
 #[target_feature(enable = "pclmulqdq")]
 unsafe fn crc_shift_iscsi_sse(crc: u32, nbytes: usize) -> __m128i {
@@ -250,6 +297,55 @@ pub unsafe fn crc32_iscsi_small_fast(mut crc: u32, data: &[u8]) -> u32 {
     crc
 }
 
+/// CRC-32/ISCSI for the shortest buffers: the CRC32 instruction alone, a word at a time from
+/// wherever the buffer starts, then at most one each of four, two and one bytes.
+///
+/// Nothing is aligned first. An unaligned load costs nothing on a CPU with SSE4.2, and aligning
+/// spends a byte-at-a-time loop on each end: on a Xeon 6731E this takes 64 bytes in 18.5 cycles
+/// from any start, where the aligning loop took 22.5 from an aligned start and 44 from an
+/// unaligned one.
+///
+/// # Safety
+///
+/// The CPU must have SSE4.2.
+#[inline]
+#[target_feature(enable = "sse4.2")]
+pub unsafe fn crc32_iscsi_small_unaligned(mut crc: u32, data: &[u8]) -> u32 {
+    let word = |bytes: &[u8]| u64::from_le_bytes(bytes.try_into().unwrap());
+
+    let mut blocks = data.chunks_exact(64);
+    for block in &mut blocks {
+        crc = mm_crc32_u64(crc, word(&block[0..8]));
+        crc = mm_crc32_u64(crc, word(&block[8..16]));
+        crc = mm_crc32_u64(crc, word(&block[16..24]));
+        crc = mm_crc32_u64(crc, word(&block[24..32]));
+        crc = mm_crc32_u64(crc, word(&block[32..40]));
+        crc = mm_crc32_u64(crc, word(&block[40..48]));
+        crc = mm_crc32_u64(crc, word(&block[48..56]));
+        crc = mm_crc32_u64(crc, word(&block[56..64]));
+    }
+
+    let mut words = blocks.remainder().chunks_exact(8);
+    for bytes in &mut words {
+        crc = mm_crc32_u64(crc, word(bytes));
+    }
+
+    let mut tail = words.remainder();
+    if tail.len() >= 4 {
+        crc = _mm_crc32_u32(crc, u32::from_le_bytes(tail[..4].try_into().unwrap()));
+        tail = &tail[4..];
+    }
+    if tail.len() >= 2 {
+        crc = _mm_crc32_u16(crc, u16::from_le_bytes(tail[..2].try_into().unwrap()));
+        tail = &tail[2..];
+    }
+    if let Some(&byte) = tail.first() {
+        crc = _mm_crc32_u8(crc, byte);
+    }
+
+    crc
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,6 +354,223 @@ mod tests {
     use rand::{rng, RngExt};
 
     const RUST_CRC32_ISCSI: Crc<u32, Table<16>> = Crc::<u32, Table<16>>::new(&crc::CRC_32_ISCSI);
+
+    /// Calls a kernel the test has already checked this CPU can run.
+    fn run(kernel: unsafe fn(u32, &[u8]) -> u32, crc: u32, data: &[u8]) -> u32 {
+        // SAFETY: every caller picks the kernel from the features it detected
+        unsafe { kernel(crc, data) }
+    }
+
+    /// CRC-32/ISCSI through the widest kernel this CPU has, as dispatch would resolve it.
+    fn crc32_iscsi(crc: u32, data: &[u8]) -> u32 {
+        let has_avx512 =
+            is_x86_feature_detected!("avx512vl") && is_x86_feature_detected!("avx512bw");
+        let tier = if cfg!(target_arch = "x86") {
+            PerformanceTier::X86SsePclmulqdq
+        } else if has_avx512 && is_x86_feature_detected!("vpclmulqdq") {
+            PerformanceTier::X86_64Avx512Vpclmulqdq
+        } else if has_avx512 {
+            PerformanceTier::X86_64Avx512Pclmulqdq
+        } else {
+            PerformanceTier::X86_64SsePclmulqdq
+        };
+
+        run(
+            iscsi_kernel_fn(select_iscsi_kernel(tier, true).unwrap()),
+            crc,
+            data,
+        )
+    }
+
+    /// Every tier resolves to its own kernel, and none of them without the CRC32 instructions.
+    #[test]
+    fn each_tier_selects_its_own_kernel() {
+        let tiers = [
+            (PerformanceTier::X86SsePclmulqdq, Some(IscsiKernel::Sse)),
+            (PerformanceTier::X86_64SsePclmulqdq, Some(IscsiKernel::Sse)),
+            // Zen 3, Alder Lake and Sierra Forest: 256-bit VPCLMULQDQ, and the SSE kernel
+            (
+                PerformanceTier::X86_64Avx2Vpclmulqdq,
+                Some(IscsiKernel::Sse),
+            ),
+            #[cfg(target_arch = "x86_64")]
+            (
+                PerformanceTier::X86_64Avx512Pclmulqdq,
+                Some(IscsiKernel::Avx512Pclmulqdq),
+            ),
+            #[cfg(target_arch = "x86_64")]
+            (
+                PerformanceTier::X86_64Avx512Vpclmulqdq,
+                Some(IscsiKernel::Avx512Vpclmulqdq),
+            ),
+            (PerformanceTier::SoftwareTable, None),
+        ];
+
+        for (tier, kernel) in tiers {
+            assert_eq!(select_iscsi_kernel(tier, true), kernel, "{tier:?}");
+            assert_eq!(
+                select_iscsi_kernel(tier, false),
+                None,
+                "{tier:?} without SSE4.2"
+            );
+        }
+    }
+
+    /// The compile-time shift tables against the run-time routine they replace.
+    #[test]
+    fn shift_table_matches_xnmodp() {
+        if !is_x86_feature_detected!("sse4.2") || !is_x86_feature_detected!("pclmulqdq") {
+            return;
+        }
+
+        for (m, &shift) in iscsi::sse_pclmulqdq::SHIFTS.iter().enumerate() {
+            let expected = unsafe { xnmodp_iscsi_sse(64 * m as u64 + 31) };
+            assert_eq!(shift, expected, "m {m}");
+        }
+
+        for (e, shifts) in iscsi::sse_pclmulqdq::LONG_SHIFTS.iter().enumerate() {
+            for (j, &shift) in shifts.iter().enumerate() {
+                let words = (iscsi::sse_pclmulqdq::MAX_SCALAR_ROUNDS as u64) << e;
+                let expected = unsafe { xnmodp_iscsi_sse(64 * words * (j as u64 + 1) + 31) };
+                assert_eq!(shift, expected, "e {e} j {j}");
+            }
+        }
+    }
+
+    /// The SSE kernel against the table-driven software implementation: every length through
+    /// the first four turns of its main loop, the lengths around later turns, around the pass
+    /// boundaries and at a megabyte, from every alignment of the start within 16 bytes, from the
+    /// init state and a carried state.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn sse_kernel_matches_software() {
+        use crate::crc32::consts::CRC32_ISCSI;
+
+        if !(is_x86_feature_detected!("sse4.2") && is_x86_feature_detected!("pclmulqdq")) {
+            eprintln!("skipping sse_kernel_matches_software: no SSE4.2 + PCLMULQDQ");
+            return;
+        }
+
+        let mut data = vec![0u8; 1_048_577 + 16];
+        rng().fill(&mut data[..]);
+
+        // The parts are sized in 32-byte units after 8 for the last word, and the main loop
+        // takes eight units at a time
+        let mut lengths: Vec<usize> = (0..=1100).collect();
+        for blocks in [5usize, 8, 15, 16, 17, 63, 64, 255, 256] {
+            lengths.extend(blocks * 256 - 40..=blocks * 256 + 48);
+        }
+        // The largest pass the exact shift table sizes is 32 KiB and the word after it; longer
+        // buffers take that doubled, then what is left
+        for passes in [1usize, 2, 3, 4, 7, 8] {
+            lengths.extend(passes * 32_768 - 24..=passes * 32_768 + 56);
+        }
+        lengths.extend(1_048_575..=1_048_577);
+
+        let init = CRC32_ISCSI.init_algorithm;
+        let carried = crate::arch::software::update(init, &data[4096..4096 + 7], &CRC32_ISCSI);
+
+        for offset in 0..16 {
+            for &len in &lengths {
+                let input = &data[offset..offset + len];
+                for state in [init, carried] {
+                    let expected = crate::arch::software::update(state, input, &CRC32_ISCSI);
+                    let actual = unsafe {
+                        crc32_iscsi_sse_v4x2s4x4(state as u32, input.as_ptr(), input.len())
+                    } as u64;
+
+                    assert_eq!(
+                        actual, expected,
+                        "offset {offset} len {len} state {state:#x}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The short-buffer path against the table-driven software implementation: every length
+    /// through the longest it is given and past it, from every alignment of the start within 16
+    /// bytes, from the init state and a carried state.
+    #[test]
+    fn small_unaligned_matches_software() {
+        use crate::crc32::consts::CRC32_ISCSI;
+
+        if !is_x86_feature_detected!("sse4.2") {
+            eprintln!("skipping small_unaligned_matches_software: no SSE4.2");
+            return;
+        }
+
+        let mut data = vec![0u8; 2 * DIRECT_SMALL_MAX + 80];
+        rng().fill(&mut data[..]);
+
+        let init = CRC32_ISCSI.init_algorithm;
+        let carried = crate::arch::software::update(init, &data[40..47], &CRC32_ISCSI);
+
+        for offset in 0..16 {
+            for len in 0..=2 * DIRECT_SMALL_MAX + 64 {
+                let input = &data[offset..offset + len];
+                for state in [init, carried] {
+                    let expected = crate::arch::software::update(state, input, &CRC32_ISCSI);
+                    let actual = unsafe { crc32_iscsi_small_unaligned(state as u32, input) } as u64;
+
+                    assert_eq!(
+                        actual, expected,
+                        "offset {offset} len {len} state {state:#x}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The three-stream kernel that takes the longest buffers, against the table-driven software
+    /// implementation: every length through its first turns, a megabyte, and through the SSE
+    /// entry point the lengths either side of where it takes over.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn far_kernel_matches_software() {
+        use crate::crc32::consts::CRC32_ISCSI;
+
+        if !(is_x86_feature_detected!("sse4.2") && is_x86_feature_detected!("pclmulqdq")) {
+            eprintln!("skipping far_kernel_matches_software: no SSE4.2 + PCLMULQDQ");
+            return;
+        }
+
+        let mut data = vec![0u8; SSE_FAR_MIN + 96];
+        rng().fill(&mut data[..]);
+
+        let init = CRC32_ISCSI.init_algorithm;
+        let carried = crate::arch::software::update(init, &data[4096..4096 + 7], &CRC32_ISCSI);
+
+        let mut lengths: Vec<usize> = (0..=700).collect();
+        lengths.extend(1_048_575..=1_048_577);
+
+        for offset in [0usize, 1, 3, 7, 8, 9, 15] {
+            for &len in &lengths {
+                let input = &data[offset..offset + len];
+                for state in [init, carried] {
+                    let expected = crate::arch::software::update(state, input, &CRC32_ISCSI);
+                    let actual = unsafe {
+                        crc32_iscsi_sse_v4s3x3(state as u32, input.as_ptr(), input.len())
+                    } as u64;
+
+                    assert_eq!(
+                        actual, expected,
+                        "offset {offset} len {len} state {state:#x}"
+                    );
+                }
+            }
+        }
+
+        for offset in [0usize, 5] {
+            for len in SSE_FAR_MIN - 8..=SSE_FAR_MIN + 72 {
+                let input = &data[offset..offset + len];
+                let expected = crate::arch::software::update(init, input, &CRC32_ISCSI);
+                let actual = run(crc32_iscsi_sse, init as u32, input) as u64;
+
+                assert_eq!(actual, expected, "entry offset {offset} len {len}");
+            }
+        }
+    }
 
     /// The kernels a pinned tier is held to agree with the reference at every length through
     /// the small path, across the fold boundary and at a megabyte, from aligned and unaligned
@@ -274,7 +587,7 @@ mod tests {
                 let slice = &data[offset..offset + len];
                 let expected = RUST_CRC32_ISCSI.checksum(slice);
                 assert_eq!(
-                    crc32_iscsi_sse(0xffffffff, slice) ^ 0xffffffff,
+                    run(iscsi_kernel_fn(IscsiKernel::Sse), 0xffffffff, slice) ^ 0xffffffff,
                     expected,
                     "sse len {len} offset {offset}"
                 );
@@ -282,7 +595,11 @@ mod tests {
                 {
                     if is_x86_feature_detected!("avx512vl") {
                         assert_eq!(
-                            crc32_iscsi_avx512_pclmulqdq(0xffffffff, slice) ^ 0xffffffff,
+                            run(
+                                iscsi_kernel_fn(IscsiKernel::Avx512Pclmulqdq),
+                                0xffffffff,
+                                slice
+                            ) ^ 0xffffffff,
                             expected,
                             "avx512-pclmulqdq len {len} offset {offset}"
                         );
@@ -405,7 +722,7 @@ mod tests {
             }
 
             assert_eq!(
-                crc32_iscsi_sse_v4s3x3(0xffffffff, data.as_ptr(), data.len()) ^ 0xffffffff,
+                crc32_iscsi_sse_v4x2s4x4(0xffffffff, data.as_ptr(), data.len()) ^ 0xffffffff,
                 checksum
             );
         }
