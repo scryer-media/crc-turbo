@@ -61,7 +61,26 @@ pub(crate) fn short_block(data: &[u8], offset: usize) -> [u8; CRC_CHUNK_SIZE] {
 
 /// Main entry point that works for both CRC-32 and CRC-64
 #[inline(always)]
+#[cfg(target_arch = "aarch64")]
 pub unsafe fn update<T: ArchOps, W: EnhancedCrcWidth>(
+    state: W::Value,
+    bytes: &[u8],
+    params: &CrcParams,
+    ops: &T,
+) -> W::Value
+where
+    T::Vector: Copy,
+{
+    update_with::<T, W, false>(state, bytes, params, ops)
+}
+
+/// [`update`], on x86 with `ALIGN_HEAD` choosing whether a buffer of `X86_ALIGN_MIN` bytes or
+/// more is first taken to a 64-byte boundary. Only a tier whose fold loads 64 bytes at a time
+/// asks for it: on the tiers with 16- and 32-byte loads it measured no faster at 64 KiB and
+/// 1 MiB from an unaligned start on a Xeon E5-2666 v3, an EPYC 7R32, an EPYC 7R13 and a Xeon
+/// 8275CL, and it made those tiers' folds larger.
+#[inline(always)]
+pub(crate) unsafe fn update_with<T: ArchOps, W: EnhancedCrcWidth, const ALIGN_HEAD: bool>(
     state: W::Value,
     bytes: &[u8],
     params: &CrcParams,
@@ -113,7 +132,7 @@ where
 
     // On x86 a long buffer is taken from a 64-byte boundary, see `X86_ALIGN_MIN`.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    if len >= X86_ALIGN_MIN {
+    if ALIGN_HEAD && len >= X86_ALIGN_MIN {
         let head = bytes.as_ptr().align_offset(64);
         if head != 0 {
             let (left, rest) = bytes.split_at(head);
@@ -187,12 +206,15 @@ where
 /// with nothing else in the function: a tier keeps it apart from its entry, whose short arms
 /// then stay in line, and from the fold for long buffers, whose set-up it does not pay.
 ///
+/// With `OPAQUE_KEYS`, constant parameters' keys are loaded rather than built in general
+/// registers, see [`crate::arch::x86::opaque_keys`].
+///
 /// # Safety
 ///
 /// `bytes` must be at least 128 bytes long.
 #[inline(always)]
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-pub(crate) unsafe fn update_mid<T: ArchOps, W: EnhancedCrcWidth>(
+pub(crate) unsafe fn update_mid<T: ArchOps, W: EnhancedCrcWidth, const OPAQUE_KEYS: bool>(
     state: W::Value,
     bytes: &[u8],
     params: &CrcParams,
@@ -209,7 +231,11 @@ where
         Reflector::ForwardReflector { smask }
     };
     let crc_state = W::create_state(state, params.refin, ops);
-    let keys = extract_keys_array(params);
+    let keys = if OPAQUE_KEYS {
+        crate::arch::x86::opaque_keys(extract_keys_array(params))
+    } else {
+        extract_keys_array(params)
+    };
 
     process_unaligned::<T, W>(bytes, &crc_state, &reflector, keys, ops)
 }
@@ -856,6 +882,7 @@ where
 ///
 /// `data` must be readable for `blocks * 16` bytes, and `blocks` at least 2.
 #[inline(always)]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 unsafe fn fold_blocks_onto_last<T: ArchOps, W: EnhancedCrcWidth>(
     blocks: usize,
     data: *const u8,
@@ -917,17 +944,61 @@ unsafe fn process_32_to_255<T: ArchOps, W: EnhancedCrcWidth>(
 where
     T::Vector: Copy,
 {
+    // The last seven whole blocks but the last are each folded straight onto the last, across
+    // the distance between them, rather than each into the next: the products are independent,
+    // so the chain is one carry-less multiply and the XORs, where folding block by block was one
+    // multiply per block, the multiply's latency each time. The Linux kernel's x86 CRC template
+    // breaks the chain the same way for short buffers, by folding several vectors and halving
+    // them. The keys are the generated ones the 128-byte fold collapses its lanes with, which
+    // reach 112 bytes; blocks before those seven, from the remainders of longer buffers on x86,
+    // are folded one by one into the first of them.
+    const DISTANCE_KEYS: [(usize, usize); 6] =
+        [(2, 1), (20, 19), (18, 17), (16, 15), (14, 13), (12, 11)];
+
     let len = data.len();
     debug_assert!((32..256).contains(&len));
     let blocks = len / CRC_CHUNK_SIZE;
-    // The fold for a given block count, instantiated below for each count a buffer under 128
-    // bytes has: with the count a constant, the loops unroll and each block's keys are at a
-    // fixed index, where a run-time count looked both indices up in `DISTANCE_KEYS` and then
-    // loaded the keys through them, block by block.
-    macro_rules! fold_blocks {
-        ($blocks:expr) => {
-            fold_blocks_onto_last::<T, W>($blocks, data.as_ptr(), state, reflector, keys, ops)
+    // Macros rather than closures: a closure is a function of its own, which LLVM may leave out
+    // of line, where the tier's target features do not reach.
+    macro_rules! load {
+        ($i:expr) => {
+            reflect_bytes(
+                reflector,
+                ops.load_bytes(data.as_ptr().add($i * CRC_CHUNK_SIZE)),
+                ops,
+            )
         };
+    }
+
+    // The fold for a given block count, written once and instantiated below for each count a
+    // buffer under 128 bytes has: with the count a constant, the loops unroll and each block's
+    // keys are at a fixed index, where a run-time count looked both indices up in
+    // `DISTANCE_KEYS` and then loaded the keys through them, block by block.
+    macro_rules! fold_blocks {
+        ($blocks:expr) => {{
+            let blocks: usize = $blocks;
+            let first = blocks.saturating_sub(DISTANCE_KEYS.len() + 1);
+            let mut head = ops.xor_vectors(load!(0), state.value);
+            if first > 0 {
+                let rk01rk02 = W::create_coefficient(keys[2], keys[1], state.reflected, ops);
+                for i in 1..=first {
+                    head = fold_and_xor::<T, W>(head, rk01rk02, load!(i), state.reflected, ops);
+                }
+            }
+
+            macro_rules! fold_onto_last {
+                ($block:expr, $i:expr, $acc:expr) => {{
+                    let (hi, lo) = DISTANCE_KEYS[blocks - 2 - $i];
+                    let coeff = W::create_coefficient(keys[hi], keys[lo], state.reflected, ops);
+                    fold_and_xor::<T, W>($block, coeff, $acc, state.reflected, ops)
+                }};
+            }
+            let mut acc = fold_onto_last!(head, first, load!(blocks - 1));
+            for i in first + 1..blocks - 1 {
+                acc = fold_onto_last!(load!(i), i, acc);
+            }
+            acc
+        }};
     }
     // From four blocks, two to a multiply where the tier has the registers; below that the
     // 128-bit fold takes no more multiplies and a shorter chain.

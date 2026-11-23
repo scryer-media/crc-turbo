@@ -189,10 +189,16 @@ own changelog up to the fork point continues below, unchanged.
   loads before the first byte.
 
 - AVX-512 tiers: the two 512-bit registers a fold ends with are reduced to
-  128 bits in one step with per-lane generated keys; buffers of 128 bytes to
-  4 KiB have an entry of their own; folds from 64 KiB start at a 64-byte
-  boundary; and CRC-32/ISCSI has a kernel of four 512-bit folding streams
-  beside five CRC32-instruction streams, selected by CPU model and length.
+  128 bits in one step with per-lane generated keys; on the
+  `x86_64-avx512-vpclmulqdq` tier 192 to 255 bytes fold their first 64
+  bytes 128 bytes on before that step, and folds from 64 KiB start at a
+  64-byte boundary; and CRC-32/ISCSI has a kernel of four 512-bit folding
+  streams beside five CRC32-instruction streams, selected by CPU model and
+  length.
+- x86: CRC-32/ISO-HDLC from 128 bytes to 4 KiB has an entry of its own on
+  every tier; on the `x86-sse-pclmulqdq`, `x86_64-sse-pclmulqdq` and
+  `x86_64-avx512-pclmulqdq` tiers it loads its fold keys rather than
+  building them in general registers.
 
 - Every architecture: 32 to 255 bytes, the generic fold no longer runs its
   16-byte blocks as one chain of dependent multiplies. Each of the last
@@ -636,6 +642,49 @@ own changelog up to the fork point continues below, unchanged.
   server part (Xeon 8375C) measured the changes up to the stream kernel's
   thresholds; the last revision of the 128-byte entry and the 64-byte
   alignment were not measured there.
+- x86, after the change above, against it, measured on the same seven EC2
+  `.large` CPUs (Xeon E5-2666 v3, EPYC 7R32, EPYC 7R13, Xeon 8275CL, Xeon
+  8375C, Xeon 8488C, EPYC 9R14):
+  - The generic fold's 32 to 255 bytes (`process_32_to_255`) are back in
+    the form they had before the fold was refactored through a shared
+    helper, which had changed the code every tier inlines for those
+    lengths; on aarch64 the entries and folds compile to the same
+    instructions as before it. The entries for buffers under 128 bytes and the folds of the
+    `x86-sse-pclmulqdq`, `x86_64-avx2-vpclmulqdq` and
+    `x86_64-avx512-pclmulqdq` tiers compile to the same instructions as
+    before it again.
+  - The `x86_64-avx512-pclmulqdq` tier no longer enables AVX512BW in its
+    code (detection still requires it, as above): with it the compiler
+    replaced byte blends with mask-register sequences. The
+    `x86_64-avx512-vpclmulqdq` tier enables it in its folds only.
+  - Only the `x86_64-avx512-vpclmulqdq` tier, whose fold loads 64 bytes at
+    a time, takes a buffer from 64 KiB to a 64-byte boundary first; on the
+    other tiers it was no faster from an unaligned start at 64 KiB and
+    1 MiB and made their folds larger.
+  - On the `x86_64-avx512-vpclmulqdq` tier, 192 to 255 bytes fold their
+    first 64 bytes 128 bytes on, onto the third 64, before the one-step
+    reduction, rather than folding the four blocks after the eighth in
+    256-bit registers: CRC-32/ISO-HDLC at 192 bytes 1.40x faster on the
+    8375C, 1.26x on the 9R14 and 1.06x on the 8488C, the other algorithms
+    1.12x to 1.29x (one link layout).
+  - CRC-32/ISO-HDLC from 128 bytes to 4 KiB loads its fold keys on the
+    `x86-sse-pclmulqdq`, `x86_64-sse-pclmulqdq` and
+    `x86_64-avx512-pclmulqdq` tiers. With the parameters a constant, the
+    compiler built each 64-bit key in a general register and moved it into
+    the vector unit, on the port the carry-less multiplies use. Loaded:
+    1.14x to 1.15x at 128 and 192 bytes and 1.08x at 256 on the E5-2666 v3,
+    1.05x to 1.12x from 128 to 256 bytes on the 8275CL; on the 7R32 0.96x
+    to 1.04x. On the other two tiers it was 0.93x to 1.03x, so they keep the
+    built keys, as do buffers under 128 bytes, where the 7R32, the 7R13,
+    the 8375C and the 8488C lost up to 10%.
+  - Timing below 512 bytes depends on where the linker places the code as
+    much as on the code. Rebuilt with the same source and only the link
+    order shuffled (lld `--shuffle-sections`), the same cell moved by a
+    median 3% to 12% per CPU and up to 2.7x; 60% to 87% of the cells up to
+    512 bytes differed by more than 1% between two pairs of such builds.
+    A single build's comparison against another therefore repeats its
+    layout's bias from run to run. The figures above are geometric means
+    over four link layouts per build.
 
 - WebAssembly is faster for 43 of the 50 built-in algorithms. Every table
   load there is bounds-checked, so for a long input the software path now
