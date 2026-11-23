@@ -119,7 +119,7 @@ pub(crate) unsafe fn crc32_iscsi_with(kernel: FusionKernel, crc: u32, data: &[u8
         // The shortest buffers take the loop before the kernel is looked at, so every tier
         // runs the same code for them.
         if len < SMALL_BUFFER_END {
-            crc32_iscsi_small_fast(crc, data)
+            crc32_iscsi_short(crc, data)
         } else if kernel == FusionKernel::PmullSha3 {
             if len < SHA3_SMALL_END {
                 crc32_iscsi_small_fast(crc, data)
@@ -155,7 +155,7 @@ pub(crate) unsafe fn crc32_iso_hdlc_with(kernel: FusionKernel, crc: u32, data: &
         // The shortest buffers take the loop before the kernel is looked at, so every tier
         // runs the same code for them.
         if len < SMALL_BUFFER_END {
-            crc32_iso_hdlc_small_fast(crc, data)
+            crc32_iso_hdlc_short(crc, data)
         } else if kernel == FusionKernel::PmullSha3 {
             if len < SHA3_SMALL_END {
                 crc32_iso_hdlc_small_fast(crc, data)
@@ -282,96 +282,87 @@ unsafe fn fold_eor3(x: uint64x2_t, k: uint64x2_t, d: uint64x2_t) -> uint64x2_t {
     clmul_hi_and_xor(x, k, clmul_lo_and_xor(x, k, d))
 }
 
+/// The CRC32 instruction loop's body: unaligned words from the first byte, as an aarch64 load
+/// costs the same either way. On an Apple M5 Max, aligning first a byte at a time made a buffer
+/// three bytes off alignment 2.2x slower at 32 bytes and 1.4x at 112, and an aligned one no
+/// faster. `$blocks` adds the loop over 64-byte blocks, which the short entry points leave out.
+macro_rules! crc_loop {
+    ($crc:ident, $data:ident, $d:ident, $w:ident, $h:ident, $b:ident, $blocks:expr) => {{
+        let word = |bytes: &[u8; 8]| u64::from_le_bytes(*bytes);
+        let mut rest = $data;
+        if $blocks {
+            while let Some((block, tail)) = rest.split_first_chunk::<64>() {
+                for chunk in block.as_chunks::<8>().0 {
+                    $crc = $d($crc, word(chunk));
+                }
+                rest = tail;
+            }
+        }
+        if let Some((quad, tail)) = rest.split_first_chunk::<32>() {
+            for chunk in quad.as_chunks::<8>().0 {
+                $crc = $d($crc, word(chunk));
+            }
+            rest = tail;
+        }
+        if let Some((pair, tail)) = rest.split_first_chunk::<16>() {
+            let (first, second) = pair.split_at(8);
+            $crc = $d($crc, word(first.try_into().unwrap()));
+            $crc = $d($crc, word(second.try_into().unwrap()));
+            rest = tail;
+        }
+        if let Some((chunk, tail)) = rest.split_first_chunk::<8>() {
+            $crc = $d($crc, word(chunk));
+            rest = tail;
+        }
+        if let Some((word, tail)) = rest.split_first_chunk::<4>() {
+            $crc = $w($crc, u32::from_le_bytes(*word));
+            rest = tail;
+        }
+        if let Some((half, tail)) = rest.split_first_chunk::<2>() {
+            $crc = $h($crc, u16::from_le_bytes(*half));
+            rest = tail;
+        }
+        if let Some(&byte) = rest.first() {
+            $crc = $b($crc, byte);
+        }
+        $crc
+    }};
+}
+
 /// CRC-32/ISCSI by the CRC32 instruction alone, one chain of 64-bit steps. Dispatch sends it
-/// short buffers, and on the PMULL tier off Apple everything below 1 KiB.
+/// the SHA3 tier's buffers below [`SHA3_SMALL_END`], and on the PMULL tier off Apple everything
+/// below 1 KiB.
 #[inline]
 #[target_feature(enable = "crc")]
 pub unsafe fn crc32_iscsi_small_fast(mut crc: u32, data: &[u8]) -> u32 {
-    // Unaligned words from the first byte: an aarch64 load costs the same either way. On an
-    // Apple M5 Max, aligning first a byte at a time made a buffer three bytes off alignment
-    // 2.2x slower at 32 bytes and 1.4x at 112, and an aligned one no faster.
-    let word = |bytes: &[u8; 8]| u64::from_le_bytes(*bytes);
-    let mut rest = data;
-    while let Some((block, tail)) = rest.split_first_chunk::<64>() {
-        for chunk in block.as_chunks::<8>().0 {
-            crc = __crc32cd(crc, word(chunk));
-        }
-        rest = tail;
-    }
-    if let Some((quad, tail)) = rest.split_first_chunk::<32>() {
-        for chunk in quad.as_chunks::<8>().0 {
-            crc = __crc32cd(crc, word(chunk));
-        }
-        rest = tail;
-    }
-    if let Some((pair, tail)) = rest.split_first_chunk::<16>() {
-        let (first, second) = pair.split_at(8);
-        crc = __crc32cd(crc, word(first.try_into().unwrap()));
-        crc = __crc32cd(crc, word(second.try_into().unwrap()));
-        rest = tail;
-    }
-    if let Some((chunk, tail)) = rest.split_first_chunk::<8>() {
-        crc = __crc32cd(crc, word(chunk));
-        rest = tail;
-    }
-    if let Some((word, tail)) = rest.split_first_chunk::<4>() {
-        crc = __crc32cw(crc, u32::from_le_bytes(*word));
-        rest = tail;
-    }
-    if let Some((half, tail)) = rest.split_first_chunk::<2>() {
-        crc = __crc32ch(crc, u16::from_le_bytes(*half));
-        rest = tail;
-    }
-    if let Some(&byte) = rest.first() {
-        crc = __crc32cb(crc, byte);
-    }
-    crc
+    crc_loop!(crc, data, __crc32cd, __crc32cw, __crc32ch, __crc32cb, true)
 }
 
-/// CRC-32/ISO-HDLC by the CRC32 instruction alone, one chain of 64-bit steps. Dispatch sends it
-/// short buffers, and on the PMULL tier off Apple everything below 1 KiB.
+/// [`crc32_iscsi_small_fast`] for a buffer shorter than [`SMALL_BUFFER_END`], without the
+/// 64-byte loop. A separate function, as one call site for each length range leaves the
+/// compiler free to fit each to its range: called for the short buffers and the longer ones
+/// alike, CRC-32/ISCSI and CRC-32/ISO-HDLC from 16 to 48 bytes ran at 0.78x to 0.92x of
+/// 2ee9ff1's speed on Graviton 2, 3 and 4.
+#[inline]
+#[target_feature(enable = "crc")]
+unsafe fn crc32_iscsi_short(mut crc: u32, data: &[u8]) -> u32 {
+    debug_assert!(data.len() < SMALL_BUFFER_END);
+    crc_loop!(crc, data, __crc32cd, __crc32cw, __crc32ch, __crc32cb, false)
+}
+
+/// CRC-32/ISO-HDLC by the CRC32 instruction alone; see [`crc32_iscsi_small_fast`].
 #[inline]
 #[target_feature(enable = "crc")]
 pub unsafe fn crc32_iso_hdlc_small_fast(mut crc: u32, data: &[u8]) -> u32 {
-    // Unaligned words from the first byte: an aarch64 load costs the same either way. On an
-    // Apple M5 Max, aligning first a byte at a time made a buffer three bytes off alignment
-    // 2.2x slower at 32 bytes and 1.4x at 112, and an aligned one no faster.
-    let word = |bytes: &[u8; 8]| u64::from_le_bytes(*bytes);
-    let mut rest = data;
-    while let Some((block, tail)) = rest.split_first_chunk::<64>() {
-        for chunk in block.as_chunks::<8>().0 {
-            crc = __crc32d(crc, word(chunk));
-        }
-        rest = tail;
-    }
-    if let Some((quad, tail)) = rest.split_first_chunk::<32>() {
-        for chunk in quad.as_chunks::<8>().0 {
-            crc = __crc32d(crc, word(chunk));
-        }
-        rest = tail;
-    }
-    if let Some((pair, tail)) = rest.split_first_chunk::<16>() {
-        let (first, second) = pair.split_at(8);
-        crc = __crc32d(crc, word(first.try_into().unwrap()));
-        crc = __crc32d(crc, word(second.try_into().unwrap()));
-        rest = tail;
-    }
-    if let Some((chunk, tail)) = rest.split_first_chunk::<8>() {
-        crc = __crc32d(crc, word(chunk));
-        rest = tail;
-    }
-    if let Some((word, tail)) = rest.split_first_chunk::<4>() {
-        crc = __crc32w(crc, u32::from_le_bytes(*word));
-        rest = tail;
-    }
-    if let Some((half, tail)) = rest.split_first_chunk::<2>() {
-        crc = __crc32h(crc, u16::from_le_bytes(*half));
-        rest = tail;
-    }
-    if let Some(&byte) = rest.first() {
-        crc = __crc32b(crc, byte);
-    }
-    crc
+    crc_loop!(crc, data, __crc32d, __crc32w, __crc32h, __crc32b, true)
+}
+
+/// [`crc32_iscsi_short`] for CRC-32/ISO-HDLC.
+#[inline]
+#[target_feature(enable = "crc")]
+unsafe fn crc32_iso_hdlc_short(mut crc: u32, data: &[u8]) -> u32 {
+    debug_assert!(data.len() < SMALL_BUFFER_END);
+    crc_loop!(crc, data, __crc32d, __crc32w, __crc32h, __crc32b, false)
 }
 
 #[cfg(test)]
@@ -504,6 +495,29 @@ mod tests {
                 core::slice::from_raw_parts(buf, len),
             )
         }
+    }
+
+    unsafe fn short_iscsi(crc: u32, buf: *const u8, len: usize) -> u32 {
+        // SAFETY: the caller holds `len` bytes at `buf`, fewer than `SMALL_BUFFER_END`, and
+        // checked for CRC32
+        unsafe { crc32_iscsi_short(crc, core::slice::from_raw_parts(buf, len)) }
+    }
+
+    unsafe fn short_iso_hdlc(crc: u32, buf: *const u8, len: usize) -> u32 {
+        // SAFETY: as for `short_iscsi`
+        unsafe { crc32_iso_hdlc_short(crc, core::slice::from_raw_parts(buf, len)) }
+    }
+
+    /// The short entry points, called directly, agree with the reference at every length they
+    /// are given, from every start offset within 16 bytes, carrying a prefix's state.
+    #[test]
+    fn short_entry_points_agree_with_the_reference() {
+        assert!(std::arch::is_aarch64_feature_detected!("crc"));
+        let kernels: [(&str, Kernel, bool); 2] = [
+            ("short iscsi", short_iscsi, true),
+            ("short iso-hdlc", short_iso_hdlc, false),
+        ];
+        kernels_agree(&kernels, &(0..SMALL_BUFFER_END).collect::<Vec<_>>());
     }
 
     /// Dispatch agrees with the reference on either side of every length it switches kernels

@@ -211,6 +211,13 @@ own changelog up to the fork point continues below, unchanged.
   Apple's cores each multiply and the XOR that takes its result are written
   as a pair the core fuses, the SHA3 kernel's main loop included, where the
   three-way XOR crc-fast uses there keeps the core from fusing either.
+- Off Apple, CRC-32/ISCSI and CRC-32/ISO-HDLC run the CRC32 instruction
+  loop below 80 bytes on the SHA3 tier, and below 1 KiB on the PMULL tier,
+  which then runs `v3s4x2e_v2` from 1 KiB rather than 2 KiB; the stream
+  kernels finish their remainder with the same loop, and `v9s3x2e_s3`
+  issues every multiply before its three-way XORs, as crc-fast does.
+  Below 64 bytes every tier calls a copy of the loop without its 64-byte
+  block step, so that the compiler fits each copy to its length range.
 - `checksum` naming CRC-32/ISCSI or CRC-32/ISO-HDLC is that algorithm's
   entry point inlined, not a match over every algorithm.
 - The other algorithms fold a buffer from 128 bytes to 256 KiB from
@@ -714,6 +721,23 @@ own changelog up to the fork point continues below, unchanged.
 
   Up to 1 KiB the kernel takes no shift. The PMULL tier without SHA3 and
   the other algorithms do not use this kernel.
+- aarch64 off Apple, CRC-32/ISCSI and CRC-32/ISO-HDLC: the SHA3 tier runs
+  the CRC32 instruction loop below 80 bytes, where the four-lane fold was
+  slower at 64 bytes on Graviton 3 (9.2 to 10.4 GB/s against 12.8) and
+  Graviton 4 (13.8 to 14.9 against 17.2 to 17.5). The PMULL tier, which
+  Graviton 2 takes, runs the loop below 1 KiB and the four-stream kernel
+  from 1 KiB, where the loop alone outran both lane folds at every length
+  from 64 bytes and the stream kernel won from 1 KiB. The stream kernels
+  finish their remainder with the loop. The SHA3 kernel's main loop issues
+  all its multiplies before the three-way XORs again: XOR after each pair
+  ran 0.94x to 0.96x of 1.11.0 on Graviton 3 at 1 MiB, this order 0.99x to
+  1.02x. Below 64 bytes every tier calls a copy of the loop without its
+  64-byte block step: with one copy called from three length ranges the
+  compiler no longer specialised it, and from 16 to 48 bytes both
+  algorithms ran 0.78x to 0.92x of the previous commit on Graviton 2, 3
+  and 4. A test calls the short copies directly at every length below 64
+  bytes from 16 start offsets with a carried state, and the dispatch test
+  covers each new threshold on either side. Apple's paths are unchanged.
 - With that kernel, the direct call above and this release's aarch64 short paths,
   CRC-32/ISCSI and CRC-32/ISO-HDLC against 1.11.0 on Graviton, median of
   seven interleaved rounds, checksums compared first and the test suite
@@ -733,14 +757,23 @@ own changelog up to the fork point continues below, unchanged.
   | 1048576 | 1.64x | 0.95x to 0.98x | 1.00x to 1.02x |
 
   On the Apple M5 Max the final source was 1.15x to 3.47x at every length
-  from 16 bytes to 1 MiB, aligned and unaligned. Graviton3 at 1 MiB is the
-  one shortfall: 40.1 to 42.5 GB/s against 1.11.0's 41.3 to 43.7 in every
-  round, with the SHA3 kernel's loop unchanged; it is not explained. The
-  other algorithms' fold was 0.94x to 8.9x on Graviton; below 0.99x were
-  CRC-32/BZIP2 and CRC-64/ECMA-182 from 64 KiB to 1 MiB on Graviton2
-  (0.97x), 16 KiB on Graviton4 from an aligned start (0.94x to 0.95x), and
-  on the M5 Max 4 KiB, 8 KiB and 128 KiB (0.94x to 0.96x), in both bit
-  orders; those are not explained either.
+  from 16 bytes to 1 MiB, aligned and unaligned. Graviton3 at 1 MiB,
+  0.95x to 0.98x in that table, ran 0.98x to 1.04x of 1.11.0 once the SHA3
+  kernel issued its multiplies before its three-way XORs again (above),
+  and Graviton4 0.99x to 1.01x; the table is from before that change. The
+  other algorithms' fold, in two batches of seven interleaved rounds, ran
+  0.97x to 3.5x of 1.11.0 on Graviton2, 0.87x to 9.1x on Graviton3 and
+  0.80x to 9.4x on Graviton4. Below 0.99x were the forward (not reflected)
+  algorithms from 8 KiB to 1 MiB on Graviton2 (0.97x to 0.98x), where the
+  fold's loop has 1.11.0's instructions in another order; on Graviton3
+  2 KiB to 64 KiB and on Graviton4 8 KiB to 1 MiB, cells that differ by
+  algorithm though every algorithm of a bit order runs the same fold, and
+  that move by as much against 2ee9ff1, whose fold for these lengths is
+  the same code. Taking an aligned buffer from 2 KiB through 1.11.0's
+  aligned fold moved as many of those cells down as up, and aligning the
+  loops did not close them; they are not explained. On the M5 Max 4 KiB,
+  8 KiB and 128 KiB ran 0.94x to 0.96x in both bit orders, also not
+  explained.
 
 - A `no_std` build for x86_64 chose the AVX-512 tiers from its compile-time
   target features on AVX512VL alone. Those kernels also use AVX512BW, so a
