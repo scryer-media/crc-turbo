@@ -24,7 +24,8 @@ pub(crate) fn is_intel_ecore() -> bool {
 }
 
 /// The aarch64 fusion kernel's choice, kept in one byte and read with a relaxed load: 0 before
-/// it is made, then 1 for none, 2 for the PMULL kernel and 3 for the EOR3 one. The byte carries
+/// it is made, then 1 for none, 2 for the PMULL kernel, 3 for the EOR3 one and 4 for the EOR3
+/// one with Neoverse V2's plan ([`aarch64::Core`]). The byte carries
 /// the choice itself and publishes nothing else, and every thread that makes it makes the same
 /// one.
 #[cfg(all(feature = "std", target_arch = "aarch64"))]
@@ -37,13 +38,37 @@ fn choose_aarch64_kernel() {
     use aarch64::FusionKernel;
 
     let tier = crate::feature_detection::get_arch_ops().get_tier();
-    let kernel = aarch64::select_kernel(tier, std::arch::is_aarch64_feature_detected!("crc"));
+    let kernel = aarch64::select_kernel(
+        tier,
+        std::arch::is_aarch64_feature_detected!("crc"),
+        aarch64::Core::from_midr(read_midr()),
+    );
     let byte = match kernel {
         None => 1,
         Some(FusionKernel::Pmull) => 2,
         Some(FusionKernel::PmullSha3) => 3,
+        Some(FusionKernel::PmullSha3NeoverseV2) => 4,
     };
     AARCH64_KERNEL.store(byte, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// The first CPU's `MIDR_EL1`, as Linux publishes it in sysfs, or 0 where it cannot be read:
+/// another OS, or a kernel or sandbox without the file. Read once, when the kernel is chosen.
+/// The file rather than `mrs`, which traps unless the kernel emulates it (`HWCAP_CPUID`).
+#[cold]
+#[cfg(all(feature = "std", target_arch = "aarch64"))]
+fn read_midr() -> u64 {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        std::fs::read_to_string("/sys/devices/system/cpu/cpu0/regs/identification/midr_el1")
+            .ok()
+            .and_then(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        0
+    }
 }
 
 /// The aarch64 entry for one CRC-32, with `XOROUT` applied: the kernel the CPU's choice names,
@@ -66,6 +91,9 @@ macro_rules! aarch64_entry {
             Some(match AARCH64_KERNEL.load(Ordering::Relaxed) {
                 3 => unsafe { aarch64::$with(FusionKernel::PmullSha3, state, data, XOROUT) },
                 2 => unsafe { aarch64::$with(FusionKernel::Pmull, state, data, XOROUT) },
+                4 => unsafe {
+                    aarch64::$with(FusionKernel::PmullSha3NeoverseV2, state, data, XOROUT)
+                },
                 _ => $slow::<XOROUT>(state, data),
             })
         }

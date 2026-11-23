@@ -39,7 +39,8 @@ macro_rules! entry_points {
     (
         $module:ident, short: $short:path, small: $small:path, eor3_v4: $eor3_v4:path,
         eor3_v8: $eor3_v8:ident, eor3_large: $eor3_large:ident, v4: $v4:ident, v8: $v8:ident,
-        streams: $streams:ident, eor3_v4_compiled: $eor3_v4_compiled:path
+        streams: $streams:ident, eor3_v4_compiled: $eor3_v4_compiled:path,
+        v2_v4: $v2_v4:path, v2_v8: $v2_v8:path
     ) => {
         /// The kernels as the dispatch calls them; see [`entry_points`].
         mod $module {
@@ -107,6 +108,30 @@ macro_rules! entry_points {
                     // SAFETY: as for the assembly
                     unsafe { $eor3_v4(crc, buf, len, xorout) }
                 }
+
+                /// Neoverse V2's four-lane fold, finished by the CRC32 instruction.
+                #[inline(always)]
+                pub(in super::super) unsafe fn v2_v4(
+                    crc: u32,
+                    buf: *const u8,
+                    len: usize,
+                    xorout: u32,
+                ) -> u32 {
+                    // SAFETY: as for the assembly
+                    unsafe { $v2_v4(crc, buf, len, xorout) }
+                }
+
+                /// Neoverse V2's eight-lane fold, finished by the CRC32 instruction.
+                #[inline(always)]
+                pub(in super::super) unsafe fn v2_v8(
+                    crc: u32,
+                    buf: *const u8,
+                    len: usize,
+                    xorout: u32,
+                ) -> u32 {
+                    // SAFETY: as for the assembly
+                    unsafe { $v2_v8(crc, buf, len, xorout) }
+                }
             }
 
             #[cfg(not(all(
@@ -156,6 +181,10 @@ macro_rules! entry_points {
                 inlined!(v4, super::super::$v4);
                 inlined!(v8, super::super::$v8);
                 inlined!(streams, super::super::$streams);
+                // Neoverse V2's plan is only chosen on Linux and Android; elsewhere its arms
+                // name the SHA3 tier's kernels.
+                inlined!(v2_v4, $eor3_v4_compiled);
+                inlined!(v2_v8, super::super::$eor3_v8);
             }
 
             pub(super) use imp::*;
@@ -173,7 +202,9 @@ entry_points!(
     v4: crc32_iscsi_v4,
     v8: crc32_iscsi_v8,
     streams: crc32_iscsi_v3s4,
-    eor3_v4_compiled: super::super::lanes::crc32_iscsi_eor3_v4
+    eor3_v4_compiled: super::super::lanes::crc32_iscsi_eor3_v4,
+    v2_v4: super::super::asm_v2_v4_iscsi,
+    v2_v8: super::super::asm_v2_v8_iscsi
 );
 
 entry_points!(
@@ -186,7 +217,9 @@ entry_points!(
     v4: crc32_iso_hdlc_v4,
     v8: crc32_iso_hdlc_v8,
     streams: crc32_iso_hdlc_v3s4,
-    eor3_v4_compiled: super::super::lanes::crc32_iso_hdlc_eor3_v4
+    eor3_v4_compiled: super::super::lanes::crc32_iso_hdlc_eor3_v4,
+    v2_v4: super::super::asm_v2_v4_iso_hdlc,
+    v2_v8: super::super::asm_v2_v8_iso_hdlc
 );
 
 #[cfg(all(
@@ -195,8 +228,10 @@ entry_points!(
 ))]
 use asm::{
     crc32_iscsi_eor3_v4 as asm_eor3_v4_iscsi, crc32_iscsi_loop as small_iscsi_entry,
-    crc32_iscsi_short as short_iscsi_entry, crc32_iso_hdlc_eor3_v4 as asm_eor3_v4_iso_hdlc,
+    crc32_iscsi_short as short_iscsi_entry, crc32_iscsi_v2_v4 as asm_v2_v4_iscsi,
+    crc32_iscsi_v2_v8 as asm_v2_v8_iscsi, crc32_iso_hdlc_eor3_v4 as asm_eor3_v4_iso_hdlc,
     crc32_iso_hdlc_loop as small_iso_hdlc_entry, crc32_iso_hdlc_short as short_iso_hdlc_entry,
+    crc32_iso_hdlc_v2_v4 as asm_v2_v4_iso_hdlc, crc32_iso_hdlc_v2_v8 as asm_v2_v8_iso_hdlc,
 };
 #[cfg(not(all(
     target_endian = "little",
@@ -268,19 +303,70 @@ pub(crate) enum FusionKernel {
     Pmull,
     /// PMULL folds with the SHA3 extension's three-way XOR, beside three CRC32 streams.
     PmullSha3,
+    /// [`FusionKernel::PmullSha3`] with Neoverse V2's plan from [`V2_FOLD_START`] to
+    /// [`LARGE_BUFFER_THRESHOLD`]: fast-crc32's `neon_eor3_*_v4` below [`FOUR_LANE_END`] and its
+    /// `neon_eor3_*_v8` above, each in assembly and finished by the CRC32 instruction.
+    PmullSha3NeoverseV2,
 }
+
+/// The core a CPU's `MIDR_EL1` names, as far as the fusion kernels' choice depends on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Core {
+    /// Arm Neoverse V2 (implementer 0x41, part 0xd4f): AWS Graviton 4, NVIDIA Grace, Google
+    /// Axion.
+    NeoverseV2,
+    /// Any other core, or one whose `MIDR_EL1` could not be read.
+    Other,
+}
+
+impl Core {
+    /// The core `midr`, a `MIDR_EL1` value, names: its implementer in bits 31:24 and its part
+    /// number in bits 15:4.
+    pub(crate) const fn from_midr(midr: u64) -> Core {
+        let implementer = (midr >> 24) & 0xff;
+        let part = (midr >> 4) & 0xfff;
+        if implementer == 0x41 && part == 0xd4f {
+            Core::NeoverseV2
+        } else {
+            Core::Other
+        }
+    }
+}
+
+/// Whether Neoverse V2's plan exists on this target: its kernels are the assembly in `asm`,
+/// built for little-endian Linux and Android.
+const HAS_V2_PLAN: bool = cfg!(all(
+    target_endian = "little",
+    any(target_os = "linux", target_os = "android")
+));
+
+/// Where Neoverse V2's plan starts folding: 128 bytes, where fast-crc32's `neon_eor3_*_v8`
+/// starts its fold. Below it that kernel runs the CRC32 instruction alone, and was the fastest
+/// reference at 112 bytes on Graviton 4.
+const V2_FOLD_START: usize = 128;
 
 /// The fusion kernels for `tier`, or `None` when the CPU has no CRC32 instructions to fuse with.
 ///
 /// The CRC32 instructions are an optional extension on ARMv8.0 that no tier implies. Each tier
 /// is held to its own kernels, so a pinned `CRC_TURBO_TIER` covers them: `aarch64-neon-pmull` on
 /// a CPU with SHA3 runs the PMULL kernel, not the EOR3 one.
-pub(crate) fn select_kernel(tier: PerformanceTier, has_crc: bool) -> Option<FusionKernel> {
+///
+/// Neoverse V2 takes its own plan under the SHA3 tier ([`FusionKernel::PmullSha3NeoverseV2`]),
+/// where the plan exists; every other core, Neoverse N1 and V1 and Apple's among them, keeps the
+/// tier's kernels.
+pub(crate) fn select_kernel(
+    tier: PerformanceTier,
+    has_crc: bool,
+    core: Core,
+) -> Option<FusionKernel> {
     if !has_crc {
         return None;
     }
 
     match tier {
+        PerformanceTier::AArch64AesSha3 if HAS_V2_PLAN && core == Core::NeoverseV2 => {
+            Some(FusionKernel::PmullSha3NeoverseV2)
+        }
         PerformanceTier::AArch64AesSha3 => Some(FusionKernel::PmullSha3),
         PerformanceTier::AArch64Aes => Some(FusionKernel::Pmull),
         _ => None,
@@ -315,6 +401,16 @@ pub(crate) unsafe fn crc32_iscsi_with(
         // runs the same code for them.
         if len < SMALL_BUFFER_END {
             k::short(crc, ptr, len, xorout)
+        } else if kernel == FusionKernel::PmullSha3NeoverseV2 {
+            if len < V2_FOLD_START {
+                k::small(crc, ptr, len, xorout)
+            } else if len < FOUR_LANE_END {
+                k::v2_v4(crc, ptr, len, xorout)
+            } else if len < LARGE_BUFFER_THRESHOLD {
+                k::v2_v8(crc, ptr, len, xorout)
+            } else {
+                k::eor3_large(crc, ptr, len, xorout)
+            }
         } else if kernel == FusionKernel::PmullSha3 {
             if len < SHA3_SMALL_END {
                 k::small(crc, ptr, len, xorout)
@@ -356,6 +452,16 @@ pub(crate) unsafe fn crc32_iso_hdlc_with(
     unsafe {
         if len < SMALL_BUFFER_END {
             k::short(crc, ptr, len, xorout)
+        } else if kernel == FusionKernel::PmullSha3NeoverseV2 {
+            if len < V2_FOLD_START {
+                k::small(crc, ptr, len, xorout)
+            } else if len < FOUR_LANE_END {
+                k::v2_v4(crc, ptr, len, xorout)
+            } else if len < LARGE_BUFFER_THRESHOLD {
+                k::v2_v8(crc, ptr, len, xorout)
+            } else {
+                k::eor3_large(crc, ptr, len, xorout)
+            }
         } else if kernel == FusionKernel::PmullSha3 {
             if len < SHA3_SMALL_END {
                 k::small(crc, ptr, len, xorout)
@@ -594,7 +700,7 @@ mod tests {
             PerformanceTier::AArch64Aes
         };
 
-        select_kernel(tier, true).unwrap()
+        select_kernel(tier, true, Core::Other).unwrap()
     }
 
     /// CRC-32/ISCSI through a kernel the test has already checked this CPU can run.
@@ -630,8 +736,139 @@ mod tests {
         ];
 
         for (tier, kernel) in tiers {
-            assert_eq!(select_kernel(tier, true), kernel, "{tier:?}");
-            assert_eq!(select_kernel(tier, false), None, "{tier:?} without CRC32");
+            assert_eq!(select_kernel(tier, true, Core::Other), kernel, "{tier:?}");
+            assert_eq!(
+                select_kernel(tier, false, Core::Other),
+                None,
+                "{tier:?} without CRC32"
+            );
+        }
+    }
+
+    /// `MIDR_EL1` values of the cores either side of Neoverse V2's plan: Graviton 2's Neoverse
+    /// N1, Graviton 3's V1, Graviton 4's V2 (two revisions), an Apple core, and none read.
+    const MIDR_N1: u64 = 0x413f_d0c1;
+    const MIDR_V1: u64 = 0x411f_d401;
+    const MIDR_V2: u64 = 0x410f_d4f1;
+    const MIDR_V2_R0P0: u64 = 0x410f_d4f0;
+    const MIDR_APPLE: u64 = 0x611f_0221;
+    const MIDR_UNREAD: u64 = 0;
+
+    #[test]
+    fn midr_names_neoverse_v2_alone() {
+        assert_eq!(Core::from_midr(MIDR_V2), Core::NeoverseV2);
+        assert_eq!(Core::from_midr(MIDR_V2_R0P0), Core::NeoverseV2);
+        for midr in [
+            MIDR_N1,
+            MIDR_V1,
+            MIDR_APPLE,
+            MIDR_UNREAD,
+            0x610f_d4f0,
+            0x410f_d4e0,
+        ] {
+            assert_eq!(Core::from_midr(midr), Core::Other, "{midr:#x}");
+        }
+    }
+
+    /// Neoverse V2 takes its plan on the SHA3 tier where the plan exists, and nowhere else; N1,
+    /// V1, Apple's cores and an unread `MIDR_EL1` keep their tier's kernels.
+    #[test]
+    fn neoverse_v2_alone_takes_its_plan() {
+        let sha3 = PerformanceTier::AArch64AesSha3;
+        let pmull = PerformanceTier::AArch64Aes;
+        let v2 = if HAS_V2_PLAN {
+            FusionKernel::PmullSha3NeoverseV2
+        } else {
+            FusionKernel::PmullSha3
+        };
+        let cases = [
+            (pmull, MIDR_N1, Some(FusionKernel::Pmull)),
+            (sha3, MIDR_V1, Some(FusionKernel::PmullSha3)),
+            (sha3, MIDR_V2, Some(v2)),
+            (sha3, MIDR_V2_R0P0, Some(v2)),
+            // A pinned PMULL tier holds V2 to the PMULL kernels
+            (pmull, MIDR_V2, Some(FusionKernel::Pmull)),
+            (sha3, MIDR_APPLE, Some(FusionKernel::PmullSha3)),
+            (sha3, MIDR_UNREAD, Some(FusionKernel::PmullSha3)),
+            (pmull, MIDR_UNREAD, Some(FusionKernel::Pmull)),
+        ];
+        for (tier, midr, want) in cases {
+            assert_eq!(
+                select_kernel(tier, true, Core::from_midr(midr)),
+                want,
+                "{tier:?} {midr:#x}"
+            );
+            assert_eq!(select_kernel(tier, false, Core::from_midr(midr)), None);
+        }
+    }
+
+    /// Neoverse V2's kernels, forced on whatever CPU has their features, against the software
+    /// path: each assembly kernel directly over every length it takes up to 600 bytes, and the
+    /// plan's dispatch from 0 bytes across all its thresholds, from aligned and unaligned starts,
+    /// from the initial state and from a carried one, with the standard `xorout` and another.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn neoverse_v2_kernels_match_software() {
+        use crate::crc32::consts::{CRC32_ISCSI, CRC32_ISO_HDLC};
+        if !(std::arch::is_aarch64_feature_detected!("sha3")
+            && std::arch::is_aarch64_feature_detected!("aes")
+            && std::arch::is_aarch64_feature_detected!("crc"))
+        {
+            return;
+        }
+        type Entry = unsafe fn(u32, *const u8, usize, u32) -> u32;
+        unsafe fn plan_iscsi(crc: u32, buf: *const u8, len: usize, xorout: u32) -> u32 {
+            // SAFETY: the caller holds `len` bytes at `buf` and checked for SHA3
+            unsafe {
+                crc32_iscsi_with(
+                    FusionKernel::PmullSha3NeoverseV2,
+                    crc,
+                    core::slice::from_raw_parts(buf, len),
+                    xorout,
+                )
+            }
+        }
+        unsafe fn plan_iso_hdlc(crc: u32, buf: *const u8, len: usize, xorout: u32) -> u32 {
+            // SAFETY: as for `plan_iscsi`
+            unsafe {
+                crc32_iso_hdlc_with(
+                    FusionKernel::PmullSha3NeoverseV2,
+                    crc,
+                    core::slice::from_raw_parts(buf, len),
+                    xorout,
+                )
+            }
+        }
+        let cases: [(&str, Entry, bool, core::ops::RangeInclusive<usize>); 6] = [
+            ("v2_v4 iscsi", iscsi_entry::v2_v4, true, 64..=600),
+            ("v2_v4 iso-hdlc", iso_hdlc_entry::v2_v4, false, 64..=600),
+            ("v2_v8 iscsi", iscsi_entry::v2_v8, true, 128..=600),
+            ("v2_v8 iso-hdlc", iso_hdlc_entry::v2_v8, false, 128..=600),
+            ("plan iscsi", plan_iscsi, true, 0..=2200),
+            ("plan iso-hdlc", plan_iso_hdlc, false, 0..=2200),
+        ];
+        let mut data = vec![0u8; 2200 + 16];
+        rng().fill(&mut data[..]);
+        for (name, kernel, castagnoli, lengths) in cases {
+            let params = if castagnoli {
+                CRC32_ISCSI
+            } else {
+                CRC32_ISO_HDLC
+            };
+            for len in lengths {
+                for offset in [0, 1, 3, 8, 15] {
+                    let body = &data[offset..offset + len];
+                    for (state, xorout) in [(!0u32, !0u32), (0x1234_5678, 0x0f0f_0f0f)] {
+                        let want = crate::arch::software::update(state as u64, body, &params)
+                            as u32
+                            ^ xorout;
+                        // SAFETY: SHA3, PMULL and CRC32 were detected; the kernels read `body`
+                        // alone
+                        let got = unsafe { kernel(state, body.as_ptr(), body.len(), xorout) };
+                        assert_eq!(got, want, "{name} len {len} offset {offset} {state:#x}");
+                    }
+                }
+            }
         }
     }
 

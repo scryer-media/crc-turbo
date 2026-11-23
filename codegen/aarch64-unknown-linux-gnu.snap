@@ -10,3 +10,7 @@ crc_turbo::crc32::fusion::aarch64::asm::crc32c_blocks asm=a1f2e622d8360fb3/45 gl
 crc_turbo::crc32::fusion::aarch64::asm::crc32_blocks asm=306f1fc990771c8b/45 glue=1 calls=0
 crc_turbo::crc32::fusion::aarch64::asm::crc32c_eor3_v4 asm=6d7dd7068b55a398/62 glue=1 calls=0
 crc_turbo::crc32::fusion::aarch64::asm::crc32_eor3_v4 asm=f5abb12aee24bfb0/62 glue=1 calls=0
+crc_turbo::crc32::fusion::aarch64::asm::crc32c_v2_v4 asm=60d51ad96d2c7b16/85 glue=1 calls=0
+crc_turbo::crc32::fusion::aarch64::asm::crc32_v2_v4 asm=841cc80484ec6780/85 glue=1 calls=0
+crc_turbo::crc32::fusion::aarch64::asm::crc32c_v2_v8 asm=ccb303d5b915ed54/114 glue=1 calls=0
+crc_turbo::crc32::fusion::aarch64::asm::crc32_v2_v8 asm=440b9ec4c836b2ce/114 glue=1 calls=0
