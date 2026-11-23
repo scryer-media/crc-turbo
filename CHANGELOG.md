@@ -219,7 +219,10 @@ own changelog up to the fork point continues below, unchanged.
   16-byte blocks with each block folded onto the last across its own
   distance, so that their shape does not depend on the compiler; crc-fast
   folds them in a chain of compiled intrinsics. CRC-32/ISO-HDLC has a
-  checksum entry per tier with that assembly in line.
+  checksum entry per tier with that assembly in line, and on the
+  `x86_64-avx2-vpclmulqdq` and `x86_64-avx512-vpclmulqdq` tiers its
+  checksum folds 64 to 255 and 64 to 127 bytes at 256 and 512 bits, the
+  shape of libdeflate's.
 
 - Every architecture: 32 to 255 bytes, the generic fold no longer runs its
   16-byte blocks as one chain of dependent multiplies. Each of the last
@@ -731,28 +734,46 @@ own changelog up to the fork point continues below, unchanged.
   distance with the generated key for it, read from the key table; the
   bytes after the last whole block are folded in with one overlapping read.
   The wider tiers' 256-bit fold of 64 to 127 bytes, which LLVM had left as
-  a call out of line, is no longer used there: in a build that kept it,
-  CRC-32/ISO-HDLC from 64 to 112 bytes on those tiers read 0.64x to 0.88x
-  of commit 2ee9ff1. Each fold sits in one function per tier, width and bit
+  a call out of line, is no longer used there for the generic algorithms;
+  CRC-32/ISO-HDLC has its own wide arms, below. Each fold sits in one function per tier, width and bit
   order, never inlined and not generic; Miri and 32-bit x86 run the intrinsics they are tested against.
   CRC-32/ISO-HDLC has an entry of its own per tier with the assembly in
   line, and on the SSE tier of a CPU with AVX takes the AVX encoding. A
   test checks each fold against the software path over every algorithm,
   every length it takes, four starting offsets and a carried
   state, and changing one key offset, multiply selector or blend operand
-  fails it. Measured on the same seven EC2 `.large` CPUs against commit
-  2ee9ff1, CRC-32/ISO-HDLC from 16 to 255 bytes, median of two
-  interleaved rounds over two link layouts in each of two batches:
-  0.91x to 1.53x (geometric mean 1.17x), and from 1.11.0 2.36x to 8.37x.
-  Below 0.99x in both batches: 96 and 112 bytes on the EPYC 7R13 (0.95x,
-  0.96x) and the EPYC 9R14 (0.95x, 0.91x). Against the fastest of
-  fast-crc32's generated C, libdeflate and zlib, CRC-32/ISO-HDLC still
-  trails, in both batches, on the E5-2666 v3 from 16 to 192 bytes (0.84x
-  to 0.93x) and at 4 KiB (0.96x), the 8275CL from 16 to 96 bytes (0.85x to
-  0.97x), the 7R32 from 48 to 256 bytes (0.94x to 0.98x), the 7R13 from 96
-  to 192 bytes (0.87x to 0.96x), the 9R14 from 64 to 112 bytes (0.80x to
-  0.92x), the 8488C at 256 bytes and 4 KiB (0.89x, 0.97x) and the 8375C at
-  1 and 2 KiB (0.92x, 0.87x).
+  fails it.
+- x86, CRC-32/ISO-HDLC from 16 to 255 bytes takes libdeflate's shape for
+  each register width (`crc32_pclmul_template.h`, reimplemented from its
+  description; no code is taken). On the 128-bit tiers each fold's pair of
+  multipliers is loaded into a register once and both multiplies read it,
+  as libdeflate holds its multipliers in registers, instead of each
+  multiply reading the pair from memory. The checksum entries of the
+  `x86_64-avx2-vpclmulqdq` and `x86_64-avx512-vpclmulqdq` tiers fold 64 to
+  255 and 64 to 127 bytes at their full width: the CRC and the first 32 or
+  64 bytes in one register, every further 32 or 64 bytes folded onto the
+  end across its distance, then 512 to 256 to 128 bits, with the bytes
+  after the last whole block folded in by one overlapping read. Their keys
+  are computed at compile time from the generated ones' powers of x,
+  checked equal to them, in a 64-byte-aligned table. Tests check both
+  widths against the software path from a carried state, every length to
+  600 bytes and four starting offsets, and moving one key row in either
+  width fails them. Measured on seven EC2 `.large` CPUs (E5-2666 v3,
+  8275CL, EPYC 7R32, 7R13 and 9R14, 8375C and 8488C), median of two
+  interleaved rounds over four link layouts, from an aligned and an
+  unaligned start, 16 to 192 bytes: 2.24x to 10.15x 1.11.0's speed
+  (geometric mean 5.10x). Against the fastest of fast-crc32's generated
+  C, libdeflate and zlib: 0.86x to 1.82x (geometric mean 1.14x); the
+  wide arms took the 7R13 from 0.85x to 0.97x at 80 to 192 bytes to 1.07x
+  to 1.23x, and the 9R14 from 0.80x to 0.87x at 80 to 112 bytes to 1.16x
+  to 1.30x. libdeflate still leads on the E5-2666 v3 from 32 to 96 bytes,
+  at 128 from an unaligned start and at 192 (0.86x to 0.96x), the 8275CL
+  from 32 to 96 bytes (0.87x to 0.96x) and the 7R32 from 80 to 112 bytes (0.93x to 0.96x). On those
+  tiers its compiled path at 64 and 96 bytes runs the same number of
+  multiplies and about the same number of instructions as this crate's,
+  with a longer chain of dependent multiplies, and the E5-2666 v3's cells
+  moved by up to 8% between two builds that differ only in code the CPU
+  never runs.
 
 - WebAssembly is faster for 43 of the 50 built-in algorithms. Every table
   load there is bounds-checked, so for a long input the software path now
