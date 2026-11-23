@@ -4,6 +4,7 @@
 
 #![cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 
+pub(crate) mod short_asm;
 pub mod sse;
 
 /// `keys` with their values hidden from the optimizer, for a caller whose parameters are a

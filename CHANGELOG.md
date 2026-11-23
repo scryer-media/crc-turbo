@@ -205,6 +205,12 @@ own changelog up to the fork point continues below, unchanged.
   every tier; on the `x86-sse-pclmulqdq`, `x86_64-sse-pclmulqdq` and
   `x86_64-avx512-pclmulqdq` tiers it loads its fold keys rather than
   building them in general registers.
+- x86: buffers of 16 to 255 bytes (16 to 127 on the 256- and 512-bit
+  tiers) are folded by inline assembly, one straight-line arm per number of
+  16-byte blocks with each block folded onto the last across its own
+  distance, so that their shape does not depend on the compiler; crc-fast
+  folds them in a chain of compiled intrinsics. CRC-32/ISO-HDLC has a
+  checksum entry per tier with that assembly in line.
 
 - Every architecture: 32 to 255 bytes, the generic fold no longer runs its
   16-byte blocks as one chain of dependent multiplies. Each of the last
@@ -691,6 +697,36 @@ own changelog up to the fork point continues below, unchanged.
     A single build's comparison against another therefore repeats its
     layout's bias from run to run. The figures above are geometric means
     over four link layouts per build.
+- x86: the folds of 16 to 255 bytes on the `x86-sse-pclmulqdq` and
+  `x86_64-sse-pclmulqdq` tiers, and of 16 to 127 bytes on the three wider
+  tiers, are inline assembly, for every algorithm, so that a new LLVM
+  cannot change their shape. Each length of 16-byte blocks has a
+  straight-line arm folding each block onto the last across its own
+  distance with the generated key for it, read from the key table; the
+  bytes after the last whole block are folded in with one overlapping read.
+  The wider tiers' 256-bit fold of 64 to 127 bytes, which LLVM had left as
+  a call out of line, is no longer used there: in a build that kept it,
+  CRC-32/ISO-HDLC from 64 to 112 bytes on those tiers read 0.64x to 0.88x
+  of commit 2ee9ff1. Each fold sits in one function per tier, width and bit
+  order, never inlined and not generic; Miri and 32-bit x86 run the intrinsics they are tested against.
+  CRC-32/ISO-HDLC has an entry of its own per tier with the assembly in
+  line, and on the SSE tier of a CPU with AVX takes the AVX encoding. A
+  test checks each fold against the software path over every algorithm,
+  every length it takes, four starting offsets and a carried
+  state, and changing one key offset, multiply selector or blend operand
+  fails it. Measured on the same seven EC2 `.large` CPUs against commit
+  2ee9ff1, CRC-32/ISO-HDLC from 16 to 255 bytes, median of two
+  interleaved rounds over two link layouts in each of two batches:
+  0.91x to 1.53x (geometric mean 1.17x), and from 1.11.0 2.36x to 8.37x.
+  Below 0.99x in both batches: 96 and 112 bytes on the EPYC 7R13 (0.95x,
+  0.96x) and the EPYC 9R14 (0.95x, 0.91x). Against the fastest of
+  fast-crc32's generated C, libdeflate and zlib, CRC-32/ISO-HDLC still
+  trails, in both batches, on the E5-2666 v3 from 16 to 192 bytes (0.84x
+  to 0.93x) and at 4 KiB (0.96x), the 8275CL from 16 to 96 bytes (0.85x to
+  0.97x), the 7R32 from 48 to 256 bytes (0.94x to 0.98x), the 7R13 from 96
+  to 192 bytes (0.87x to 0.96x), the 9R14 from 64 to 112 bytes (0.80x to
+  0.92x), the 8488C at 256 bytes and 4 KiB (0.89x, 0.97x) and the 8375C at
+  1 and 2 KiB (0.92x, 0.87x).
 
 - WebAssembly is faster for 43 of the 50 built-in algorithms. Every table
   load there is bounds-checked, so for a long input the software path now
