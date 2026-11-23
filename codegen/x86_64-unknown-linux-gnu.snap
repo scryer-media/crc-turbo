@@ -1,0 +1,6 @@
+# Hot paths on x86_64-unknown-linux-gnu, checked by `cargo xtask codegen check`.
+# One function per line: its Rust path, then what the pinned toolchain's
+# release build made of it. `asm` is a hash of the inline assembly's mnemonics
+# and their count, `glue` the instructions the compiler generated around it,
+# `calls` how many of those are calls. Rewrite the numbers with
+# `cargo xtask codegen bless --target x86_64-unknown-linux-gnu`.

@@ -1,0 +1,58 @@
+name: codegen-watch
+
+# The hot paths' compiled shape on the compilers that are coming: beta and
+# nightly, unpinned on purpose. `ci.yml` holds the pinned toolchain and the
+# oldest supported one to `codegen/<target>.snap`; this run is the early
+# warning that a newer compiler treats the code around the inline assembly
+# differently, before that compiler is the one consumers build with. It is not
+# a required check: a failure here is a finding to act on, not a broken change.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '41 4 * * 2'
+
+concurrency:
+  group: crc-turbo-codegen-watch
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  watch:
+    name: codegen-${{ matrix.toolchain }}-${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [beta, nightly]
+        platform: [x86_64, aarch64]
+        include:
+          - platform: x86_64
+            runner: ubuntu-26.04
+          - platform: aarch64
+            runner: ubuntu-26.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      - name: The compiler under watch
+        env:
+          TOOLCHAIN: ${{ matrix.toolchain }}
+        run: rustc "+$TOOLCHAIN" -vV
+      - name: The release profile
+        env:
+          TOOLCHAIN: ${{ matrix.toolchain }}
+        run: cargo "+$TOOLCHAIN" xtask codegen check
+      - name: As a dependent crate builds it by default
+        env:
+          TOOLCHAIN: ${{ matrix.toolchain }}
+        run: cargo "+$TOOLCHAIN" xtask codegen check --profile consumer

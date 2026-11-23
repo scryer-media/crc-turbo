@@ -53,6 +53,12 @@ own changelog up to the fork point continues below, unchanged.
 - The crate archive no longer carries the repository's CI, hook, fuzz and
   agent files, nor upstream's `.kiro/` design notes, which stay in the
   repository.
+- `cargo xtask codegen check` holds the hot paths' compiled shape to
+  `codegen/<target>.snap`: the inline assembly of each listed function, by
+  mnemonic, and the count of instructions and calls the compiler generated
+  around it. CI runs it on the pinned toolchain, on the MSRV and as a
+  dependent crate builds the library (no LTO, default codegen units), on
+  x86_64 and aarch64; `codegen-watch.yml` runs it weekly on beta and nightly.
 
 ### Fixes taken from crc-fast's open pull requests
 
@@ -860,6 +866,15 @@ own changelog up to the fork point continues below, unchanged.
   takes the tiers below, as `std` builds already did; both detection paths
   decide through one rule. `std` builds are unchanged. The gap is item 3 of
   crc-fast#64 by GiorgioRegni, which 1.11.0 closed for `std` builds only.
+
+- The compiled shape of the hot paths is now checked, not assumed. `cargo
+  xtask codegen check` reads the assembly the compiler emitted for each
+  function listed in `codegen/<target>.snap` and fails when a listed
+  function's inline assembly differs, when the code generated around it grows
+  past the snapshot's margin, or when it gains a call. It runs in CI on the
+  pinned toolchain (exact), on the MSRV and under the profile a dependent
+  crate gets by default, and weekly on beta and nightly as an early warning.
+  It counts instructions and never times anything.
 
 ## 1.11.0 - 2026-10-20
 

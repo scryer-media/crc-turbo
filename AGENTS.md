@@ -68,6 +68,16 @@ major version and a reason, not convenience.
 - The CPUs without the feature the change needs are part of the claim: an
   AVX2 change is measured on an AVX-512 part too, and aarch64 is measured
   whenever shared code moves.
+- **Speed does not depend on the compiler's mood.** A consumer builds this
+  crate with their own rustc, LLVM and profile, so a hot path whose shape
+  matters is inline asm (with an intrinsics path for Miri and as the tested
+  fallback), not a shape the optimizer happened to choose. Each such path is
+  listed in `codegen/<target>.snap` and held there by `cargo xtask codegen
+  check`: the asm's mnemonics must match exactly on every compiler and
+  profile, and the generated code around it may not grow or gain a call. A
+  change to a listed path re-blesses the snapshot (`cargo xtask codegen
+  bless --target <target>`) in the same commit and says why in its message.
+  The check counts instructions; it never times anything.
 
 ## Tests
 
