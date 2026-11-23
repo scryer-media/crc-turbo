@@ -1613,6 +1613,18 @@ iso_hdlc_checksum!(
     iso_hdlc_fold_x86_64_avx2_vpclmulqdq,
     crate::arch::x86_64::avx2_vpclmulqdq::X86_64Avx2VpclmulqdqOps::new()
 );
+// Intel's E-core parts: the same ladder, and libdeflate's cascade from 256 bytes, see
+// `crate::arch::choose_iso_hdlc`
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+iso_hdlc_checksum!(
+    "avx2,vpclmulqdq,sse4.1,pclmulqdq",
+    avx,
+    w256,
+    iso_hdlc_checksum_avx2_ecore,
+    iso_hdlc_mid_x86_64_avx2_ecore,
+    iso_hdlc_fold_x86_64_avx2_vpclmulqdq,
+    crate::arch::x86_64::avx2_vpclmulqdq::X86_64Avx2VpclmulqdqOps::new()
+);
 
 /// The wide ladders' bodies from a carried CRC, for the tests: the checksum entries are the
 /// only callers in the library, and they start from no CRC.

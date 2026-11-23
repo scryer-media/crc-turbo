@@ -15,6 +15,8 @@
 
 mod iscsi;
 
+#[cfg(target_arch = "x86_64")]
+pub(crate) use iscsi::sse_pclmulqdq::crc32_iscsi_avx2_v4_aligned;
 use iscsi::sse_pclmulqdq::crc32_iscsi_sse_v4x2s4x4;
 #[cfg(target_arch = "x86_64")]
 use iscsi::sse_pclmulqdq::{crc32_iscsi_avx2_s3, crc32_iscsi_avx2_v4, crc32_iscsi_avx2_v4x2s4x4};
@@ -102,6 +104,15 @@ const SSE_SMALL_BUFFER_MAX: usize = 199;
 
 /// [`IscsiPlan::direct_max`] on Intel's E-core parts, see [`iscsi_limits`].
 const ECORE_DIRECT_MAX: usize = SSE_SMALL_BUFFER_MAX;
+/// [`IscsiPlan::direct_max`] on Intel's E-core parts with the AVX2 build, whose plan hands over
+/// to the vector-only kernel: on a Xeon 6731E the `v4` shape from a 16-byte boundary was ahead
+/// of the CRC32 instruction alone at 160 bytes, aligned or not, and level with it or behind at 128.
+#[cfg(target_arch = "x86_64")]
+const ECORE_V4_DIRECT_MAX: usize = 159;
+/// The longest buffer the vector-only kernel takes there: on a Xeon 6731E it was ahead of the
+/// four-stream kernel at 640 bytes and behind it at 768.
+#[cfg(target_arch = "x86_64")]
+const ECORE_MID_MAX: usize = 703;
 /// [`IscsiPlan::direct_max`] on AMD's family 0x17 (Zen, Zen+, Zen 2).
 const ZEN2_DIRECT_MAX: usize = 288;
 /// [`IscsiPlan::direct_max`] below AVX-512 everywhere else, and the longest any plan has.
@@ -243,7 +254,7 @@ impl CpuId {
     /// Intel's parts built only of E-cores from Gracemont on: Alder Lake-N, Sierra Forest, Grand
     /// Ridge and Clearwater Forest. A hybrid part is not one: its threads move between P-cores and
     /// E-cores, and it is planned for its P-cores.
-    fn is_intel_ecore(&self) -> bool {
+    pub(crate) fn is_intel_ecore(&self) -> bool {
         &self.vendor == b"GenuineIntel"
             && self.family == 6
             && matches!(self.model, 0xbe | 0xaf | 0xb6 | 0xdd)
@@ -296,6 +307,14 @@ pub(crate) struct IscsiPlan {
     /// Buffers up to this length take [`crc32_iscsi_small_unaligned`], called directly, so they
     /// pay neither the indirect call nor a kernel's entry.
     pub(crate) direct_max: usize,
+    /// One more than the longest buffer the dispatch entry hands straight to
+    /// [`crc32_iscsi_avx2_v4_aligned`], past `direct_max`, without the plan's kernel entry: 0
+    /// where the plan has no such window. Only Intel's E-core parts have one, [`ECORE_MID_MAX`],
+    /// and their kernel is the tier's default build: the dispatch entry has taken the window
+    /// before it, with one direct call as fast-crc32's `v4` is reached, rather than through the
+    /// plan and its indirect call.
+    #[cfg_attr(target_arch = "x86", allow(dead_code))]
+    pub(crate) v4_end: usize,
     /// Buffers this long or longer take the folding path instead of the kernel; `usize::MAX`
     /// where the kernel is faster at every length.
     pub(crate) fold_min: usize,
@@ -308,6 +327,19 @@ pub(crate) struct IscsiPlan {
 pub(crate) fn iscsi_plan(kernel: IscsiKernel, tier: PerformanceTier, cpu: CpuId) -> IscsiPlan {
     let (direct_max, fold_min) = iscsi_limits(kernel, tier, cpu);
     let fold_end = iscsi_fold_end(kernel, tier, cpu);
+    #[cfg(target_arch = "x86_64")]
+    let v4_end = match (
+        kernel,
+        iscsi_far_min(kernel, cpu),
+        iscsi_mid_max(kernel, cpu),
+    ) {
+        (IscsiKernel::Avx2, SSE_FAR_MIN, ECORE_MID_MAX) if cpu.is_intel_ecore() => {
+            ECORE_MID_MAX + 1
+        }
+        _ => 0,
+    };
+    #[cfg(target_arch = "x86")]
+    let v4_end = 0;
     // The vector-only window and the far handover pick the entry's build; Zen 2 also takes the
     // three CRC32 streams alone for long buffers.
     let kernel = match (
@@ -356,6 +388,7 @@ pub(crate) fn iscsi_plan(kernel: IscsiKernel, tier: PerformanceTier, cpu: CpuId)
     IscsiPlan {
         kernel,
         direct_max,
+        v4_end,
         fold_min,
         fold_end,
     }
@@ -444,6 +477,8 @@ fn iscsi_limits(kernel: IscsiKernel, tier: PerformanceTier, cpu: CpuId) -> (usiz
                 IscsiKernel::Avx2 if cpu.is_amd_family_19() => ZEN3_DIRECT_MAX,
                 #[cfg(target_arch = "x86_64")]
                 IscsiKernel::Avx2 if cpu.is_haswell() => INTEL_DIRECT_MAX,
+                #[cfg(target_arch = "x86_64")]
+                IscsiKernel::Avx2 if cpu.is_intel_ecore() => ECORE_V4_DIRECT_MAX,
                 _ => sse_direct_max(cpu),
             };
             let fold_min = match tier {
@@ -497,6 +532,8 @@ fn iscsi_mid_max(kernel: IscsiKernel, cpu: CpuId) -> usize {
         IscsiKernel::Avx2 if cpu.is_amd_family_19() => ZEN3_MID_MAX,
         #[cfg(target_arch = "x86_64")]
         IscsiKernel::Avx2 if cpu.is_haswell() => INTEL_MID_MAX,
+        #[cfg(target_arch = "x86_64")]
+        IscsiKernel::Avx2 if cpu.is_intel_ecore() => ECORE_MID_MAX,
         #[cfg(target_arch = "x86_64")]
         IscsiKernel::Avx512Pclmulqdq => INTEL_MID_MAX,
         #[cfg(target_arch = "x86_64")]
@@ -1099,34 +1136,19 @@ mod tests {
         let zen3_fold = ZEN3_FOLD_MIN;
         #[cfg(target_arch = "x86")]
         let zen3_fold = NONE;
+        // The E-cores' AVX2 build hands over to its vector-only kernel early
+        #[cfg(target_arch = "x86_64")]
+        let ecore = ECORE_V4_DIRECT_MAX;
+        #[cfg(target_arch = "x86")]
+        let ecore = ECORE_DIRECT_MAX;
 
         // (CPU, tier, the plan's limits, the SSE build's direct limit)
         let cases = [
             // Sierra Forest, Grand Ridge, Clearwater Forest, Alder Lake-N
-            (
-                cpu(INTEL, 6, 0xaf),
-                avx2,
-                (ECORE_DIRECT_MAX, NONE),
-                ECORE_DIRECT_MAX,
-            ),
-            (
-                cpu(INTEL, 6, 0xb6),
-                avx2,
-                (ECORE_DIRECT_MAX, NONE),
-                ECORE_DIRECT_MAX,
-            ),
-            (
-                cpu(INTEL, 6, 0xdd),
-                avx2,
-                (ECORE_DIRECT_MAX, NONE),
-                ECORE_DIRECT_MAX,
-            ),
-            (
-                cpu(INTEL, 6, 0xbe),
-                sse,
-                (ECORE_DIRECT_MAX, NONE),
-                ECORE_DIRECT_MAX,
-            ),
+            (cpu(INTEL, 6, 0xaf), avx2, (ecore, NONE), ECORE_DIRECT_MAX),
+            (cpu(INTEL, 6, 0xb6), avx2, (ecore, NONE), ECORE_DIRECT_MAX),
+            (cpu(INTEL, 6, 0xdd), avx2, (ecore, NONE), ECORE_DIRECT_MAX),
+            (cpu(INTEL, 6, 0xbe), sse, (ecore, NONE), ECORE_DIRECT_MAX),
             // Alder Lake and Meteor Lake are hybrid, planned for their P-cores; Tremont is
             // older than the E-cores measured
             (cpu(INTEL, 6, 0x97), avx2, (DIRECT_MAX, NONE), DIRECT_MAX),
@@ -1201,7 +1223,9 @@ mod tests {
             }
         }
 
-        // No plan's limit is below what the SSE and AVX2 entry points take alone
+        // No plan's limit is below what the SSE and AVX2 entry points take alone; the
+        // E-cores' AVX2 limit is, because the dispatch entry sends their vector-only window
+        // past it straight to its kernel, before the plan's
         assert!([
             ECORE_DIRECT_MAX,
             ZEN2_DIRECT_MAX,
@@ -1240,6 +1264,17 @@ mod tests {
             (cpu(INTEL, 6, 0x5e), Avx2, avx2, 0),
             (cpu(INTEL, 6, 0x97), Avx2, avx2, 0),
             (cpu(INTEL, 0xf, 0x3f), Avx2, avx2, 0),
+            // Sierra Forest measured; Grand Ridge, Clearwater Forest and Alder Lake-N planned as
+            // it is; against Alder Lake, Sapphire Rapids pinned to AVX2, Meteor Lake and an
+            // E-core model number in another family
+            (cpu(INTEL, 6, 0xaf), Avx2, avx2, ECORE_MID_MAX),
+            (cpu(INTEL, 6, 0xb6), Avx2, avx2, ECORE_MID_MAX),
+            (cpu(INTEL, 6, 0xdd), Avx2, avx2, ECORE_MID_MAX),
+            (cpu(INTEL, 6, 0xbe), Avx2, avx2, ECORE_MID_MAX),
+            (cpu(INTEL, 6, 0x8f), Avx2, avx2, 0),
+            (cpu(INTEL, 6, 0xaa), Avx2, avx2, 0),
+            (cpu(INTEL, 0xf, 0xaf), Avx2, avx2, 0),
+            (cpu(INTEL, 6, 0xaf), Sse, avx2, 0),
             // The SSE build has none, Haswell's included
             (cpu(INTEL, 6, 0x3f), Sse, avx2, 0),
             (cpu(AMD, 0x17, 0x31), Sse, avx2, 0),
@@ -1284,7 +1319,26 @@ mod tests {
 
         for (id, kernel, tier, mid_max) in cases {
             assert_eq!(iscsi_mid_max(kernel, id), mid_max, "{id:?} {kernel:?}");
-            if mid_max != 0 {
+            // Only the E-cores' plan sends its window straight from the dispatch entry
+            let v4_end = if id.is_intel_ecore() && kernel == Avx2 {
+                ECORE_MID_MAX + 1
+            } else {
+                0
+            };
+            assert_eq!(
+                iscsi_plan(kernel, tier, id).v4_end,
+                v4_end,
+                "{id:?} {kernel:?}"
+            );
+            // The E-cores' window is the dispatch entry's, and their plan's kernel the default
+            if v4_end != 0 {
+                assert_eq!(
+                    iscsi_plan(kernel, tier, id).kernel as usize,
+                    iscsi_kernel_fn(kernel) as usize,
+                    "{id:?} {kernel:?}"
+                );
+            }
+            if mid_max != 0 && v4_end == 0 {
                 let plan = iscsi_plan(kernel, tier, id);
                 assert!(plan.direct_max < mid_max, "{id:?} {kernel:?}");
                 assert_ne!(
@@ -1509,7 +1563,7 @@ mod tests {
         }
         lengths.extend(1_048_575..=1_048_577);
 
-        for offset in [0usize, 1, 3, 7, 8, 9, 15] {
+        for offset in [0usize, 1, 3, 7, 8, 9, 15, 33] {
             for &len in &lengths {
                 let input = &data[offset..offset + len];
                 for state in [init, carried] {
@@ -1521,6 +1575,14 @@ mod tests {
                         assert_eq!(
                             actual, expected,
                             "v4 offset {offset} len {len} state {state:#x}"
+                        );
+                    }
+
+                    if len <= 4 * INTEL_MID_MAX {
+                        let actual = unsafe { crc32_iscsi_avx2_v4_aligned(crc, ptr, len) } as u64;
+                        assert_eq!(
+                            actual, expected,
+                            "v4 aligned offset {offset} len {len} state {state:#x}"
                         );
                     }
 
@@ -1573,6 +1635,12 @@ mod tests {
                 cpu(AMD, 0x19, 0x01),
             ),
             (
+                avx2,
+                IscsiKernel::Avx2,
+                PerformanceTier::X86_64Avx2Vpclmulqdq,
+                cpu(INTEL, 6, 0xaf),
+            ),
+            (
                 avx512vl,
                 IscsiKernel::Avx512Pclmulqdq,
                 PerformanceTier::X86_64Avx512Pclmulqdq,
@@ -1614,7 +1682,7 @@ mod tests {
                 continue;
             }
             let plan = iscsi_plan(kernel, tier, id);
-            for offset in [0usize, 1, 3, 8, 63] {
+            for offset in [0usize, 1, 3, 8, 15, 33, 63] {
                 for &len in &lengths {
                     let input = &data[aligned + offset..aligned + offset + len];
                     for state in [init, carried] {

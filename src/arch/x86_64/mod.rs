@@ -7,3 +7,5 @@
 pub mod avx2_vpclmulqdq;
 pub mod avx512;
 pub mod avx512_vpclmulqdq;
+#[cfg(feature = "std")]
+pub(crate) mod iso_hdlc_cascade;

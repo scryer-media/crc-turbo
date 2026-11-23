@@ -358,10 +358,19 @@ v4x2s4x4!(
 
 /// Defines the vector-only kernel under the given name and attributes.
 macro_rules! v4 {
-    ($(#[$attr:meta])* $name:ident) => {
+    ($align:literal, $(#[$attr:meta])* $name:ident) => {
         $(#[$attr])*
         #[inline(never)]
-        pub unsafe fn $name(crc0: u32, buf: *const u8, len: usize) -> u32 {
+        pub unsafe fn $name(mut crc0: u32, mut buf: *const u8, mut len: usize) -> u32 {
+            // The bytes up to a 16-byte boundary with the CRC32 instruction first, as fast-crc32's
+            // `v4` takes them, so that no load of the fold splits a cache line
+            let head = (buf as usize).wrapping_neg() & 15;
+            if $align && head != 0 && len >= head + VECTOR_STEP {
+                crc0 = crc32_iscsi_small_unaligned(crc0, core::slice::from_raw_parts(buf, head));
+                buf = buf.add(head);
+                len -= head;
+            }
+
             if len < VECTOR_STEP {
                 return crc32_iscsi_small_unaligned(crc0, core::slice::from_raw_parts(buf, len));
             }
@@ -404,6 +413,7 @@ macro_rules! v4 {
 }
 
 v4!(
+    false,
     /// CRC-32/ISCSI over `len` bytes at `buf`, continuing from `crc0`, by carry-less folds alone:
     /// four 128-bit accumulators over the 64-byte steps from where the buffer starts, reduced to
     /// 32 bits, and the CRC32 instruction over the last 63 bytes or fewer. With no CRC32 streams
@@ -417,6 +427,22 @@ v4!(
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2,sse4.2,pclmulqdq")]
     crc32_iscsi_avx2_v4
+);
+
+v4!(
+    true,
+    /// [`crc32_iscsi_avx2_v4`] from a 16-byte boundary: the bytes before it go through the CRC32
+    /// instruction first, as in fast-crc32's `v4`, so that every load of the fold is within a
+    /// cache line. For Intel's E-cores, where a load that splits a line costs more than the
+    /// instructions that avoid it.
+    ///
+    /// # Safety
+    ///
+    /// `buf` must be valid for reads of `len` bytes, and the CPU must have AVX2, SSE4.2 and
+    /// PCLMULQDQ.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,sse4.2,pclmulqdq")]
+    crc32_iscsi_avx2_v4_aligned
 );
 
 /// The shortest aligned length [`s3!`] splits into streams.
