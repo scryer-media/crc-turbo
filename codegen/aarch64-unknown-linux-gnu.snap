@@ -4,3 +4,9 @@
 # and their count, `glue` the instructions the compiler generated around it,
 # `calls` how many of those are calls. Rewrite the numbers with
 # `cargo xtask codegen bless --target aarch64-unknown-linux-gnu`.
+crc_turbo::crc32::fusion::aarch64::asm::crc32c_short asm=749b7afe990ddf12/26 glue=1 calls=0
+crc_turbo::crc32::fusion::aarch64::asm::crc32_short asm=1d22d68a354e9bb2/26 glue=1 calls=0
+crc_turbo::crc32::fusion::aarch64::asm::crc32c_blocks asm=467e66b02b488297/44 glue=1 calls=0
+crc_turbo::crc32::fusion::aarch64::asm::crc32_blocks asm=601c00ae8831a7cf/44 glue=1 calls=0
+crc_turbo::crc32::fusion::aarch64::asm::crc32c_eor3_v4 asm=f6df45d70d453114/61 glue=1 calls=0
+crc_turbo::crc32::fusion::aarch64::asm::crc32_eor3_v4 asm=e60ef77500746ecc/61 glue=1 calls=0
