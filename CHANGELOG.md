@@ -122,6 +122,11 @@ own changelog up to the fork point continues below, unchanged.
   4 KiB take a 256-bit short fold, one final reduction and independent tail
   folds, after the Linux kernel's and libdeflate's methods. The kernel is
   chosen once per process. See 1.11.1.
+- On aarch64 Linux and Android, Arm Neoverse V2 (Graviton 4; `MIDR_EL1`
+  implementer 0x41, part 0xd4f) takes its own CRC-32/ISCSI and
+  CRC-32/ISO-HDLC plan under the SHA3 tier: fast-crc32's `neon_eor3_*_v4`
+  and `*_v8` shapes in assembly, finished by the CRC32 instruction. See
+  1.11.1.
 
 ### digest 0.11
 
@@ -953,6 +958,46 @@ own changelog up to the fork point continues below, unchanged.
   failed it on Graviton 2, 3 and 4. On the Apple M5 Max, where the code
   shape is unchanged, both algorithms ran 1.07x to 3.2x of 1.11.0 from
   16 bytes to 1 MiB, aligned and unaligned.
+- aarch64 Linux and Android, CRC-32/ISCSI and CRC-32/ISO-HDLC on Arm
+  Neoverse V2 (Graviton 4): the SHA3 tier takes a plan of its own when the
+  first CPU's `MIDR_EL1` (read from sysfs once, when the kernel is chosen)
+  names implementer 0x41, part 0xd4f. Neoverse N1 and V1, Apple's cores, a
+  pinned `aarch64-neon-pmull` tier and a core whose `MIDR_EL1` cannot be read
+  keep the kernels they ran. The plan follows the fastest outside kernel at
+  each length on a c8g.large, against fast-crc32's 32 generated NEON kernels,
+  libdeflate and zlib: the CRC32 instruction loop below 128 bytes, where
+  fast-crc32's `neon_eor3_*_v8` runs that instruction alone; its
+  `neon_eor3_*_v4` shape from 128 to 255 bytes (four lanes, `ldp` loads, one
+  EOR3 a lane), finished as it is by two CRC32 instructions and the CRC32
+  instruction over the bytes past the last stride, where the SHA3 tier
+  folds them 16 bytes at a time; and its `neon_eor3_*_v8` shape from 256
+  bytes to 2 KiB, where the SHA3 tier runs the compiled eight-lane fold. All
+  three are assembly (`crc32c_v2_v4`, `crc32_v2_v4`, 85 instructions;
+  `crc32c_v2_v8`, `crc32_v2_v8`, 114). Median of nine process launches per
+  arm, interleaved, seven rounds of 40 MiB samples each, checksums compared
+  first; 1.11.0 built twice agreed within 1% at every length. Against the
+  fastest of those references, aligned start, CRC-32/ISCSI and
+  CRC-32/ISO-HDLC ran 1.09x and 1.03x at 96 bytes (0.85x and 0.84x before),
+  1.06x and 1.07x at 112 (0.84x and 0.77x), and 0.64x to 1.09x from 128 to
+  2 KiB, where 1.11.1's tree before this change ran 0.63x to 1.10x; the
+  0.64x is CRC-32/ISO-HDLC at 240 bytes, seven of nine launches in a slow
+  mode, the other two at 1.12x. Against
+  1.11.0 every length from 80 bytes to 2 KiB, aligned and unaligned, ran
+  1.13x to 2.85x. From 128 bytes to 512 bytes the same binary measured up to
+  1.8x apart from one process launch to the next, the references and the
+  tree before this change as well, so a cell there is settled by its median
+  over launches; still below 0.97x of the fastest reference in both batches
+  were CRC-32/ISCSI at 160, 176 and 512 bytes (0.88x to 0.95x) and
+  CRC-32/ISO-HDLC at 160 and 176 bytes (0.91x to 0.96x), each a length
+  where the kernel and fast-crc32's have the same structure. A test runs
+  each new kernel directly and the plan's dispatch, on any CPU with SHA3,
+  against the software path at every length to 600 bytes (2,200 through
+  dispatch), from five start offsets, from the initial and a carried state,
+  with two final XORs; a wrong fold key in either assembly kernel failed it
+  on Graviton 4. Selection tests cover N1, V1, V2, Apple and an unread
+  `MIDR_EL1`. On the Apple M5 Max, whose code is unchanged, both algorithms
+  ran at least 0.99x of 1.11.0 from 16 bytes to 1 MiB, aligned and
+  unaligned.
 - With that kernel, the direct call above and this release's aarch64 short paths,
   CRC-32/ISCSI and CRC-32/ISO-HDLC against 1.11.0 on Graviton, median of
   seven interleaved rounds, checksums compared first and the test suite
