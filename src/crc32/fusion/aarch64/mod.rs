@@ -12,6 +12,7 @@
 
 #![cfg(target_arch = "aarch64")]
 
+mod asm;
 mod iscsi;
 mod iso_hdlc;
 mod lanes;
@@ -21,12 +22,32 @@ use core::arch::aarch64::*;
 
 use crate::feature_detection::PerformanceTier;
 
+#[cfg(all(
+    target_endian = "little",
+    any(target_os = "linux", target_os = "android")
+))]
+use asm::{
+    crc32_iscsi_eor3_v4, crc32_iscsi_loop, crc32_iscsi_short, crc32_iso_hdlc_eor3_v4,
+    crc32_iso_hdlc_loop, crc32_iso_hdlc_short,
+};
 use iscsi::crc_pmull_sha3::crc32_iscsi_eor3_v9s3x2e_s3;
 use iso_hdlc::crc_pmull_sha3::crc32_iso_hdlc_eor3_v9s3x2e_s3;
+#[cfg(not(all(
+    target_endian = "little",
+    any(target_os = "linux", target_os = "android")
+)))]
+use lanes::{crc32_iscsi_eor3_v4, crc32_iso_hdlc_eor3_v4};
+#[cfg(not(all(
+    target_endian = "little",
+    any(target_os = "linux", target_os = "android")
+)))]
+use {
+    crc32_iscsi_small_fast as crc32_iscsi_loop, crc32_iso_hdlc_small_fast as crc32_iso_hdlc_loop,
+};
+
 use lanes::{
-    crc32_iscsi_eor3_v4, crc32_iscsi_eor3_v8, crc32_iscsi_v3s4, crc32_iscsi_v4, crc32_iscsi_v8,
-    crc32_iso_hdlc_eor3_v4, crc32_iso_hdlc_eor3_v8, crc32_iso_hdlc_v3s4, crc32_iso_hdlc_v4,
-    crc32_iso_hdlc_v8,
+    crc32_iscsi_eor3_v8, crc32_iscsi_v3s4, crc32_iscsi_v4, crc32_iscsi_v8, crc32_iso_hdlc_eor3_v8,
+    crc32_iso_hdlc_v3s4, crc32_iso_hdlc_v4, crc32_iso_hdlc_v8,
 };
 
 /// Buffers shorter than this run the unrolled CRC32 instruction loop; from here the four-lane
@@ -43,10 +64,18 @@ pub(crate) const LARGE_BUFFER_THRESHOLD: usize = 2048;
 
 /// Buffers shorter than this run the SHA3 tier's CRC32 instruction loop. At 64 bytes the loop
 /// ran 12.8 GB/s on Graviton 3 against the four-lane fold's 9.2 to 10.4, and 17.2 to 17.5 on
-/// Graviton 4 against 13.8 to 14.9; from 80 bytes the two were level within the noise. Apple's
-/// cores, where this was not measured, keep [`SMALL_BUFFER_END`].
+/// Graviton 4 against 13.8 to 14.9; from 80 bytes the two compiled kernels were level within
+/// the noise. On Linux and Android, where both are the assembly in `asm`, the loop runs to 128
+/// bytes: from 80 to 112 bytes it ran 1.17x to 1.22x of the assembly fold on Graviton 3 and
+/// 1.01x to 1.49x on Graviton 4 from an aligned start, 0.99x to 1.18x from an unaligned one
+/// (2026-11-23). Apple's cores, where this was not measured, keep [`SMALL_BUFFER_END`].
 const SHA3_SMALL_END: usize = if cfg!(target_vendor = "apple") {
     SMALL_BUFFER_END
+} else if cfg!(all(
+    target_endian = "little",
+    any(target_os = "linux", target_os = "android")
+)) {
+    128
 } else {
     80
 };
@@ -122,7 +151,7 @@ pub(crate) unsafe fn crc32_iscsi_with(kernel: FusionKernel, crc: u32, data: &[u8
             crc32_iscsi_short(crc, data)
         } else if kernel == FusionKernel::PmullSha3 {
             if len < SHA3_SMALL_END {
-                crc32_iscsi_small_fast(crc, data)
+                crc32_iscsi_loop(crc, data)
             } else if len < FOUR_LANE_END {
                 crc32_iscsi_eor3_v4(crc, ptr, len)
             } else if len < LARGE_BUFFER_THRESHOLD {
@@ -131,7 +160,7 @@ pub(crate) unsafe fn crc32_iscsi_with(kernel: FusionKernel, crc: u32, data: &[u8
                 crc32_iscsi_eor3_v9s3x2e_s3(crc, ptr, len)
             }
         } else if len < PMULL_SMALL_END {
-            crc32_iscsi_small_fast(crc, data)
+            crc32_iscsi_loop(crc, data)
         } else if len < FOUR_LANE_END {
             crc32_iscsi_v4(crc, ptr, len)
         } else if len < PMULL_STREAM_THRESHOLD {
@@ -158,7 +187,7 @@ pub(crate) unsafe fn crc32_iso_hdlc_with(kernel: FusionKernel, crc: u32, data: &
             crc32_iso_hdlc_short(crc, data)
         } else if kernel == FusionKernel::PmullSha3 {
             if len < SHA3_SMALL_END {
-                crc32_iso_hdlc_small_fast(crc, data)
+                crc32_iso_hdlc_loop(crc, data)
             } else if len < FOUR_LANE_END {
                 crc32_iso_hdlc_eor3_v4(crc, ptr, len)
             } else if len < LARGE_BUFFER_THRESHOLD {
@@ -167,7 +196,7 @@ pub(crate) unsafe fn crc32_iso_hdlc_with(kernel: FusionKernel, crc: u32, data: &
                 crc32_iso_hdlc_eor3_v9s3x2e_s3(crc, ptr, len)
             }
         } else if len < PMULL_SMALL_END {
-            crc32_iso_hdlc_small_fast(crc, data)
+            crc32_iso_hdlc_loop(crc, data)
         } else if len < FOUR_LANE_END {
             crc32_iso_hdlc_v4(crc, ptr, len)
         } else if len < PMULL_STREAM_THRESHOLD {
@@ -342,7 +371,12 @@ pub unsafe fn crc32_iscsi_small_fast(mut crc: u32, data: &[u8]) -> u32 {
 /// 64-byte loop. A separate function, as one call site for each length range leaves the
 /// compiler free to fit each to its range: called for the short buffers and the longer ones
 /// alike, CRC-32/ISCSI and CRC-32/ISO-HDLC from 16 to 48 bytes ran at 0.78x to 0.92x of
-/// 2ee9ff1's speed on Graviton 2, 3 and 4.
+/// 2ee9ff1's speed on Graviton 2, 3 and 4. Linux and Android take the assembly copy in
+/// `asm` instead, which fixes where the loop sits.
+#[cfg(not(all(
+    target_endian = "little",
+    any(target_os = "linux", target_os = "android")
+)))]
 #[inline]
 #[target_feature(enable = "crc")]
 unsafe fn crc32_iscsi_short(mut crc: u32, data: &[u8]) -> u32 {
@@ -358,6 +392,10 @@ pub unsafe fn crc32_iso_hdlc_small_fast(mut crc: u32, data: &[u8]) -> u32 {
 }
 
 /// [`crc32_iscsi_short`] for CRC-32/ISO-HDLC.
+#[cfg(not(all(
+    target_endian = "little",
+    any(target_os = "linux", target_os = "android")
+)))]
 #[inline]
 #[target_feature(enable = "crc")]
 unsafe fn crc32_iso_hdlc_short(mut crc: u32, data: &[u8]) -> u32 {
@@ -508,6 +546,28 @@ mod tests {
         unsafe { crc32_iso_hdlc_short(crc, core::slice::from_raw_parts(buf, len)) }
     }
 
+    unsafe fn loop_iscsi(crc: u32, buf: *const u8, len: usize) -> u32 {
+        // SAFETY: the caller holds `len` bytes at `buf` and checked for CRC32
+        unsafe { crc32_iscsi_loop(crc, core::slice::from_raw_parts(buf, len)) }
+    }
+
+    unsafe fn loop_iso_hdlc(crc: u32, buf: *const u8, len: usize) -> u32 {
+        // SAFETY: as for `loop_iscsi`
+        unsafe { crc32_iso_hdlc_loop(crc, core::slice::from_raw_parts(buf, len)) }
+    }
+
+    /// The CRC32 instruction loops the dispatch calls, the assembly on Linux and Android,
+    /// agree with the reference across their 64-byte turns and every tail.
+    #[test]
+    fn loop_entry_points_agree_with_the_reference() {
+        assert!(std::arch::is_aarch64_feature_detected!("crc"));
+        let kernels: [(&str, Kernel, bool); 2] = [
+            ("loop iscsi", loop_iscsi, true),
+            ("loop iso-hdlc", loop_iso_hdlc, false),
+        ];
+        kernels_agree(&kernels, &(0..=1100).collect::<Vec<_>>());
+    }
+
     /// The short entry points, called directly, agree with the reference at every length they
     /// are given, from every start offset within 16 bytes, carrying a prefix's state.
     #[test]
@@ -632,6 +692,22 @@ mod tests {
             ("iso_hdlc_eor3_v4", lanes::crc32_iso_hdlc_eor3_v4, false),
             ("iso_hdlc_eor3_v8", lanes::crc32_iso_hdlc_eor3_v8, false),
         ]);
+    }
+
+    /// The four-lane EOR3 kernels dispatch calls, the assembly copies on Linux and Android,
+    /// agree with the reference at every length they are given, from 64 bytes, from every
+    /// start offset within 16 bytes, carrying a prefix's state.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn dispatched_eor3_v4_agrees_with_the_reference() {
+        if !std::arch::is_aarch64_feature_detected!("sha3") {
+            return;
+        }
+        let kernels: [(&str, Kernel, bool); 2] = [
+            ("dispatched iscsi_eor3_v4", crc32_iscsi_eor3_v4, true),
+            ("dispatched iso_hdlc_eor3_v4", crc32_iso_hdlc_eor3_v4, false),
+        ];
+        kernels_agree(&kernels, &(64..=2200).collect::<Vec<_>>());
     }
 
     #[test]

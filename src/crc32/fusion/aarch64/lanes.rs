@@ -194,7 +194,12 @@ lane_kernel!(
     __crc32cd, __crc32cb, VECTOR_TAIL_PMULL
 );
 lane_kernel!(
-    /// CRC-32/ISCSI, four lanes, EOR3 folds.
+    /// CRC-32/ISCSI, four lanes, EOR3 folds. Linux and Android run the
+    /// assembly copy in `asm`, which fixes where the kernel sits.
+    #[cfg_attr(
+        all(target_endian = "little", any(target_os = "linux", target_os = "android")),
+        allow(dead_code)
+    )]
     crc32_iscsi_eor3_v4, 4, "crc,aes,sha3", fold_eor3, shifts::iscsi_fold_keys, __crc32cd,
     __crc32cb, true
 );
@@ -214,7 +219,12 @@ lane_kernel!(
     __crc32d, __crc32b, VECTOR_TAIL_PMULL
 );
 lane_kernel!(
-    /// CRC-32/ISO-HDLC, four lanes, EOR3 folds.
+    /// CRC-32/ISO-HDLC, four lanes, EOR3 folds. Linux and Android run the
+    /// assembly copy in `asm`, which fixes where the kernel sits.
+    #[cfg_attr(
+        all(target_endian = "little", any(target_os = "linux", target_os = "android")),
+        allow(dead_code)
+    )]
     crc32_iso_hdlc_eor3_v4, 4, "crc,aes,sha3", fold_eor3, shifts::iso_hdlc_fold_keys, __crc32d,
     __crc32b, true
 );

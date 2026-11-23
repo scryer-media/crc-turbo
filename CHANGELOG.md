@@ -218,6 +218,12 @@ own changelog up to the fork point continues below, unchanged.
   issues every multiply before its three-way XORs, as crc-fast does.
   Below 64 bytes every tier calls a copy of the loop without its 64-byte
   block step, so that the compiler fits each copy to its length range.
+- On aarch64 Linux and Android those loops (below 64 bytes; on the SHA3
+  tier below 128 bytes, on the PMULL tier below 1 KiB) and the SHA3 tier's
+  four-lane fold (128 to 255 bytes) are assembly shipped in the crate, so
+  every consumer's compiler builds the same instructions at the same
+  64-byte alignment. The compiled loops and fold stay as the other targets'
+  path and as the tests' reference.
 - `checksum` naming CRC-32/ISCSI or CRC-32/ISO-HDLC is that algorithm's
   entry point inlined, not a match over every algorithm.
 - The other algorithms fold a buffer from 128 bytes to 256 KiB from
@@ -738,6 +744,37 @@ own changelog up to the fork point continues below, unchanged.
   and 4. A test calls the short copies directly at every length below 64
   bytes from 16 start offsets with a carried state, and the dispatch test
   covers each new threshold on either side. Apple's paths are unchanged.
+- aarch64 Linux and Android, CRC-32/ISCSI and CRC-32/ISO-HDLC: the CRC32
+  instruction loops and the SHA3 tier's four-lane fold are now assembly in
+  the crate (`crc32::fusion::aarch64::asm`), each one `asm!` block in a
+  non-generic `#[inline(never)]` function with the C calling convention:
+  the compiler adds only the return, and the block's opening `.p2align 6`
+  raises the alignment of the function's own section, so the entry sits on
+  a 64-byte boundary with no padding executed. Compiled, the short loop
+  matched 2ee9ff1 instruction for instruction yet ran 0.90x to 0.93x of it
+  from 16 to 48 bytes on Graviton 3 and 4, a cycle that moved with where the
+  code sat; how a consumer's compiler and profile place compiled code is
+  not this crate's to fix, so the hot code is no longer compiled. The SHA3
+  tier runs the loop to 128 bytes on these targets, where it ran 1.17x to
+  1.22x of the assembly fold from 80 to 112 bytes on Graviton 3 and 1.01x
+  to 1.49x on Graviton 4 (aligned start; unaligned 0.99x to 1.18x). Tests
+  call each assembly entry directly at every length to 1100 bytes from 16
+  start offsets with a carried state; on Graviton 2, 3 and 4 a changed step
+  bit or loop condition in the assembly failed them, and on Graviton 3 and
+  4 a changed fold key. In two batches of seven interleaved rounds on
+  Graviton 2, 3 and 4, from 16 bytes to 1 MiB, aligned and unaligned, both
+  algorithms ran at or above 1.00x of 1.11.0 in every cell of the first
+  batch (1.01x to 3.7x); in the second, one cell (Graviton 3, ISO-HDLC,
+  64 KiB from an unaligned start) ran 0.96x. Against 2ee9ff1, Graviton 2
+  was 0.96x to 1.67x; Graviton 3 ran 0.79x to 0.88x from 80 to 112 bytes
+  from an unaligned start and 0.93x to 0.97x
+  for some cells from 96 bytes to 1 KiB, and Graviton 4 0.89x to 0.98x for
+  some cells from 96 bytes to 1 KiB, where the SHA3 tier's assembly fold
+  ran slower than 2ee9ff1's compiled one. Built with Rust 1.101 beta and
+  1.102 nightly on Graviton 3, CRC-32/ISCSI ran 0.96x to 1.05x of the
+  pinned 1.97.1 build, but CRC-32/ISO-HDLC from 16 to 64 bytes ran 0.90x to
+  0.92x: the dispatch around the assembly is still compiled. The other
+  targets, Apple's included, keep the compiled code.
 - With that kernel, the direct call above and this release's aarch64 short paths,
   CRC-32/ISCSI and CRC-32/ISO-HDLC against 1.11.0 on Graviton, median of
   seven interleaved rounds, checksums compared first and the test suite
