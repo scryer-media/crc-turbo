@@ -22,32 +22,190 @@ use core::arch::aarch64::*;
 
 use crate::feature_detection::PerformanceTier;
 
+use iscsi::crc_pmull_sha3::crc32_iscsi_eor3_v9s3x2e_s3;
+use iso_hdlc::crc_pmull_sha3::crc32_iso_hdlc_eor3_v9s3x2e_s3;
+use lanes::{
+    crc32_iscsi_eor3_v8, crc32_iscsi_v3s4, crc32_iscsi_v4, crc32_iscsi_v8, crc32_iso_hdlc_eor3_v8,
+    crc32_iso_hdlc_v3s4, crc32_iso_hdlc_v4, crc32_iso_hdlc_v8,
+};
+
+/// Each kernel the dispatch calls, as `(crc, buf, len, xorout)`: the CRC of the `len` bytes at
+/// `buf` from `crc`, plus `xorout`. On Linux and Android each is a function of its own that
+/// applies `xorout` itself, as fast-crc32's kernels apply their final complement, so that the
+/// dispatch's call to it is the last thing the dispatch does: a jump, with no frame around it
+/// and nothing after it. Elsewhere each is the kernel inlined with the XOR after it, the code
+/// those targets ran before.
+macro_rules! entry_points {
+    (
+        $module:ident, short: $short:path, small: $small:path, eor3_v4: $eor3_v4:path,
+        eor3_v8: $eor3_v8:ident, eor3_large: $eor3_large:ident, v4: $v4:ident, v8: $v8:ident,
+        streams: $streams:ident, eor3_v4_compiled: $eor3_v4_compiled:path
+    ) => {
+        /// The kernels as the dispatch calls them; see [`entry_points`].
+        mod $module {
+            #[cfg(all(
+                target_endian = "little",
+                any(target_os = "linux", target_os = "android")
+            ))]
+            mod imp {
+                /// A compiled kernel, out of line, plus `xorout`.
+                macro_rules! out_of_line {
+                    ($name:ident, $kernel:path, $features:literal) => {
+                        #[inline(never)]
+                        #[target_feature(enable = $features)]
+                        pub(in super::super) unsafe fn $name(
+                            crc: u32,
+                            buf: *const u8,
+                            len: usize,
+                            xorout: u32,
+                        ) -> u32 {
+                            // SAFETY: the caller holds `len` bytes at `buf` and checked the
+                            // features
+                            unsafe { $kernel(crc, buf, len) ^ xorout }
+                        }
+                    };
+                }
+
+                out_of_line!(eor3_v8, super::super::$eor3_v8, "crc,aes,sha3");
+                out_of_line!(eor3_large, super::super::$eor3_large, "crc,aes,sha3");
+                out_of_line!(v4, super::super::$v4, "crc,aes");
+                out_of_line!(v8, super::super::$v8, "crc,aes");
+                out_of_line!(streams, super::super::$streams, "crc,aes");
+
+                /// The assembly loop for a buffer shorter than 64 bytes.
+                #[inline(always)]
+                pub(in super::super) unsafe fn short(
+                    crc: u32,
+                    buf: *const u8,
+                    len: usize,
+                    xorout: u32,
+                ) -> u32 {
+                    // SAFETY: as for the assembly
+                    unsafe { $short(crc, core::slice::from_raw_parts(buf, len), xorout) }
+                }
+
+                /// The assembly CRC32 instruction loop.
+                #[inline(always)]
+                pub(in super::super) unsafe fn small(
+                    crc: u32,
+                    buf: *const u8,
+                    len: usize,
+                    xorout: u32,
+                ) -> u32 {
+                    // SAFETY: as for the assembly
+                    unsafe { $small(crc, core::slice::from_raw_parts(buf, len), xorout) }
+                }
+
+                /// The assembly four-lane EOR3 fold.
+                #[inline(always)]
+                pub(in super::super) unsafe fn eor3_v4(
+                    crc: u32,
+                    buf: *const u8,
+                    len: usize,
+                    xorout: u32,
+                ) -> u32 {
+                    // SAFETY: as for the assembly
+                    unsafe { $eor3_v4(crc, buf, len, xorout) }
+                }
+            }
+
+            #[cfg(not(all(
+                target_endian = "little",
+                any(target_os = "linux", target_os = "android")
+            )))]
+            mod imp {
+                /// A kernel inlined, plus `xorout`.
+                macro_rules! inlined {
+                    ($name:ident, $kernel:path) => {
+                        #[inline(always)]
+                        pub(in super::super) unsafe fn $name(
+                            crc: u32,
+                            buf: *const u8,
+                            len: usize,
+                            xorout: u32,
+                        ) -> u32 {
+                            // SAFETY: the caller holds `len` bytes at `buf` and checked the
+                            // features
+                            unsafe { $kernel(crc, buf, len) ^ xorout }
+                        }
+                    };
+                }
+
+                /// A loop over a slice, inlined, plus `xorout`.
+                macro_rules! inlined_slice {
+                    ($name:ident, $kernel:path) => {
+                        #[inline(always)]
+                        pub(in super::super) unsafe fn $name(
+                            crc: u32,
+                            buf: *const u8,
+                            len: usize,
+                            xorout: u32,
+                        ) -> u32 {
+                            // SAFETY: the caller holds `len` bytes at `buf` and checked the
+                            // features
+                            unsafe { $kernel(crc, core::slice::from_raw_parts(buf, len)) ^ xorout }
+                        }
+                    };
+                }
+
+                inlined_slice!(short, $short);
+                inlined_slice!(small, $small);
+                inlined!(eor3_v4, $eor3_v4_compiled);
+                inlined!(eor3_v8, super::super::$eor3_v8);
+                inlined!(eor3_large, super::super::$eor3_large);
+                inlined!(v4, super::super::$v4);
+                inlined!(v8, super::super::$v8);
+                inlined!(streams, super::super::$streams);
+            }
+
+            pub(super) use imp::*;
+        }
+    };
+}
+
+entry_points!(
+    iscsi_entry,
+    short: super::super::short_iscsi_entry,
+    small: super::super::small_iscsi_entry,
+    eor3_v4: super::super::asm_eor3_v4_iscsi,
+    eor3_v8: crc32_iscsi_eor3_v8,
+    eor3_large: crc32_iscsi_eor3_v9s3x2e_s3,
+    v4: crc32_iscsi_v4,
+    v8: crc32_iscsi_v8,
+    streams: crc32_iscsi_v3s4,
+    eor3_v4_compiled: super::super::lanes::crc32_iscsi_eor3_v4
+);
+
+entry_points!(
+    iso_hdlc_entry,
+    short: super::super::short_iso_hdlc_entry,
+    small: super::super::small_iso_hdlc_entry,
+    eor3_v4: super::super::asm_eor3_v4_iso_hdlc,
+    eor3_v8: crc32_iso_hdlc_eor3_v8,
+    eor3_large: crc32_iso_hdlc_eor3_v9s3x2e_s3,
+    v4: crc32_iso_hdlc_v4,
+    v8: crc32_iso_hdlc_v8,
+    streams: crc32_iso_hdlc_v3s4,
+    eor3_v4_compiled: super::super::lanes::crc32_iso_hdlc_eor3_v4
+);
+
 #[cfg(all(
     target_endian = "little",
     any(target_os = "linux", target_os = "android")
 ))]
 use asm::{
-    crc32_iscsi_eor3_v4, crc32_iscsi_loop, crc32_iscsi_short, crc32_iso_hdlc_eor3_v4,
-    crc32_iso_hdlc_loop, crc32_iso_hdlc_short,
+    crc32_iscsi_eor3_v4 as asm_eor3_v4_iscsi, crc32_iscsi_loop as small_iscsi_entry,
+    crc32_iscsi_short as short_iscsi_entry, crc32_iso_hdlc_eor3_v4 as asm_eor3_v4_iso_hdlc,
+    crc32_iso_hdlc_loop as small_iso_hdlc_entry, crc32_iso_hdlc_short as short_iso_hdlc_entry,
 };
-use iscsi::crc_pmull_sha3::crc32_iscsi_eor3_v9s3x2e_s3;
-use iso_hdlc::crc_pmull_sha3::crc32_iso_hdlc_eor3_v9s3x2e_s3;
-#[cfg(not(all(
-    target_endian = "little",
-    any(target_os = "linux", target_os = "android")
-)))]
-use lanes::{crc32_iscsi_eor3_v4, crc32_iso_hdlc_eor3_v4};
 #[cfg(not(all(
     target_endian = "little",
     any(target_os = "linux", target_os = "android")
 )))]
 use {
-    crc32_iscsi_small_fast as crc32_iscsi_loop, crc32_iso_hdlc_small_fast as crc32_iso_hdlc_loop,
-};
-
-use lanes::{
-    crc32_iscsi_eor3_v8, crc32_iscsi_v3s4, crc32_iscsi_v4, crc32_iscsi_v8, crc32_iso_hdlc_eor3_v8,
-    crc32_iso_hdlc_v3s4, crc32_iso_hdlc_v4, crc32_iso_hdlc_v8,
+    crc32_iscsi_short as short_iscsi_entry, crc32_iscsi_small_fast as small_iscsi_entry,
+    crc32_iso_hdlc_short as short_iso_hdlc_entry,
+    crc32_iso_hdlc_small_fast as small_iso_hdlc_entry,
 };
 
 /// Buffers shorter than this run the unrolled CRC32 instruction loop; from here the four-lane
@@ -65,17 +223,19 @@ pub(crate) const LARGE_BUFFER_THRESHOLD: usize = 2048;
 /// Buffers shorter than this run the SHA3 tier's CRC32 instruction loop. At 64 bytes the loop
 /// ran 12.8 GB/s on Graviton 3 against the four-lane fold's 9.2 to 10.4, and 17.2 to 17.5 on
 /// Graviton 4 against 13.8 to 14.9; from 80 bytes the two compiled kernels were level within
-/// the noise. On Linux and Android, where both are the assembly in `asm`, the loop runs to 128
-/// bytes: from 80 to 112 bytes it ran 1.17x to 1.22x of the assembly fold on Graviton 3 and
-/// 1.01x to 1.49x on Graviton 4 from an aligned start, 0.99x to 1.18x from an unaligned one
-/// (2026-11-23). Apple's cores, where this was not measured, keep [`SMALL_BUFFER_END`].
+/// the noise. On Linux and Android, where both are the assembly in `asm` and each kernel applies
+/// the final complement itself, so that dispatch jumps to it, the loop runs to 96 bytes and the
+/// four-lane fold from there, the length fast-crc32's `v4` wins from on Graviton 4. With the
+/// loop to 128 bytes, CRC-32/ISO-HDLC at 112 bytes ran 0.90x to 0.94x of fast-crc32's `v8` on
+/// Graviton 3 in two batches, and 1.06x with the fold from 96 (2026-11-23). Apple's cores,
+/// where this was not measured, keep [`SMALL_BUFFER_END`].
 const SHA3_SMALL_END: usize = if cfg!(target_vendor = "apple") {
     SMALL_BUFFER_END
 } else if cfg!(all(
     target_endian = "little",
     any(target_os = "linux", target_os = "android")
 )) {
-    128
+    96
 } else {
     80
 };
@@ -127,20 +287,26 @@ pub(crate) fn select_kernel(tier: PerformanceTier, has_crc: bool) -> Option<Fusi
     }
 }
 
-/// CRC-32/ISCSI through `kernel`. The SHA3 tier runs the CRC32 instruction loop below
-/// [`SHA3_SMALL_END`] bytes, then the four-lane fold, the eight-lane fold, and from
+/// CRC-32/ISCSI through `kernel`, plus `xorout`. The SHA3 tier runs the CRC32 instruction loop
+/// below [`SHA3_SMALL_END`] bytes, then the four-lane fold, the eight-lane fold, and from
 /// [`LARGE_BUFFER_THRESHOLD`] its EOR3 kernel with three CRC32 streams beside its fold
 /// (`v9s3x2e_s3`). The PMULL tier runs the loop below [`PMULL_SMALL_END`], the lane folds
 /// where that leaves room before [`PMULL_STREAM_THRESHOLD`] (on Apple's cores), and from there
-/// four CRC32 streams beside a three-lane fold (`v3s4x2e_v2`). Each is a direct call, so where
-/// the target already has the features the caller calls the loop or the fold itself, with
-/// nothing in between.
+/// four CRC32 streams beside a three-lane fold (`v3s4x2e_v2`). Each arm ends in its kernel,
+/// which applies `xorout` (see [`entry_points`]).
 ///
 /// # Safety
 ///
 /// `kernel` came from [`select_kernel`] for the tier the CPU runs.
 #[inline(always)]
-pub(crate) unsafe fn crc32_iscsi_with(kernel: FusionKernel, crc: u32, data: &[u8]) -> u32 {
+pub(crate) unsafe fn crc32_iscsi_with(
+    kernel: FusionKernel,
+    crc: u32,
+    data: &[u8],
+    xorout: u32,
+) -> u32 {
+    use iscsi_entry as k;
+
     let (ptr, len) = (data.as_ptr(), data.len());
     // SAFETY: either kernel is only selected for a tier with PMULL, and the EOR3 one for the
     // tier with SHA3, after detecting the CRC32 instructions
@@ -148,61 +314,66 @@ pub(crate) unsafe fn crc32_iscsi_with(kernel: FusionKernel, crc: u32, data: &[u8
         // The shortest buffers take the loop before the kernel is looked at, so every tier
         // runs the same code for them.
         if len < SMALL_BUFFER_END {
-            crc32_iscsi_short(crc, data)
+            k::short(crc, ptr, len, xorout)
         } else if kernel == FusionKernel::PmullSha3 {
             if len < SHA3_SMALL_END {
-                crc32_iscsi_loop(crc, data)
+                k::small(crc, ptr, len, xorout)
             } else if len < FOUR_LANE_END {
-                crc32_iscsi_eor3_v4(crc, ptr, len)
+                k::eor3_v4(crc, ptr, len, xorout)
             } else if len < LARGE_BUFFER_THRESHOLD {
-                crc32_iscsi_eor3_v8(crc, ptr, len)
+                k::eor3_v8(crc, ptr, len, xorout)
             } else {
-                crc32_iscsi_eor3_v9s3x2e_s3(crc, ptr, len)
+                k::eor3_large(crc, ptr, len, xorout)
             }
         } else if len < PMULL_SMALL_END {
-            crc32_iscsi_loop(crc, data)
+            k::small(crc, ptr, len, xorout)
         } else if len < FOUR_LANE_END {
-            crc32_iscsi_v4(crc, ptr, len)
+            k::v4(crc, ptr, len, xorout)
         } else if len < PMULL_STREAM_THRESHOLD {
-            crc32_iscsi_v8(crc, ptr, len)
+            k::v8(crc, ptr, len, xorout)
         } else {
-            crc32_iscsi_v3s4(crc, ptr, len)
+            k::streams(crc, ptr, len, xorout)
         }
     }
 }
 
-/// CRC-32/ISO-HDLC through `kernel`; see [`crc32_iscsi_with`].
+/// CRC-32/ISO-HDLC through `kernel`, plus `xorout`; see [`crc32_iscsi_with`].
 ///
 /// # Safety
 ///
 /// `kernel` came from [`select_kernel`] for the tier the CPU runs.
 #[inline(always)]
-pub(crate) unsafe fn crc32_iso_hdlc_with(kernel: FusionKernel, crc: u32, data: &[u8]) -> u32 {
+pub(crate) unsafe fn crc32_iso_hdlc_with(
+    kernel: FusionKernel,
+    crc: u32,
+    data: &[u8],
+    xorout: u32,
+) -> u32 {
+    use iso_hdlc_entry as k;
+
     let (ptr, len) = (data.as_ptr(), data.len());
     // SAFETY: as for `crc32_iscsi_with`
     unsafe {
-        // The shortest buffers take the loop before the kernel is looked at, so every tier
-        // runs the same code for them.
         if len < SMALL_BUFFER_END {
-            crc32_iso_hdlc_short(crc, data)
+            k::short(crc, ptr, len, xorout)
         } else if kernel == FusionKernel::PmullSha3 {
             if len < SHA3_SMALL_END {
-                crc32_iso_hdlc_loop(crc, data)
+                k::small(crc, ptr, len, xorout)
             } else if len < FOUR_LANE_END {
-                crc32_iso_hdlc_eor3_v4(crc, ptr, len)
+                k::eor3_v4(crc, ptr, len, xorout)
             } else if len < LARGE_BUFFER_THRESHOLD {
-                crc32_iso_hdlc_eor3_v8(crc, ptr, len)
+                k::eor3_v8(crc, ptr, len, xorout)
             } else {
-                crc32_iso_hdlc_eor3_v9s3x2e_s3(crc, ptr, len)
+                k::eor3_large(crc, ptr, len, xorout)
             }
         } else if len < PMULL_SMALL_END {
-            crc32_iso_hdlc_loop(crc, data)
+            k::small(crc, ptr, len, xorout)
         } else if len < FOUR_LANE_END {
-            crc32_iso_hdlc_v4(crc, ptr, len)
+            k::v4(crc, ptr, len, xorout)
         } else if len < PMULL_STREAM_THRESHOLD {
-            crc32_iso_hdlc_v8(crc, ptr, len)
+            k::v8(crc, ptr, len, xorout)
         } else {
-            crc32_iso_hdlc_v3s4(crc, ptr, len)
+            k::streams(crc, ptr, len, xorout)
         }
     }
 }
@@ -429,13 +600,13 @@ mod tests {
     /// CRC-32/ISCSI through a kernel the test has already checked this CPU can run.
     fn iscsi(kernel: FusionKernel, crc: u32, data: &[u8]) -> u32 {
         // SAFETY: every caller picks the kernel from the features it detected
-        unsafe { crc32_iscsi_with(kernel, crc, data) }
+        unsafe { crc32_iscsi_with(kernel, crc, data, 0) }
     }
 
     /// CRC-32/ISO-HDLC through a kernel the test has already checked this CPU can run.
     fn iso_hdlc(kernel: FusionKernel, crc: u32, data: &[u8]) -> u32 {
         // SAFETY: as for `iscsi`
-        unsafe { crc32_iso_hdlc_with(kernel, crc, data) }
+        unsafe { crc32_iso_hdlc_with(kernel, crc, data, 0) }
     }
 
     fn crc32_iscsi(crc: u32, data: &[u8]) -> u32 {
@@ -489,6 +660,50 @@ mod tests {
         }
     }
 
+    /// Each kernel applies the caller's `xorout` itself, the way dispatch hands it the final
+    /// complement: through every length range of both tiers this CPU has, from aligned and
+    /// unaligned starts, the result with the complement applied is the reference checksum, and a
+    /// carried state with another `xorout` is that state's update with it applied.
+    #[test]
+    fn kernels_apply_the_callers_xorout() {
+        let mut kernels = vec![FusionKernel::Pmull];
+        if std::arch::is_aarch64_feature_detected!("sha3") {
+            kernels.push(FusionKernel::PmullSha3);
+        }
+        let mut data = vec![0u8; 8192 + 3];
+        rng().fill(&mut data[..]);
+        let lens = (0..=300).chain([511, 512, 1023, 1024, 1025, 2047, 2048, 2049, 4099, 8192]);
+        for kernel in kernels {
+            for len in lens.clone() {
+                for offset in [0, 3] {
+                    let slice = &data[offset..offset + len];
+                    // SAFETY: the kernel is one this CPU was checked for
+                    let (iscsi_out, iso_out, iscsi_mixed, iso_mixed) = unsafe {
+                        (
+                            crc32_iscsi_with(kernel, !0, slice, !0),
+                            crc32_iso_hdlc_with(kernel, !0, slice, !0),
+                            crc32_iscsi_with(kernel, 0x1234_5678, slice, 0x0f0f_0f0f),
+                            crc32_iso_hdlc_with(kernel, 0x1234_5678, slice, 0x0f0f_0f0f),
+                        )
+                    };
+                    let what = format!("{kernel:?} len {len} offset {offset}");
+                    assert_eq!(iscsi_out, RUST_CRC32_ISCSI.checksum(slice), "iscsi {what}");
+                    assert_eq!(iso_out, RUST_CRC32_ISO_HDLC.checksum(slice), "iso {what}");
+                    assert_eq!(
+                        iscsi_mixed,
+                        iscsi(kernel, 0x1234_5678, slice) ^ 0x0f0f_0f0f,
+                        "iscsi carried {what}"
+                    );
+                    assert_eq!(
+                        iso_mixed,
+                        iso_hdlc(kernel, 0x1234_5678, slice) ^ 0x0f0f_0f0f,
+                        "iso carried {what}"
+                    );
+                }
+            }
+        }
+    }
+
     type Kernel = unsafe fn(u32, *const u8, usize) -> u32;
 
     unsafe fn pmull_iscsi(crc: u32, buf: *const u8, len: usize) -> u32 {
@@ -498,6 +713,7 @@ mod tests {
                 FusionKernel::Pmull,
                 crc,
                 core::slice::from_raw_parts(buf, len),
+                0,
             )
         }
     }
@@ -509,6 +725,7 @@ mod tests {
                 FusionKernel::Pmull,
                 crc,
                 core::slice::from_raw_parts(buf, len),
+                0,
             )
         }
     }
@@ -520,6 +737,7 @@ mod tests {
                 FusionKernel::PmullSha3,
                 crc,
                 core::slice::from_raw_parts(buf, len),
+                0,
             )
         }
     }
@@ -531,6 +749,7 @@ mod tests {
                 FusionKernel::PmullSha3,
                 crc,
                 core::slice::from_raw_parts(buf, len),
+                0,
             )
         }
     }
@@ -538,22 +757,22 @@ mod tests {
     unsafe fn short_iscsi(crc: u32, buf: *const u8, len: usize) -> u32 {
         // SAFETY: the caller holds `len` bytes at `buf`, fewer than `SMALL_BUFFER_END`, and
         // checked for CRC32
-        unsafe { crc32_iscsi_short(crc, core::slice::from_raw_parts(buf, len)) }
+        unsafe { iscsi_entry::short(crc, buf, len, 0) }
     }
 
     unsafe fn short_iso_hdlc(crc: u32, buf: *const u8, len: usize) -> u32 {
         // SAFETY: as for `short_iscsi`
-        unsafe { crc32_iso_hdlc_short(crc, core::slice::from_raw_parts(buf, len)) }
+        unsafe { iso_hdlc_entry::short(crc, buf, len, 0) }
     }
 
     unsafe fn loop_iscsi(crc: u32, buf: *const u8, len: usize) -> u32 {
         // SAFETY: the caller holds `len` bytes at `buf` and checked for CRC32
-        unsafe { crc32_iscsi_loop(crc, core::slice::from_raw_parts(buf, len)) }
+        unsafe { iscsi_entry::small(crc, buf, len, 0) }
     }
 
     unsafe fn loop_iso_hdlc(crc: u32, buf: *const u8, len: usize) -> u32 {
         // SAFETY: as for `loop_iscsi`
-        unsafe { crc32_iso_hdlc_loop(crc, core::slice::from_raw_parts(buf, len)) }
+        unsafe { iso_hdlc_entry::small(crc, buf, len, 0) }
     }
 
     /// The CRC32 instruction loops the dispatch calls, the assembly on Linux and Android,
@@ -703,9 +922,17 @@ mod tests {
         if !std::arch::is_aarch64_feature_detected!("sha3") {
             return;
         }
+        unsafe fn iscsi_v4(crc: u32, buf: *const u8, len: usize) -> u32 {
+            // SAFETY: the caller holds `len` bytes at `buf` and checked for SHA3
+            unsafe { iscsi_entry::eor3_v4(crc, buf, len, 0) }
+        }
+        unsafe fn iso_hdlc_v4(crc: u32, buf: *const u8, len: usize) -> u32 {
+            // SAFETY: as for `iscsi_v4`
+            unsafe { iso_hdlc_entry::eor3_v4(crc, buf, len, 0) }
+        }
         let kernels: [(&str, Kernel, bool); 2] = [
-            ("dispatched iscsi_eor3_v4", crc32_iscsi_eor3_v4, true),
-            ("dispatched iso_hdlc_eor3_v4", crc32_iso_hdlc_eor3_v4, false),
+            ("dispatched iscsi_eor3_v4", iscsi_v4, true),
+            ("dispatched iso_hdlc_eor3_v4", iso_hdlc_v4, false),
         ];
         kernels_agree(&kernels, &(64..=2200).collect::<Vec<_>>());
     }

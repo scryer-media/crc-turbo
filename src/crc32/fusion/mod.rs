@@ -16,56 +16,91 @@ mod aarch64;
 mod powers;
 mod x86;
 
-/// The aarch64 fusion kernel this CPU runs, for CRC-32/ISCSI and CRC-32/ISO-HDLC alike, or
-/// `None` when it has to take the folding path.
-///
-/// The choice is kept in one byte, read with a relaxed load: 0 before it is made, then 1 for
-/// none, 2 for the PMULL kernel and 3 for the EOR3 one. The byte carries the choice itself and
-/// publishes nothing else, and every thread that makes it makes the same one. The caller then
-/// calls the CRC32 loop or the kernel directly, which a pointer would not let it inline: where
-/// the target already has the features, as on Apple's, `checksum` calls the CRC32 loop or the
-/// fold itself, with no wrapper between.
-#[inline(always)]
+/// The aarch64 fusion kernel's choice, kept in one byte and read with a relaxed load: 0 before
+/// it is made, then 1 for none, 2 for the PMULL kernel and 3 for the EOR3 one. The byte carries
+/// the choice itself and publishes nothing else, and every thread that makes it makes the same
+/// one.
 #[cfg(all(feature = "std", target_arch = "aarch64"))]
-fn aarch64_kernel() -> Option<aarch64::FusionKernel> {
-    use core::sync::atomic::{AtomicU8, Ordering};
+static AARCH64_KERNEL: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
+/// Makes the aarch64 kernel's choice and stores it in [`AARCH64_KERNEL`].
+#[cold]
+#[cfg(all(feature = "std", target_arch = "aarch64"))]
+fn choose_aarch64_kernel() {
     use aarch64::FusionKernel;
 
-    static KERNEL: AtomicU8 = AtomicU8::new(0);
-
-    #[cold]
-    fn choose() -> Option<FusionKernel> {
-        let tier = crate::feature_detection::get_arch_ops().get_tier();
-        let kernel = aarch64::select_kernel(tier, std::arch::is_aarch64_feature_detected!("crc"));
-        let byte = match kernel {
-            None => 1,
-            Some(FusionKernel::Pmull) => 2,
-            Some(FusionKernel::PmullSha3) => 3,
-        };
-        KERNEL.store(byte, Ordering::Relaxed);
-
-        kernel
-    }
-
-    match KERNEL.load(Ordering::Relaxed) {
-        0 => choose(),
-        2 => Some(FusionKernel::Pmull),
-        3 => Some(FusionKernel::PmullSha3),
-        _ => None,
-    }
+    let tier = crate::feature_detection::get_arch_ops().get_tier();
+    let kernel = aarch64::select_kernel(tier, std::arch::is_aarch64_feature_detected!("crc"));
+    let byte = match kernel {
+        None => 1,
+        Some(FusionKernel::Pmull) => 2,
+        Some(FusionKernel::PmullSha3) => 3,
+    };
+    AARCH64_KERNEL.store(byte, core::sync::atomic::Ordering::Relaxed);
 }
 
-/// CRC-32/ISCSI through this CPU's fusion kernel, with `XOROUT` applied, or `None` when it has to
-/// take the folding path. Both AArch64 and x86 have native CRC-32/ISCSI instructions.
-#[inline(always)]
-#[cfg(all(feature = "std", target_arch = "aarch64"))]
-pub(crate) fn crc32_iscsi<const XOROUT: u32>(state: u32, data: &[u8]) -> Option<u32> {
-    let kernel = aarch64_kernel()?;
+/// The aarch64 entry for one CRC-32, with `XOROUT` applied: the kernel the CPU's choice names,
+/// called directly, or [`$slow`] before the choice is made and where it is none. Every arm is
+/// the last thing the caller does, so a call naming the algorithm is a jump to the kernel, with
+/// no frame set up around it: the kernels apply `XOROUT` themselves, as fast-crc32's apply their
+/// complement, and the choice and the folding path sit out of line behind a jump of their own.
+macro_rules! aarch64_entry {
+    ($(#[$doc:meta])* $name:ident, $slow:ident, $with:ident, $params:path) => {
+        $(#[$doc])*
+        #[inline(always)]
+        #[cfg(all(feature = "std", target_arch = "aarch64"))]
+        pub(crate) fn $name<const XOROUT: u32>(state: u32, data: &[u8]) -> Option<u32> {
+            use core::sync::atomic::Ordering;
 
-    // SAFETY: the kernel was selected for the tier this CPU runs
-    Some(unsafe { aarch64::crc32_iscsi_with(kernel, state, data) } ^ XOROUT)
+            use aarch64::FusionKernel;
+
+            // SAFETY: the byte names a kernel only once one was selected for the tier this CPU
+            // runs
+            Some(match AARCH64_KERNEL.load(Ordering::Relaxed) {
+                3 => unsafe { aarch64::$with(FusionKernel::PmullSha3, state, data, XOROUT) },
+                2 => unsafe { aarch64::$with(FusionKernel::Pmull, state, data, XOROUT) },
+                _ => $slow::<XOROUT>(state, data),
+            })
+        }
+
+        /// [`$name`] before the choice is made, which makes it and goes back, and where the
+        /// choice is none, which takes the folding path.
+        #[inline(never)]
+        #[cfg(all(feature = "std", target_arch = "aarch64"))]
+        fn $slow<const XOROUT: u32>(state: u32, data: &[u8]) -> u32 {
+            use core::sync::atomic::Ordering;
+
+            if AARCH64_KERNEL.load(Ordering::Relaxed) == 0 {
+                choose_aarch64_kernel();
+                if AARCH64_KERNEL.load(Ordering::Relaxed) != 1 {
+                    return $name::<XOROUT>(state, data).unwrap_or_default();
+                }
+            }
+
+            // SAFETY: the tier's entry is the one detection selected
+            let crc = unsafe { crate::arch::update(state as u64, data, &$params) as u32 };
+            crc ^ XOROUT
+        }
+    };
 }
+
+aarch64_entry!(
+    /// CRC-32/ISCSI through this CPU's fusion kernel, with `XOROUT` applied; never `None` on
+    /// aarch64. Both AArch64 and x86 have native CRC-32/ISCSI instructions.
+    crc32_iscsi,
+    iscsi_slow,
+    crc32_iscsi_with,
+    crate::crc32::consts::CRC32_ISCSI
+);
+
+aarch64_entry!(
+    /// CRC-32/ISO-HDLC through this CPU's fusion kernel, with `XOROUT` applied; never `None` on
+    /// aarch64. Only AArch64 has native CRC-32/ISO-HDLC instructions.
+    crc32_iso_hdlc,
+    iso_hdlc_slow,
+    crc32_iso_hdlc_with,
+    crate::crc32::consts::CRC32_ISO_HDLC
+);
 
 /// One more than the longest buffer x86's CRC-32/ISCSI takes with the CRC32 instruction alone,
 /// [`x86::IscsiPlan::direct_max`]: 0 until the plan is made, and 0 for good where it has no
@@ -165,15 +200,4 @@ fn iscsi_fold<const XOROUT: u32>(state: u32, data: &[u8]) -> u32 {
         crate::arch::update(state as u64, data, &crate::crc32::consts::CRC32_ISCSI) as u32
     };
     crc ^ XOROUT
-}
-
-/// CRC-32/ISO-HDLC through this CPU's fusion kernel, or `None` when it has to take the folding
-/// path. Only AArch64 has native CRC-32/ISO-HDLC instructions.
-#[inline(always)]
-#[cfg(all(feature = "std", target_arch = "aarch64"))]
-pub(crate) fn crc32_iso_hdlc(state: u32, data: &[u8]) -> Option<u32> {
-    let kernel = aarch64_kernel()?;
-
-    // SAFETY: the kernel was selected for the tier this CPU runs
-    Some(unsafe { aarch64::crc32_iso_hdlc_with(kernel, state, data) })
 }
