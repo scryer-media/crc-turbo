@@ -5,5 +5,4 @@
 
 #![cfg(target_arch = "aarch64")]
 
-pub(crate) mod crc_pmull;
 pub(crate) mod crc_pmull_sha3;

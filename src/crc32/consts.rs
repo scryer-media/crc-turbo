@@ -325,7 +325,7 @@ pub const CRC32_XFER: CrcParams = CrcParams {
 
 // CRC-32/AIXM
 pub const KEYS_814141AB_FORWARD: [u64; 23] = [
-    0x0000000000000000,
+    0xfeff7f62de04ce3d,
     0x9be9878f00000000,
     0x85b2a6e400000000,
     0x2aa81be300000000,
@@ -352,7 +352,7 @@ pub const KEYS_814141AB_FORWARD: [u64; 23] = [
 
 // CRC-32/AUTOSAR
 pub const KEYS_F4ACFB13_REFLECTED: [u64; 23] = [
-    0x0000000000000000,
+    0xacc133413cfdbf23,
     0x000000016130902a,
     0x0000000050428a9c,
     0x000000010b1e9a08,
@@ -379,7 +379,7 @@ pub const KEYS_F4ACFB13_REFLECTED: [u64; 23] = [
 
 // CRC-32/BASE91-D
 pub const KEYS_A833982B_REFLECTED: [u64; 23] = [
-    0x0000000000000000,
+    0x78fb64be9167fd37,
     0x00000001e065d896,
     0x00000001aca6d990,
     0x000000007ec6845e,
@@ -406,7 +406,7 @@ pub const KEYS_A833982B_REFLECTED: [u64; 23] = [
 
 // CRC-32/CD-ROM-EDC
 pub const KEYS_8001801B_REFLECTED: [u64; 23] = [
-    0x0000000000000000,
+    0x4f00ffff7000ffff,
     0x00000001d5934102,
     0x000000006c90c100,
     0x00000001fbea69a0,
@@ -433,7 +433,7 @@ pub const KEYS_8001801B_REFLECTED: [u64; 23] = [
 
 // CRC-32/MEF
 pub const KEYS_741B8CD7_REFLECTED: [u64; 23] = [
-    0x0000000000000000,
+    0xc25dd01c17d232cd,
     0x000000014b0602f8,
     0x000000007b4bc878,
     0x0000000023b08408,
@@ -460,7 +460,7 @@ pub const KEYS_741B8CD7_REFLECTED: [u64; 23] = [
 
 // CRC-32/XFER
 pub const KEYS_000000AF_FORWARD: [u64; 23] = [
-    0x0000000000000000,
+    0x000000af00004455,
     0x00295f2300000000,
     0xfafa517900000000,
     0x5cd86bb500000000,
@@ -487,7 +487,7 @@ pub const KEYS_000000AF_FORWARD: [u64; 23] = [
 
 // CRC-32/ISO-HDLC (aka 'crc32'), CRC-32/JAMCRC
 const KEYS_04C11DB7_REFLECTED: [u64; 23] = [
-    0x0000000000000000, // unused placeholder to match 1-based indexing
+    0xb4e5b025f7011641,
     0x00000000ccaa009e, // (2^(32* 3) mod P(x))' << 1
     0x00000001751997d0, // (2^(32* 5) mod P(x))' << 1
     0x000000014a7fe880, // (2^(32*31) mod P(x))' << 1
@@ -514,7 +514,7 @@ const KEYS_04C11DB7_REFLECTED: [u64; 23] = [
 
 // CRC-32/ISCSI (aka 'crc32c')
 const KEYS_1EDC6F41_REFLECTED: [u64; 23] = [
-    0x0000000000000000, // unused placeholder to match 1-based indexing
+    0x4869ec38dea713f1,
     0x000000014cd00bd6, // (2^(32* 3) mod P(x))' << 1
     0x00000000f20c0dfe, // (2^(32* 5) mod P(x))' << 1
     0x000000000d3b6092, // (2^(32*31) mod P(x))' << 1
@@ -541,7 +541,7 @@ const KEYS_1EDC6F41_REFLECTED: [u64; 23] = [
 
 // CRC-32/BZIP2, CRC-32/CKSUM, CRC-32/MPEG-2
 const KEYS_04C11DB7_FORWARD: [u64; 23] = [
-    0x0000000000000000, // unused placeholder to match 1-based indexing
+    0x04d101df481b4e5a,
     0xf200aa6600000000, // 2^(32* 3) mod P(x) << 32
     0x17d3315d00000000, // 2^(32* 5) mod P(x) << 32
     0x022ffca500000000, // 2^(32*31) mod P(x) << 32

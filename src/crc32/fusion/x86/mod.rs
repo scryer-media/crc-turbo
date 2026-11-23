@@ -529,35 +529,42 @@ pub unsafe fn crc32_iscsi_small_fast(mut crc: u32, data: &[u8]) -> u32 {
 #[inline]
 #[target_feature(enable = "sse4.2")]
 pub unsafe fn crc32_iscsi_small_unaligned(mut crc: u32, data: &[u8]) -> u32 {
-    let word = |bytes: &[u8]| u64::from_le_bytes(bytes.try_into().unwrap());
+    let word = |bytes: &[u8; 8]| u64::from_le_bytes(*bytes);
 
-    let mut blocks = data.chunks_exact(64);
-    for block in &mut blocks {
-        crc = mm_crc32_u64(crc, word(&block[0..8]));
-        crc = mm_crc32_u64(crc, word(&block[8..16]));
-        crc = mm_crc32_u64(crc, word(&block[16..24]));
-        crc = mm_crc32_u64(crc, word(&block[24..32]));
-        crc = mm_crc32_u64(crc, word(&block[32..40]));
-        crc = mm_crc32_u64(crc, word(&block[40..48]));
-        crc = mm_crc32_u64(crc, word(&block[48..56]));
-        crc = mm_crc32_u64(crc, word(&block[56..64]));
+    // Below 64 bytes, one straight-line step each of 32, 16 and 8 bytes. A loop over the
+    // remaining words compiled to a counted loop and an unrolled one with set-up between them.
+    let mut rest = data;
+    while let Some((block, tail)) = rest.split_first_chunk::<64>() {
+        for chunk in block.as_chunks::<8>().0 {
+            crc = mm_crc32_u64(crc, word(chunk));
+        }
+        rest = tail;
     }
-
-    let mut words = blocks.remainder().chunks_exact(8);
-    for bytes in &mut words {
-        crc = mm_crc32_u64(crc, word(bytes));
+    if let Some((quad, tail)) = rest.split_first_chunk::<32>() {
+        for chunk in quad.as_chunks::<8>().0 {
+            crc = mm_crc32_u64(crc, word(chunk));
+        }
+        rest = tail;
     }
-
-    let mut tail = words.remainder();
-    if tail.len() >= 4 {
-        crc = _mm_crc32_u32(crc, u32::from_le_bytes(tail[..4].try_into().unwrap()));
-        tail = &tail[4..];
+    if let Some((pair, tail)) = rest.split_first_chunk::<16>() {
+        for chunk in pair.as_chunks::<8>().0 {
+            crc = mm_crc32_u64(crc, word(chunk));
+        }
+        rest = tail;
     }
-    if tail.len() >= 2 {
-        crc = _mm_crc32_u16(crc, u16::from_le_bytes(tail[..2].try_into().unwrap()));
-        tail = &tail[2..];
+    if let Some((chunk, tail)) = rest.split_first_chunk::<8>() {
+        crc = mm_crc32_u64(crc, word(chunk));
+        rest = tail;
     }
-    if let Some(&byte) = tail.first() {
+    if let Some((quad, tail)) = rest.split_first_chunk::<4>() {
+        crc = _mm_crc32_u32(crc, u32::from_le_bytes(*quad));
+        rest = tail;
+    }
+    if let Some((half, tail)) = rest.split_first_chunk::<2>() {
+        crc = _mm_crc32_u16(crc, u16::from_le_bytes(*half));
+        rest = tail;
+    }
+    if let Some(&byte) = rest.first() {
         crc = _mm_crc32_u8(crc, byte);
     }
 
@@ -802,6 +809,7 @@ mod tests {
 
     /// The CPU's own identity decodes to a vendor string and a family.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not run the CPUID instruction")]
     fn cpu_id_detects_this_cpu() {
         let id = CpuId::detect();
         assert!(id.vendor.iter().all(|b| b.is_ascii_graphic()), "{id:?}");

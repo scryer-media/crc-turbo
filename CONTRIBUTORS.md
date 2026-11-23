@@ -44,6 +44,8 @@ author.
   AVX512BW detection gaps and the missing test coverage (crc-fast#64).
 - **dengyt2018**: the request for error values in place of panics for
   `no_std` callers (crc-fast#37).
+- **Andres J Ruiz Torres** (andres-sm): the WebAssembly size, table leak
+  and stack use fixes and their size check (crc-fast#67).
 
 ## This fork
 

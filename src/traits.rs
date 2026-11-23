@@ -58,6 +58,53 @@ pub trait ArchOps: Sized + Copy + Clone {
         false
     }
 
+    /// Folds `units` 16-byte blocks, 2 to 15, into one vector ready for the final reduction, with
+    /// the tier's wide registers; `None` where the tier has none, and the caller folds 128 bits
+    /// at a time. With `head_in_data` the blocks are the `units` from `data` and `head`, the
+    /// state, is combined with the first; otherwise the first is `head`, already reflected and
+    /// folded from the bytes before it, and the rest are the `units - 1` from `data`.
+    ///
+    /// # Safety
+    ///
+    /// `data` must be valid for reads of those blocks, and the CPU must have the tier's
+    /// features.
+    #[inline(always)]
+    unsafe fn fold_short_wide(
+        &self,
+        _head: Self::Vector,
+        _data: *const u8,
+        _units: usize,
+        _head_in_data: bool,
+        _keys: &[u64; 23],
+        _reflected: bool,
+    ) -> Option<Self::Vector>
+    where
+        Self::Vector: Copy,
+    {
+        None
+    }
+
+    /// Folds `chunks` 128-byte blocks from `data`, which need not be aligned, from `state` into
+    /// one vector ready for the final reduction, with the tier's wide registers; `None` where the
+    /// tier has none or needs more chunks than that, and the caller folds 128 bits at a time.
+    ///
+    /// # Safety
+    ///
+    /// `data` must be valid for reads of `chunks * 128` bytes, `chunks` must be at least 1, and
+    /// the CPU must have the tier's features.
+    unsafe fn fold_simd_blocks_unaligned(
+        &self,
+        _state: &CrcState<Self::Vector>,
+        _data: *const u8,
+        _chunks: usize,
+        _keys: &[u64; 23],
+    ) -> Option<Self::Vector>
+    where
+        Self::Vector: Copy,
+    {
+        None
+    }
+
     /// Create a SIMD vector from a u64 pair
     ///
     /// # Safety

@@ -90,6 +90,32 @@ own changelog up to the fork point continues below, unchanged.
   generator either way. Requested in crc-fast#61 by jacobloveless, whose
   per-width table features this replaces with one feature that covers
   every algorithm a binary does not use, without fifty feature flags.
+- On targets without an accelerated path (WebAssembly, and every
+  architecture but x86, x86_64 and aarch64) each built-in algorithm has a
+  calculator of its own that names its table, so a module using one
+  algorithm links one table even without LTO: a `no_std` WebAssembly module
+  computing CRC-64/NVME is 38 KiB, from 718 KiB (767 KiB to 56 KiB with
+  `std`). Custom parameters without the `cache` feature no longer leak a
+  table on every call, and their table and the `generated-tables` ones are
+  built in place on the heap rather than on the stack. CI builds that module
+  without LTO and fails above 64 KiB. From crc-fast#67 by Andres J Ruiz
+  Torres, without its slice-by-16 loop.
+
+### WebAssembly
+
+- On WebAssembly, every generator with a sparse multiple of the right shape
+  (all but CRC-32/XFER and six of the seven CRC-64 generators) skips the
+  tables for most of a long input, so 43 of the 50 built-in algorithms are
+  faster there, up to 4.3x for CRC-16/DNP at 64 KiB. See 1.11.1.
+
+### x86 and aarch64
+
+- CRC-32/ISCSI follows a per-CPU plan below AVX-512, its fusion kernels
+  take their shifts from compile-time tables on x86 and on aarch64's SHA3
+  tier, the kernels below AVX-512 have an AVX2 build, and x86 buffers under
+  4 KiB take a 256-bit short fold, one final reduction and independent tail
+  folds, after the Linux kernel's and libdeflate's methods. The kernel is
+  chosen once per process. See 1.11.1.
 
 ### digest 0.11
 
@@ -143,8 +169,9 @@ own changelog up to the fork point continues below, unchanged.
   buffers over 3 MiB (128 KiB on Alder Lake's AVX2 build), where reading
   one place fewer at a time is worth more. Both are built twice, and on x86_64 CPUs with AVX2 the build with
   AVX2 enabled runs, whose VEX encoding was measured faster on every CPU
-  timed. The AVX-512 and aarch64 fusion kernels still compute their shifts
-  per buffer.
+  timed. The aarch64 SHA3 tier's CRC-32/ISCSI and CRC-32/ISO-HDLC
+  kernels for buffers from 2 KiB take theirs from tables too; the AVX-512
+  fusion kernel still computes its shifts per buffer.
 - Below AVX-512, CRC-32/ISCSI follows a plan chosen per CPU model: the
   plain CRC32 instruction loop runs up to 384 bytes (288 on AMD family
   0x17, 199 on Intel's E-core parts), where crc-fast hands over to its
@@ -154,11 +181,37 @@ own changelog up to the fork point continues below, unchanged.
 - CRC-32/ISCSI buffers up to the plan's limit (256 bytes on the AVX-512
   tiers) are checksummed with the CRC32 instruction over unaligned words,
   by a direct call ahead of the fusion kernel; crc-fast aligns first, a
-  byte at a time, and so does this crate through 1.11.1.
+  byte at a time, and so does this crate through 1.11.0.
 - The fusion kernel for CRC-32/ISCSI, and on aarch64 for CRC-32/ISO-HDLC,
-  is chosen once per process and kept as a function pointer. crc-fast, and
-  this crate through 1.11.1, ran feature detection on every checksum call:
-  up to four atomic loads before the first byte.
+  is chosen once per process: on x86 kept as a function pointer, on aarch64
+  as one byte ahead of direct calls. crc-fast, and this crate through
+  1.11.0, ran feature detection on every checksum call: up to four atomic
+  loads before the first byte.
+
+- Every architecture: 32 to 255 bytes, the generic fold no longer runs its
+  16-byte blocks as one chain of dependent multiplies. Each of the last
+  seven blocks is folded straight onto the last with the generated key for
+  its distance, so those multiplies run side by side, the method of the
+  Linux kernel's x86 CRC template (Eric Biggers); no kernel code is taken.
+
+### aarch64 performance
+
+- CRC-32/ISCSI and CRC-32/ISO-HDLC run fast-crc32's `v4` fold from 64
+  bytes and `v8` from 256, without first aligning the buffer, where crc-fast
+  runs `v12e_v1` from 128 bytes, aligning first; from 2 KiB the PMULL tier
+  runs `v3s4x2e_v2` in place of `v12e_v1`, and the SHA3 tier crc-fast's
+  `v9s3x2e_s3` (from 1 KiB there) with its shift multipliers from
+  compile-time tables. On
+  Apple's cores each multiply and the XOR that takes its result are written
+  as a pair the core fuses, the SHA3 kernel's main loop included, where the
+  three-way XOR crc-fast uses there keeps the core from fusing either.
+- `checksum` naming CRC-32/ISCSI or CRC-32/ISO-HDLC is that algorithm's
+  entry point inlined, not a match over every algorithm.
+- The other algorithms fold a buffer from 128 bytes to 256 KiB from
+  wherever it starts and reduce it once, where crc-fast folds the bytes
+  before and after an aligned middle separately. That fold is kept out of
+  line, compiled once per bit order; buffers under 128 bytes run crc-fast's
+  code inlined in the tier's entry point.
 
 ### Tier selection
 
@@ -296,7 +349,7 @@ own changelog up to the fork point continues below, unchanged.
 - New `checksum_zeros` and `checksum_zeros_with_params`: the CRC of `len`
   zero bytes in O(log len), without touching memory.
 
-## 1.11.2 - 2026-11-22
+## 1.11.1 - 2026-11-23
 
 - CRC-32/ISCSI is faster on x86 CPUs without AVX-512: the
   `x86_64-avx2-vpclmulqdq`, `x86_64-sse-pclmulqdq` and `x86-sse-pclmulqdq`
@@ -306,11 +359,11 @@ own changelog up to the fork point continues below, unchanged.
   passes up to 32 KiB, and four entries for each doubling beyond that; a
   longer buffer is taken in a few passes, largest first). Measured on a
   Xeon 6731E (Sierra Forest, which selects `x86_64-avx2-vpclmulqdq`)
-  against 1.11.1, user-mode cycles per call, median of six interleaved
+  against 1.11.0, user-mode cycles per call, median of six interleaved
   rounds, checksums compared first, the build timed being this release's
   source:
 
-  | bytes | 1.11.1 | 1.11.2 | |
+  | bytes | 1.11.0 | 1.11.1 | |
   |---:|---:|---:|---:|
   | 8 | 24.5 | 18.0 | 1.36x |
   | 16 | 29.0 | 18.4 | 1.58x |
@@ -369,28 +422,28 @@ own changelog up to the fork point continues below, unchanged.
     the AVX2 build hands over to `v4s3x3` from 128 KiB instead of 3 MiB,
     and the loop keeps 384 bytes. Measured on a Core i5-1240P, P-core and
     E-core apart, in nanoseconds: on the P-cores the four-stream kernel
-    was 1% to 2% behind 1.11.1's `v4s3x3` from 256 KiB to 2 MiB, and a
+    was 1% to 2% behind 1.11.0's `v4s3x3` from 256 KiB to 2 MiB, and a
     200-byte handover up to 12% behind the loop from 200 to 256 bytes; on
     the E-cores the kernel overtook the loop at 200 bytes and the
     four-stream shape was 4% to 10% ahead. The fold was 1.02x to 1.07x
     on the P-cores from 64 KiB to 4 MiB but about 0.75x from 8 MiB and
     about 0.6x on the E-cores, so Alder Lake keeps the kernel. Against
-    1.11.1, median of nine or fifteen interleaved rounds: P-cores 1.38x at
+    1.11.0, median of nine or fifteen interleaved rounds: P-cores 1.38x at
     64 bytes (3.15x unaligned), 2.0x to 2.6x from 257 bytes to 1 KiB,
     1.40x at 4 KiB, 1.04x at 64 KiB and 1.00x to 1.02x from 128 KiB to
     32 MiB; E-cores 1.26x to 3.0x up to 4 KiB, 1.18x to 1.30x from 64 KiB
     to 2 MiB and 1.03x to 1.16x from 3 MiB.
 
-  Measured on EC2 spot instances against 1.11.1, nanoseconds per call,
+  Measured on EC2 spot instances against 1.11.0, nanoseconds per call,
   median of nine interleaved rounds pinned to one core, from an aligned
   start unless marked. Checksums of CRC-32/ISCSI, the fold with the same
-  parameters, CRC-32/ISO-HDLC and CRC-64/NVME matched 1.11.1 first, over
+  parameters, CRC-32/ISO-HDLC and CRC-64/NVME matched 1.11.0 first, over
   every length from 0 to 1,100 bytes and larger ones around 4 KiB and
   3 MiB, aligned and unaligned, with the tier pinned to each target string
   in turn; the full test suite passed on each CPU, natively and pinned to
   `x86-sse-pclmulqdq`:
 
-  | bytes | 7R13 1.11.1 | 7R13 1.11.2 | 7R32 1.11.1 | 7R32 1.11.2 | E5-2666 v3 1.11.1 | E5-2666 v3 1.11.2 |
+  | bytes | 7R13 1.11.0 | 7R13 1.11.1 | 7R32 1.11.0 | 7R32 1.11.1 | E5-2666 v3 1.11.0 | E5-2666 v3 1.11.1 |
   |---:|---:|---:|---:|---:|---:|---:|
   | 64 | 6.4 | 4.7 | 7.9 | 5.2 | 8.7 | 5.9 |
   | 64, unaligned | 10.6 | 4.7 | 12.8 | 5.2 | 14.5 | 5.8 |
@@ -411,8 +464,8 @@ own changelog up to the fork point continues below, unchanged.
   CRC-64/NVME, which share none of this code, measured 0.95x to 1.08x
   across the same runs. Sierra Forest and the other E-core parts, Zen 4
   and Zen 5 without AVX-512, Alder Lake through Arrow Lake and Hygon were
-  not measured with this build. The AVX-512 tiers and aarch64 keep their
-  kernels and still compute their shifts per buffer.
+  not measured with this build. The AVX-512 tiers keep their kernels and
+  still compute their shifts per buffer; aarch64 is below.
 - The SSE kernel itself is now the `v4x2s4x4` shape of
   [fast-crc32](https://github.com/corsix/fast-crc32/): two 64-byte vector
   steps beside four CRC32 instruction streams, in place of `v4s3x3`. On the
@@ -423,7 +476,7 @@ own changelog up to the fork point continues below, unchanged.
   instruction alone, and it takes over from the plain CRC32 instruction
   loop where the plan above says. On the Xeon 6731E it overtook the loop
   at 200 bytes, but on the EPYC 7R13 a build that took over there was up
-  to 1.5x slower than 1.11.1 from 200 to 256 bytes (200 bytes 14.72 to
+  to 1.5x slower than 1.11.0 from 200 to 256 bytes (200 bytes 14.72 to
   22.56 ns), which is why the handover is per CPU.
 - `v4s3x3` stays for buffers over 3 MiB. `v4x2s4x4` reads five places in a
   buffer at once, and on the Xeon 6731E, whose cores share 4 MiB of L2
@@ -434,20 +487,20 @@ own changelog up to the fork point continues below, unchanged.
   AVX-512 tiers, no longer align before the CRC32 instruction loop. The loop takes unaligned 8-byte words from the start
   of the buffer and finishes with at most one each of four, two and one
   bytes, where it took up to seven single bytes at each end. On the Xeon
-  6731E 64 bytes takes 18.5 cycles from any start; 1.11.1 took 22.4 to
+  6731E 64 bytes takes 18.5 cycles from any start; 1.11.0 took 22.4 to
   25.3 from an aligned start, run to run, and 44.0 from an unaligned one.
   These buffers are a direct call ahead of the kernel's function pointer,
   on every x86 tier with the CRC32 instructions, and the kernels are kept
   out of line so that a short buffer does not pay for the registers a
   kernel saves. That changes the AVX-512 tiers too, for buffers up to 256
-  bytes, so they were timed on EC2 against 1.11.1: a c6i.xlarge (Xeon
+  bytes, so they were timed on EC2 against 1.11.0: a c6i.xlarge (Xeon
   Platinum 8375C, Ice Lake, `x86_64-avx512-vpclmulqdq`) and a c5.xlarge
   (Xeon Platinum 8124M, Skylake-SP, `x86_64-avx512-pclmulqdq`), nanoseconds
   per call, median of nine interleaved rounds, checksums compared first
   (lengths 0 to 300 and larger, aligned and unaligned, on each tier pinned
   down to software), and the full test suite run on both:
 
-  | bytes | 8375C 1.11.1 | 8375C 1.11.2 | 8124M 1.11.1 | 8124M 1.11.2 |
+  | bytes | 8375C 1.11.0 | 8375C 1.11.1 | 8124M 1.11.0 | 8124M 1.11.1 |
   |---:|---:|---:|---:|---:|
   | 8 | 7.45 | 5.44 | 9.43 | 8.14 |
   | 64 | 6.86 | 5.43 | 8.97 | 8.09 |
@@ -459,12 +512,12 @@ own changelog up to the fork point continues below, unchanged.
 
   Of the 36 lengths from 1 to 512 bytes, aligned and unaligned, none was
   slower on either CPU; 512 bytes on the 8375C read 0.97x once and 1.00x
-  in a rerun of 15 rounds. From 1 KiB to 1 MiB 1.11.2 was 1.00x to 1.04x.
+  in a rerun of 15 rounds. From 1 KiB to 1 MiB 1.11.1 was 1.00x to 1.04x.
   From 2 MiB to 64 MiB both CPUs moved by up to 5% either way between runs,
   following which release ran first, and CRC-32/ISO-HDLC and CRC-64/NVME,
   whose code did not change, moved by as much. Those runs had the direct
   call stop at 199 bytes. With it at 256 the 8375C was timed again, and
-  200 to 256 bytes ran 1.16x to 1.27x faster than 1.11.1 (256 bytes 12.79
+  200 to 256 bytes ran 1.16x to 1.27x faster than 1.11.0 (256 bytes 12.79
   to 10.09 ns, 19.00 to 10.11 unaligned), with no length from 1 to 512
   bytes slower; the 8124M was not timed again. With the final source the
   8375C and a c5.large (Xeon Platinum 8275CL, Cascade Lake,
@@ -475,19 +528,173 @@ own changelog up to the fork point continues below, unchanged.
   1.21x from 257 bytes up; the closest, 512 bytes unaligned on the 8375C,
   was 0.99x.
 - The fusion kernel is chosen once per process, from the tier and the CRC32
-  instructions, and kept as a function pointer; a checksum call loads the
-  pointer and calls it. Before, every CRC-32/ISCSI call on x86 and every
-  CRC-32/ISCSI and CRC-32/ISO-HDLC call on aarch64 ran feature detection
-  first, up to four atomic loads. On a Graviton2 (Neoverse N1, a
-  c6g.xlarge on EC2, `aarch64-neon-pmull`), checksums matched 1.11.1 and the
-  test suite passed; CRC-32/ISCSI and CRC-32/ISO-HDLC were 1.03x to 1.35x
-  faster from 1 to 512 bytes, aligned and unaligned (the closest, 200
-  bytes, 1.00x), and the same from 4 KiB up. Apple CPUs were not timed.
+  instructions. On x86 it is kept as a function pointer, which a checksum
+  call loads and calls. On aarch64 the choice is one byte, read with a
+  relaxed load, and the call to the CRC32 loop or the fold is direct, so
+  where the target already has the features it is inlined into `checksum`.
+  Before, every CRC-32/ISCSI call on x86 and every CRC-32/ISCSI and
+  CRC-32/ISO-HDLC call on aarch64 ran feature detection first, up to four
+  atomic loads. On a Graviton2 (Neoverse N1, a c6g.xlarge on EC2,
+  `aarch64-neon-pmull`), checksums matched 1.11.0 and the test suite passed;
+  with the function pointer CRC-32/ISCSI and CRC-32/ISO-HDLC were 1.03x to
+  1.35x faster from 1 to 512 bytes, aligned and unaligned (the closest, 200
+  bytes, 1.00x), and the same from 4 KiB up. With the direct call and the
+  aarch64 work below, the final source against 1.11.0 is in the aarch64
+  table further down; on the Apple M5 Max an intermediate build of the
+  direct call was 0.85x to 0.91x from 128 to 200 bytes, a gap the final
+  source no longer has (128 bytes 2.52x to 2.60x).
 - These changes come from reports by cemeyer, crc-turbo#3 (dispatch) and
   crc-turbo#4 (the Sierra Forest gap, with the measurements against
   fast-crc32's kernels that showed it).
+- CRC-32/ISO-HDLC and the other folded algorithms are faster on x86 below
+  4 KiB, on every tier. The methods are the Linux kernel's x86 CRC template
+  and libdeflate's, reimplemented here from their descriptions with this
+  crate's generated keys; no code is taken from either:
+  - a 256-bit fold for buffers from 32 to 255 bytes, two 16-byte blocks per
+    carry-less multiply, in place of one block per multiply;
+  - one Barrett reduction at the end of every buffer under 1 MiB, where the
+    fold reduced each 128-byte pass;
+  - the tail blocks of a buffer folded independently towards the end, each
+    with its own key, and XORed together, rather than one after another;
+  - CRC-32/ISO-HDLC entries that take their keys as constants of the
+    algorithm rather than loading them through the parameters.
 
-## 1.11.1 - 2026-11-08
+  A test forces each x86 tier onto these paths over every algorithm, both
+  bit orders, every length up to 64 bytes and from 120 to 400, lengths
+  around 512 bytes, 1 KiB, 4 KiB and 8 KiB, four starting offsets and a
+  carried state, against the software path; swapping one coefficient of the
+  256-bit fold fails 34 tests. Measured on EC2 against 1.11.0, CRC-32/ISO-HDLC,
+  nanoseconds per call, median of seven interleaved rounds, checksums
+  compared first, from an aligned start:
+
+  | bytes | EPYC 7R32 1.11.0 | 1.11.1 | EPYC 7R13 1.11.0 | 1.11.1 | Xeon 8375C 1.11.0 | 1.11.1 |
+  |---:|---:|---:|---:|---:|---:|---:|
+  | 16 | 20.8 | 5.8 | 15.7 | 5.3 | 16.8 | 4.6 |
+  | 64 | 27.6 | 10.6 | 22.0 | 8.1 | 36.8 | 6.3 |
+  | 128 | 31.2 | 16.4 | 27.4 | 10.6 | 30.5 | 8.2 |
+  | 256 | 39.9 | 26.7 | 28.6 | 14.2 | 38.3 | 14.8 |
+  | 256, unaligned | 67.5 | 26.7 | 62.9 | 14.2 | 92.1 | 14.4 |
+  | 512 | 56.1 | 46.1 | 35.9 | 22.0 | 37.5 | 20.0 |
+  | 1024 | 94.3 | 84.8 | 53.1 | 39.8 | 38.8 | 31.9 |
+  | 4096 | 327 | 318 | 160 | 147 | 95.7 | 92.2 |
+
+  From 16 KiB to 1 MiB the three CPUs measured 0.99x to 1.02x. The other
+  folded algorithms were 0.99x to 3.89x across the same lengths. Of 17
+  lengths from 16 bytes to 1 MiB, aligned and unaligned, CRC-32/ISCSI and
+  CRC-32/ISO-HDLC read 0.99x or better against 1.11.0 everywhere but
+  CRC-32/ISCSI at 2 KiB and 4 KiB on the 8375C, 0.96x to 0.97x: that length is bimodal on that CPU in both
+  releases (43.4 or 40.5 GB/s), and a rerun of the final source read 1.00x.
+  Against the fastest of fast-crc32's generated C, libdeflate and zlib built
+  in the same binary, this release does not yet match them everywhere:
+  CRC-32/ISO-HDLC from 32 to 512 bytes on the 7R32 (0.74x to 0.93x), 128 to
+  192 bytes on the 7R13 (0.84x) and 512 bytes to 4 KiB on the 8375C against
+  fast-crc32's AVX-512 kernel (0.76x to 0.93x); CRC-32/ISCSI from 16 to 48
+  bytes on the 7R13 and the 8375C (0.81x to 0.88x) and at 1 MiB on the
+  8375C (0.81x).
+- WebAssembly is faster for 43 of the 50 built-in algorithms. Every table
+  load there is bounds-checked, so for a long input the software path now
+  reduces the message by a sparse multiple of the generator first, in the
+  manner of Sam Russell's Chorba (arXiv:2412.16398) for CRC-32/ISO-HDLC:
+  when `x^n + x^(n - d_1) + ... + 1` is a multiple of the generator, each
+  64-bit word is XORed `d` bits further on, for each offset `d`, with shifts
+  in place of table lookups, and the last few words go through the tables.
+  The offsets of each generator (three to five, all at least 64) are found by
+  a search in `src/generate.rs` that a test checks the kernels against, and
+  every kernel is checked against the tables over every algorithm, both bit
+  orders, lengths from 0 to 4 KiB, unaligned starts and a carried state, on
+  every target. Each algorithm's kernel is a constant of its calculator, and
+  from which length it runs is set per generator and bit order from where it
+  overtook the tables. Measured against 1.11.0 under wasmtime and Node on an
+  Apple M-series Mac, `wasm32-wasip1`, nanoseconds per `checksum` call,
+  median of five interleaved rounds, the slower of the two runtimes' ratios,
+  checksums compared first for every algorithm from 0 to 1,100 bytes and
+  larger, one-shot and split:
+
+  | algorithm | 256 B | 1 KiB | 64 KiB |
+  |---|---:|---:|---:|
+  | CRC-16/DNP | 2.13x | 3.55x | 4.29x |
+  | CRC-32/ISO-HDLC | 1.43x | 1.97x | 2.22x |
+  | CRC-32/JAMCRC | 1.43x | 1.96x | 2.17x |
+  | CRC-64/GO-ISO | 1.94x | 2.00x | 2.02x |
+  | CRC-32/ISCSI | 1.36x | 1.62x | 1.73x |
+  | CRC-32/AUTOSAR, BASE91-D, CD-ROM-EDC, MEF | 1.14x to 1.70x | 1.33x to 1.70x | 1.40x to 1.83x |
+  | reflected CRC-16 (11 more) | 1.54x to 1.67x | 1.54x to 1.60x | 1.49x to 1.54x |
+  | forward CRC-16 (19) | 0.98x to 1.22x | 1.15x to 1.56x | 1.19x to 1.92x |
+  | CRC-32/BZIP2, CKSUM, MPEG-2 | 1.00x to 1.01x | 1.20x to 1.22x | 1.42x to 1.43x |
+  | CRC-32/AIXM | 0.99x | 1.10x | 1.27x |
+
+  No algorithm at any length from 32 bytes to 64 KiB was below 0.98x in
+  either runtime, the seven algorithms without a kernel included, and below
+  64 bytes every algorithm was 1.01x to 1.10x. Native targets keep the
+  tables, which measured faster there.
+- On those same targets each built-in algorithm has its own calculator,
+  which links its algorithm's table alone: a `no_std` WebAssembly module
+  computing CRC-64/NVME through `checksum`, `crc64_nvme` and `Digest`, built
+  without LTO, is 38,267 bytes, from 718 KiB, and 56 KiB from 767 KiB with
+  `std`. CI builds that module (`wasm-size/`) and fails above 64 KiB. Custom
+  parameters without the `cache` feature built a table per call and leaked
+  it; the table is now freed when the call returns. That table and the
+  `generated-tables` ones are built in place on the heap, not as a 32 KiB
+  stack temporary. From crc-fast#67 by Andres J Ruiz Torres; its
+  slice-by-16 loop rewrite is not taken.
+- A test forces each aarch64 tier, the SHA3 one on any CPU that has it, and
+  checks every algorithm against the software path across the fold.
+- CRC-32/ISCSI and CRC-32/ISO-HDLC are faster on aarch64 from 1 KiB, on
+  the SHA3 tier. Over 1 KiB the fusion kernel runs three CRC32 instruction
+  streams beside the PMULL fold and shifts them back together at the end,
+  and worked out the three multipliers by repeated squaring on every call.
+  They now come from tables built at compile time: one entry per 64-bit
+  word up to 16 KiB, and one per 16 KiB step beyond that up to 16 MiB, two
+  entries combined with a carry-less multiply and a CRC32 instruction; only
+  a stream longer than 16 MiB still squares. A test checks every entry of
+  both tables against the squaring, and another every length around the
+  table boundaries against the software path; changing either table's
+  starting power fails both. Measured against 1.11.0 on an Apple M5 Max,
+  median of 15 interleaved rounds (21 from 128 to 512 KiB), checksums
+  compared first for every algorithm:
+
+  | bytes | CRC-32/ISCSI | CRC-32/ISO-HDLC |
+  |---:|---:|---:|
+  | 1025 | 2.23x | 2.26x |
+  | 2048 | 2.07x | 2.07x |
+  | 4096 | 1.85x | 1.84x |
+  | 8192 | 1.48x | 1.42x |
+  | 16384 | 1.22x | 1.26x |
+  | 32768 | 1.12x | 1.16x |
+  | 65536 | 1.03x | 1.11x |
+  | 131072 | 1.05x | 1.05x |
+  | 262144 | 1.03x | 1.02x |
+  | 1048576 | 1.04x | 1.02x |
+
+  Up to 1 KiB the kernel takes no shift. The PMULL tier without SHA3 and
+  the other algorithms do not use this kernel.
+- With that kernel, the direct call above and this release's aarch64 short paths,
+  CRC-32/ISCSI and CRC-32/ISO-HDLC against 1.11.0 on Graviton, median of
+  seven interleaved rounds, checksums compared first and the test suite
+  passed on each, aligned start (unaligned in brackets where it differs by
+  more than a tenth):
+
+  | bytes | Graviton2 c6g | Graviton3 c7g | Graviton4 c8g |
+  |---:|---:|---:|---:|
+  | 16 | 2.07x to 2.28x (2.80x) | 1.64x (2.26x) | 2.00x (2.45x) |
+  | 64 | 1.57x to 1.62x (2.79x) | 1.52x (2.42x) | 1.61x (2.54x) |
+  | 128 | 1.90x to 2.04x | 2.17x to 2.23x | 2.09x to 2.33x |
+  | 256 | 1.60x to 1.64x | 1.94x | 1.69x to 1.76x |
+  | 1024 | 1.18x to 1.23x | 1.58x to 1.66x | 1.58x to 1.62x |
+  | 4096 | 1.55x | 1.62x to 1.63x | 1.68x to 1.70x |
+  | 16384 | 1.64x to 1.65x | 1.08x to 1.30x | 1.26x to 1.27x |
+  | 65536 | 1.62x | 1.04x to 1.10x | 1.06x to 1.08x |
+  | 1048576 | 1.64x | 0.95x to 0.98x | 1.00x to 1.02x |
+
+  On the Apple M5 Max the final source was 1.15x to 3.47x at every length
+  from 16 bytes to 1 MiB, aligned and unaligned. Graviton3 at 1 MiB is the
+  one shortfall: 40.1 to 42.5 GB/s against 1.11.0's 41.3 to 43.7 in every
+  round, with the SHA3 kernel's loop unchanged; it is not explained. The
+  other algorithms' fold was 0.94x to 8.9x on Graviton; below 0.99x were
+  CRC-32/BZIP2 and CRC-64/ECMA-182 from 64 KiB to 1 MiB on Graviton2
+  (0.97x), 16 KiB on Graviton4 from an aligned start (0.94x to 0.95x), and
+  on the M5 Max 4 KiB, 8 KiB and 128 KiB (0.94x to 0.96x), in both bit
+  orders; those are not explained either.
 
 - A `no_std` build for x86_64 chose the AVX-512 tiers from its compile-time
   target features on AVX512VL alone. Those kernels also use AVX512BW, so a

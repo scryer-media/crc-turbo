@@ -15,7 +15,6 @@ use crate::enums::Reflector;
 use crate::structs::CrcState;
 use crate::traits::{ArchOps, EnhancedCrcWidth};
 use core::arch::x86_64::*;
-use core::ops::BitXor;
 
 /// Implements the ArchOps trait using 256-bit AVX2 and VPCLMULQDQ instructions.
 /// Delegates to X86SsePclmulqdqOps for standard 128-bit operations
@@ -68,32 +67,32 @@ impl Simd256 {
 
     #[inline]
     #[target_feature(enable = "avx2")]
-    unsafe fn to_128i_extract<const INDEX: i32>(self) -> __m128i {
-        _mm256_extracti128_si256(self.0, INDEX)
-    }
-
-    #[inline]
-    #[target_feature(enable = "avx2")]
     unsafe fn xor(&self, other: &Self) -> Self {
         Self(_mm256_xor_si256(self.0, other.0))
     }
 }
 
 impl X86_64Avx2VpclmulqdqOps {
-    /// Process aligned blocks using VPCLMULQDQ with 4 x 256-bit registers
+    /// Folds `chunks` 128-byte blocks from `data`, which need not be aligned, with 4 x 256-bit
+    /// registers, into one 128-bit vector ready for the final reduction.
+    ///
+    /// # Safety
+    ///
+    /// `data` must be valid for reads of `chunks * 128` bytes, and `chunks` at least 1.
+    ///
+    /// Unlike the AVX-512 tier's, it keeps its own `target_feature` and stays a call: inlined
+    /// into the tier's entry it was 1% to 3% slower from 384 to 512 bytes on an EPYC 7R13.
     #[inline]
     #[target_feature(enable = "avx2,vpclmulqdq")]
-    unsafe fn process_blocks<W: EnhancedCrcWidth>(
+    unsafe fn fold_blocks(
         &self,
-        state: &mut CrcState<<X86_64Avx2VpclmulqdqOps as ArchOps>::Vector>,
-        first: &[__m128i; 8],
-        rest: &[[__m128i; 8]],
+        state: &CrcState<<X86_64Avx2VpclmulqdqOps as ArchOps>::Vector>,
+        data: *const u8,
+        chunks: usize,
         keys: &[u64; 23],
         reflected: bool,
-    ) -> W::Value
-    where
-        W::Value: Copy + BitXor<Output = W::Value>,
-    {
+    ) -> __m128i {
+        debug_assert!(chunks >= 1);
         let state_u64s = self.extract_u64s(state.value);
 
         // Forward CRCs hold each 128-bit stream byte-reversed, as the SSE tier does, so the
@@ -107,7 +106,7 @@ impl X86_64Avx2VpclmulqdqOps {
         let reflector = create_reflector256(reflected);
 
         // The first 128 bytes, as 8 streams in 4 registers
-        let first_ptr = first.as_ptr() as *const u8;
+        let first_ptr = data;
         let mut x = [
             reflect_bytes256(&reflector, Simd256::load_from_ptr(first_ptr)),
             reflect_bytes256(&reflector, Simd256::load_from_ptr(first_ptr.add(32))),
@@ -120,8 +119,8 @@ impl X86_64Avx2VpclmulqdqOps {
         // Each register moves 128 bytes forward per block: the SSE fold-by-8 distance
         let coeff = self.create_avx2_128byte_coefficient(keys, reflected);
 
-        for block in rest {
-            let block_ptr = block.as_ptr() as *const u8;
+        for chunk in 1..chunks {
+            let block_ptr = data.add(chunk * 128);
 
             x[0] = x[0].fold_32(
                 &coeff,
@@ -141,9 +140,7 @@ impl X86_64Avx2VpclmulqdqOps {
             );
         }
 
-        let folded = self.fold_from_4x256_to_1x128(x, keys, reflected);
-
-        W::perform_final_reduction(folded, reflected, keys, self)
+        self.fold_from_4x256_to_1x128(x, keys, reflected)
     }
 
     /// Create a folding coefficient for AVX2 for 128-byte folding distances
@@ -159,8 +156,10 @@ impl X86_64Avx2VpclmulqdqOps {
         Simd256::new(k1, k2, k1, k2)
     }
 
-    /// Fold from 4 x 256-bit to 1 x 128-bit, the eight streams folded in parallel by their
-    /// distance from the last one, as the SSE tier does
+    /// Fold from 4 x 256-bit to 1 x 128-bit in two levels: each register onto the one 64
+    /// bytes on, then each lane of the two left onto the last lane by its own distance, with a
+    /// coefficient per lane, and the lanes xored together. Eight 256-bit multiplies in place of
+    /// fourteen 128-bit ones.
     #[inline(always)]
     unsafe fn fold_from_4x256_to_1x128(
         &self,
@@ -168,41 +167,155 @@ impl X86_64Avx2VpclmulqdqOps {
         keys: &[u64; 23],
         reflected: bool,
     ) -> __m128i {
-        // Create the fold coefficients for different distances
-        let fold_coefficients = [
-            self.create_vector_from_u64_pair(keys[10], keys[9], reflected), // 112 bytes
-            self.create_vector_from_u64_pair(keys[12], keys[11], reflected), // 96 bytes
-            self.create_vector_from_u64_pair(keys[14], keys[13], reflected), // 80 bytes
-            self.create_vector_from_u64_pair(keys[16], keys[15], reflected), // 64 bytes
-            self.create_vector_from_u64_pair(keys[18], keys[17], reflected), // 48 bytes
-            self.create_vector_from_u64_pair(keys[20], keys[19], reflected), // 32 bytes
-            self.create_vector_from_u64_pair(keys[2], keys[1], reflected),  // 16 bytes
-        ];
+        // Both bit orders hold the earlier 16 bytes of a register in lane 0. The lanes of the
+        // first register left are 48 and 32 bytes from the last 16; of the second, 16 and 0,
+        // and the last lane, which does not move, takes a zero key.
+        let pair = |high: u64, low: u64| if reflected { (high, low) } else { (low, high) };
+        let (h64, l64) = pair(keys[15], keys[16]);
+        let (h48, l48) = pair(keys[17], keys[18]);
+        let (h32, l32) = pair(keys[19], keys[20]);
+        let (h16, l16) = pair(keys[1], keys[2]);
+        let coeff_64 = Simd256::new(h64, l64, h64, l64);
+        let first_coeffs = Simd256::new(h32, l32, h48, l48);
+        let second_coeffs = Simd256::new(0, 0, h16, l16);
 
-        // The 8 x 128-bit streams in data order (both bit orders keep each stream in its own
-        // lane, so no lane swap is needed)
-        let v128 = [
-            x[0].to_128i_extract::<0>(),
-            x[0].to_128i_extract::<1>(),
-            x[1].to_128i_extract::<0>(),
-            x[1].to_128i_extract::<1>(),
-            x[2].to_128i_extract::<0>(),
-            x[2].to_128i_extract::<1>(),
-            x[3].to_128i_extract::<0>(),
-            x[3].to_128i_extract::<1>(),
-        ];
+        let a = x[0].fold_32(&coeff_64, &x[2]);
+        let b = x[1].fold_32(&coeff_64, &x[3]);
 
-        // Fold the 8 xmm registers to 1 xmm register
-        let mut res = v128[7];
+        let lanes = _mm256_xor_si256(
+            _mm256_xor_si256(
+                _mm256_xor_si256(
+                    _mm256_clmulepi64_epi128(a.0, first_coeffs.0, 0x00),
+                    _mm256_clmulepi64_epi128(a.0, first_coeffs.0, 0x11),
+                ),
+                _mm256_xor_si256(
+                    _mm256_clmulepi64_epi128(b.0, second_coeffs.0, 0x00),
+                    _mm256_clmulepi64_epi128(b.0, second_coeffs.0, 0x11),
+                ),
+            ),
+            _mm256_blend_epi32(_mm256_setzero_si256(), b.0, 0b1111_0000),
+        );
 
-        for (i, &coeff) in fold_coefficients.iter().enumerate() {
-            let folded_h = self.carryless_mul_00(v128[i], coeff);
-            let folded_l = self.carryless_mul_11(v128[i], coeff);
-            res = self.xor3_vectors(folded_h, folded_l, res);
-        }
-
-        res
+        _mm_xor_si128(
+            _mm256_castsi256_si128(lanes),
+            _mm256_extracti128_si256(lanes, 1),
+        )
     }
+}
+
+/// [`ArchOps::fold_short_wide`] in 256-bit registers, two blocks per carry-less multiply.
+/// The blocks are taken in 256-bit pairs and halved, in the manner of libdeflate's and the
+/// Linux kernel's x86 CRC templates: up to four pairs folded two onto two across 64 bytes, then
+/// a pair across 64 bytes onto each, one pair onto the other across 32 bytes, then a pair
+/// across 32 bytes, the pair's halves across 16 bytes, and a last block across 16 bytes. With
+/// 128-bit registers the same blocks take twice the multiplies, which on an EPYC 7R13 bound
+/// a buffer of 128 to 255 bytes. The AVX-512 tier takes it too.
+///
+/// # Safety
+///
+/// As for [`ArchOps::fold_short_wide`], and the CPU must have AVX2 and VPCLMULQDQ.
+#[inline]
+#[target_feature(enable = "avx2,vpclmulqdq")]
+pub(crate) unsafe fn fold_short_256(
+    head: __m128i,
+    data: *const u8,
+    units: usize,
+    head_in_data: bool,
+    keys: &[u64; 23],
+    reflected: bool,
+) -> __m128i {
+    debug_assert!((2..16).contains(&units));
+    // Block `i` is at `base + 16 * i`; without `head_in_data`, block 0 is `head`, and `base`
+    // itself is never read.
+    let base = if head_in_data {
+        data
+    } else {
+        data.wrapping_sub(16)
+    };
+    let reflector = create_reflector256(reflected);
+    macro_rules! pair_at {
+        ($unit:expr) => {
+            reflect_bytes256(&reflector, Simd256::load_from_ptr(base.add($unit * 16)))
+        };
+    }
+    macro_rules! block_at {
+        ($unit:expr) => {{
+            let block = _mm_loadu_si128(base.add($unit * 16) as *const __m128i);
+            match reflector {
+                Reflector256::NoReflector => block,
+                Reflector256::ForwardReflector { smask } => {
+                    _mm_shuffle_epi8(block, _mm256_castsi256_si128(smask.0))
+                }
+            }
+        }};
+    }
+    // The coefficient pairs, high and low per 128-bit lane, for each distance, as
+    // `fold_from_4x256_to_1x128` makes them.
+    macro_rules! coeff {
+        ($high:expr, $low:expr) => {{
+            let (h, l) = if reflected {
+                (keys[$high], keys[$low])
+            } else {
+                (keys[$low], keys[$high])
+            };
+            Simd256::new(h, l, h, l)
+        }};
+    }
+
+    // From the buffer's start, one load and the state into its low lane, as libdeflate does,
+    // where inserting a lane is a step more on the chain to the result.
+    let mut v0 = if head_in_data {
+        pair_at!(0).xor(&Simd256(_mm256_zextsi128_si256(head)))
+    } else {
+        Simd256(_mm256_inserti128_si256(
+            _mm256_castsi128_si256(head),
+            block_at!(1),
+            1,
+        ))
+    };
+    if units >= 4 {
+        let k32 = coeff!(19, 20);
+        let mut v1 = pair_at!(2);
+        let mut next = 4;
+        if units >= 8 {
+            let k64 = coeff!(15, 16);
+            v0 = v0.fold_32(&k64, &pair_at!(4));
+            v1 = v1.fold_32(&k64, &pair_at!(6));
+            next = 8;
+            if units & 4 != 0 {
+                v0 = v0.fold_32(&k64, &pair_at!(8));
+                v1 = v1.fold_32(&k64, &pair_at!(10));
+                next = 12;
+            }
+        }
+        v0 = v0.fold_32(&k32, &v1);
+        if units & 2 != 0 {
+            v0 = v0.fold_32(&k32, &pair_at!(next));
+        }
+    }
+
+    let k16 = _mm256_castsi256_si128(coeff!(1, 2).0);
+    // A macro rather than a closure, which LLVM may leave out of line without the features.
+    macro_rules! fold_16 {
+        ($x:expr, $next:expr) => {{
+            let x = $x;
+            _mm_xor_si128(
+                _mm_xor_si128(
+                    _mm_clmulepi64_si128(x, k16, 0x00),
+                    _mm_clmulepi64_si128(x, k16, 0x11),
+                ),
+                $next,
+            )
+        }};
+    }
+    let mut x = fold_16!(
+        _mm256_castsi256_si128(v0.0),
+        _mm256_extracti128_si256(v0.0, 1)
+    );
+    if units & 1 != 0 {
+        x = fold_16!(x, block_at!(units - 1));
+    }
+    x
 }
 
 // 256-bit version of the Reflector
@@ -262,15 +375,53 @@ impl ArchOps for X86_64Avx2VpclmulqdqOps {
     where
         Self::Vector: Copy,
     {
-        // Update the state with the result
+        let reflected = state.reflected;
+        let folded = self.fold_blocks(
+            state,
+            first.as_ptr() as *const u8,
+            1 + rest.len(),
+            keys,
+            reflected,
+        );
         *state = W::create_state(
-            self.process_blocks::<W>(state, first, rest, keys, state.reflected),
-            state.reflected,
+            W::perform_final_reduction(folded, reflected, keys, self),
+            reflected,
             self,
         );
 
         // Return true to indicate we handled it
         true
+    }
+
+    #[inline(always)]
+    unsafe fn fold_short_wide(
+        &self,
+        head: Self::Vector,
+        data: *const u8,
+        units: usize,
+        head_in_data: bool,
+        keys: &[u64; 23],
+        reflected: bool,
+    ) -> Option<Self::Vector> {
+        Some(fold_short_256(
+            head,
+            data,
+            units,
+            head_in_data,
+            keys,
+            reflected,
+        ))
+    }
+
+    #[inline(always)]
+    unsafe fn fold_simd_blocks_unaligned(
+        &self,
+        state: &CrcState<Self::Vector>,
+        data: *const u8,
+        chunks: usize,
+        keys: &[u64; 23],
+    ) -> Option<Self::Vector> {
+        Some(self.fold_blocks(state, data, chunks, keys, state.reflected))
     }
 
     // Delegate all other methods to X86SsePclmulqdqOps

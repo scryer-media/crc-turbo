@@ -15,28 +15,55 @@
 mod aarch64;
 mod x86;
 
-/// A fusion kernel: the CRC state after `data`, from the state before it. `unsafe` because it
-/// carries the target features of the tier it was selected for.
+/// The aarch64 fusion kernel this CPU runs, for CRC-32/ISCSI and CRC-32/ISO-HDLC alike, or
+/// `None` when it has to take the folding path.
+///
+/// The choice is kept in one byte, read with a relaxed load: 0 before it is made, then 1 for
+/// none, 2 for the PMULL kernel and 3 for the EOR3 one. The byte carries the choice itself and
+/// publishes nothing else, and every thread that makes it makes the same one. The caller then
+/// calls the CRC32 loop or the kernel directly, which a pointer would not let it inline: where
+/// the target already has the features, as on Apple's, `checksum` calls the CRC32 loop or the
+/// fold itself, with no wrapper between.
+#[inline(always)]
 #[cfg(all(feature = "std", target_arch = "aarch64"))]
-type FusionFn = unsafe fn(u32, &[u8]) -> u32;
+fn aarch64_kernel() -> Option<aarch64::FusionKernel> {
+    use core::sync::atomic::{AtomicU8, Ordering};
+
+    use aarch64::FusionKernel;
+
+    static KERNEL: AtomicU8 = AtomicU8::new(0);
+
+    #[cold]
+    fn choose() -> Option<FusionKernel> {
+        let tier = crate::feature_detection::get_arch_ops().get_tier();
+        let kernel = aarch64::select_kernel(tier, std::arch::is_aarch64_feature_detected!("crc"));
+        let byte = match kernel {
+            None => 1,
+            Some(FusionKernel::Pmull) => 2,
+            Some(FusionKernel::PmullSha3) => 3,
+        };
+        KERNEL.store(byte, Ordering::Relaxed);
+
+        kernel
+    }
+
+    match KERNEL.load(Ordering::Relaxed) {
+        0 => choose(),
+        2 => Some(FusionKernel::Pmull),
+        3 => Some(FusionKernel::PmullSha3),
+        _ => None,
+    }
+}
 
 /// CRC-32/ISCSI through this CPU's fusion kernel, or `None` when it has to take the folding path.
 /// Both AArch64 and x86 have native CRC-32/ISCSI instructions.
 #[inline(always)]
 #[cfg(all(feature = "std", target_arch = "aarch64"))]
 pub(crate) fn crc32_iscsi(state: u32, data: &[u8]) -> Option<u32> {
-    static KERNEL: std::sync::OnceLock<Option<FusionFn>> = std::sync::OnceLock::new();
+    let kernel = aarch64_kernel()?;
 
-    let kernel = (*KERNEL.get_or_init(|| {
-        let tier = crate::feature_detection::get_arch_ops().get_tier();
-
-        aarch64::select_kernel(tier, std::arch::is_aarch64_feature_detected!("crc"))
-            .map(aarch64::iscsi_kernel_fn)
-    }))?;
-
-    // SAFETY: the kernel was selected for the tier this CPU runs, which has the carry-less
-    // multiply it needs, after detecting the CRC32 instructions
-    Some(unsafe { kernel(state, data) })
+    // SAFETY: the kernel was selected for the tier this CPU runs
+    Some(unsafe { aarch64::crc32_iscsi_with(kernel, state, data) })
 }
 
 /// CRC-32/ISCSI through this CPU's plan: the CRC32 instruction alone for a short buffer, the
@@ -77,15 +104,8 @@ pub(crate) fn crc32_iscsi(state: u32, data: &[u8]) -> Option<u32> {
 #[inline(always)]
 #[cfg(all(feature = "std", target_arch = "aarch64"))]
 pub(crate) fn crc32_iso_hdlc(state: u32, data: &[u8]) -> Option<u32> {
-    static KERNEL: std::sync::OnceLock<Option<FusionFn>> = std::sync::OnceLock::new();
+    let kernel = aarch64_kernel()?;
 
-    let kernel = (*KERNEL.get_or_init(|| {
-        let tier = crate::feature_detection::get_arch_ops().get_tier();
-
-        aarch64::select_kernel(tier, std::arch::is_aarch64_feature_detected!("crc"))
-            .map(aarch64::iso_hdlc_kernel_fn)
-    }))?;
-
-    // SAFETY: as for `crc32_iscsi`
-    Some(unsafe { kernel(state, data) })
+    // SAFETY: the kernel was selected for the tier this CPU runs
+    Some(unsafe { aarch64::crc32_iso_hdlc_with(kernel, state, data) })
 }

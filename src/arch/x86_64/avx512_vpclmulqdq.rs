@@ -11,7 +11,6 @@ use crate::enums::Reflector;
 use crate::structs::CrcState;
 use crate::traits::{ArchOps, EnhancedCrcWidth};
 use core::arch::x86_64::*;
-use core::ops::BitXor;
 
 /// Implements the ArchOps trait using 512-bit AVX-512 and VPCLMULQDQ instructions at 512 bits.
 /// Delegates to X86SsePclmulqdqOps for standard 128-bit operations
@@ -75,12 +74,6 @@ impl Simd512 {
 
     #[inline]
     #[target_feature(enable = "avx512f")]
-    unsafe fn to_128i_extract<const INDEX: i32>(self) -> __m128i {
-        _mm512_extracti32x4_epi32(self.0, INDEX)
-    }
-
-    #[inline]
-    #[target_feature(enable = "avx512f")]
     unsafe fn xor(&self, other: &Self) -> Self {
         Self(_mm512_xor_si512(self.0, other.0))
     }
@@ -107,23 +100,28 @@ impl Simd512 {
 }
 
 impl X86_64Avx512VpclmulqdqOps {
-    /// Process aligned blocks using VPCLMULQDQ with 4 x 512-bit registers
+    /// Folds `chunks` 128-byte blocks from `data`, which need not be aligned, with 4 x 512-bit
+    /// registers, into one 128-bit vector ready for the final reduction.
     ///
-    /// Note that #[inline(always)] loses the inlining performance boost, despite no native
-    /// target_features being used directly. Odd since that's not how Rust's docs make it sound...
+    /// # Safety
+    ///
+    /// `data` must be valid for reads of `chunks * 128` bytes, and `chunks` at least 2.
+    ///
+    /// Inlined into the tier's entry, without a `target_feature` of its own, it was 1.39x faster
+    /// at 256 bytes, 1.23x at 512 and 1.08x at 4 KiB on a Xeon Platinum 8375C, but a caller not
+    /// itself inlined into the entry then calls each helper and intrinsic: forward CRCs ran 0.4x
+    /// as fast from 64 KiB. So it keeps its features and stays a call.
     #[inline]
     #[target_feature(enable = "avx512vl,avx512bw,vpclmulqdq")]
-    unsafe fn process_blocks<W: EnhancedCrcWidth>(
+    unsafe fn fold_blocks(
         &self,
-        state: &mut CrcState<<X86_64Avx512VpclmulqdqOps as ArchOps>::Vector>,
-        first: &[__m128i; 8],
-        rest: &[[__m128i; 8]],
+        state: &CrcState<<X86_64Avx512VpclmulqdqOps as ArchOps>::Vector>,
+        data: *const u8,
+        chunks: usize,
         keys: &[u64; 23],
         reflected: bool,
-    ) -> W::Value
-    where
-        W::Value: Copy + BitXor<Output = W::Value>,
-    {
+    ) -> __m128i {
+        debug_assert!(chunks >= 2);
         let state_u64s = self.extract_u64s(state.value);
 
         let positioned_state = if reflected {
@@ -134,9 +132,9 @@ impl X86_64Avx512VpclmulqdqOps {
 
         let reflector = create_reflector512(reflected);
 
-        // Load first 256 bytes (2nd half is rest[0] since these are 128-byte blocks)
-        let first_ptr = first.as_ptr() as *const u8;
-        let first_rest_ptr = rest[0].as_ptr() as *const u8;
+        // The first 256 bytes
+        let first_ptr = data;
+        let first_rest_ptr = data.add(128);
 
         let mut x = [
             reflect_bytes512(&reflector, Simd512::load_from_ptr(first_ptr)),
@@ -149,12 +147,12 @@ impl X86_64Avx512VpclmulqdqOps {
 
         let coeff = self.create_avx512_256byte_coefficient(keys, reflected);
 
-        let remaining_rest = &rest[1..];
-        let pair_count = remaining_rest.len() / 2;
+        let remaining = chunks - 2;
+        let pair_count = remaining / 2;
 
         for i in 0..pair_count {
-            let block1_ptr = remaining_rest[i * 2].as_ptr() as *const u8;
-            let block2_ptr = remaining_rest[i * 2 + 1].as_ptr() as *const u8;
+            let block1_ptr = data.add(256 + i * 256);
+            let block2_ptr = block1_ptr.add(128);
 
             x[0] = x[0].fold_64(
                 &coeff,
@@ -174,16 +172,13 @@ impl X86_64Avx512VpclmulqdqOps {
             );
         }
 
-        let processed_pairs = pair_count * 2;
-        let remaining_single_count = remaining_rest.len() - processed_pairs;
-
-        if remaining_single_count > 0 {
+        if remaining % 2 == 1 {
             // We have 1 unprocessed block (128 bytes)
             // Fold 4×512 down to 2×512 and process the remaining block with 2-register mode
             let folded_2reg = self.fold_from_4x512_to_2x256(x, keys, reflected);
             let coeff_2reg = self.create_avx512_128byte_coefficient(keys, reflected);
 
-            let last_block_ptr = remaining_rest[processed_pairs].as_ptr() as *const u8;
+            let last_block_ptr = data.add((chunks - 1) * 128);
 
             let final_x = [
                 folded_2reg[0].fold_64(
@@ -196,15 +191,11 @@ impl X86_64Avx512VpclmulqdqOps {
                 ),
             ];
 
-            let folded = self.fold_from_2x512_to_1x128(final_x, keys, reflected);
-
-            return W::perform_final_reduction(folded, reflected, keys, self);
+            return self.fold_from_2x512_to_1x128(final_x, keys, reflected);
         }
 
         // All blocks processed in pairs - fold from 4 x 512-bit to 1 x 128-bit
-        let folded = self.fold_from_4x512_to_1x128(x, keys, reflected);
-
-        W::perform_final_reduction(folded, reflected, keys, self)
+        self.fold_from_4x512_to_1x128(x, keys, reflected)
     }
 
     /// Create a folding coefficient for AVX-512 for 128-byte folding distances
@@ -273,7 +264,10 @@ impl X86_64Avx512VpclmulqdqOps {
         [x[0].fold_64(&coeff, &x[2]), x[1].fold_64(&coeff, &x[3])]
     }
 
-    /// Fold from 2 x 512-bit to 1 x 128-bit
+    /// Fold from 2 x 512-bit to 1 x 128-bit as a tree: the first register onto the second, 64
+    /// bytes on, then each lane of that onto the last lane by its own distance in one multiply
+    /// with a coefficient per lane, and the four lanes xored together. Four 512-bit multiplies
+    /// in place of fourteen 128-bit ones folded in a chain.
     #[inline(always)]
     unsafe fn fold_from_2x512_to_1x128(
         &self,
@@ -281,53 +275,47 @@ impl X86_64Avx512VpclmulqdqOps {
         keys: &[u64; 23],
         reflected: bool,
     ) -> __m128i {
-        // Create the fold coefficients for different distances
-        let fold_coefficients = [
-            self.create_vector_from_u64_pair(keys[10], keys[9], reflected), // 112 bytes
-            self.create_vector_from_u64_pair(keys[12], keys[11], reflected), // 96 bytes
-            self.create_vector_from_u64_pair(keys[14], keys[13], reflected), // 80 bytes
-            self.create_vector_from_u64_pair(keys[16], keys[15], reflected), // 64 bytes
-            self.create_vector_from_u64_pair(keys[18], keys[17], reflected), // 48 bytes
-            self.create_vector_from_u64_pair(keys[20], keys[19], reflected), // 32 bytes
-            self.create_vector_from_u64_pair(keys[2], keys[1], reflected),  // 16 bytes
-        ];
-
-        // Extract the 8 x 128-bit vectors from the 2 x 512-bit vectors (this is faster than
-        // using 256-bit intrinsics for 1KiB payloads)
-        let v128 = if reflected {
-            [
-                x[0].to_128i_extract::<0>(), // 256-x0.low
-                x[0].to_128i_extract::<1>(), // 256-x0.high
-                x[0].to_128i_extract::<2>(), // 256-x1.low
-                x[0].to_128i_extract::<3>(), // 256-x1.high
-                x[1].to_128i_extract::<0>(), // 256-x2.low
-                x[1].to_128i_extract::<1>(), // 256-x2.high
-                x[1].to_128i_extract::<2>(), // 256-x3.low
-                x[1].to_128i_extract::<3>(), // 256-x3.high
-            ]
+        // Reflected streams hold the earliest 16 bytes in lane 0; forward ones, byte-reversed
+        // per 64 bytes, hold them in lane 3. Each lane takes the key for its distance from the
+        // last 16 bytes (48, 32, 16), and the last lane, which does not move, a zero key.
+        let (coeff_64, lane_coeffs, last_lane) = if reflected {
+            (
+                Simd512::new(
+                    keys[15], keys[16], keys[15], keys[16], keys[15], keys[16], keys[15], keys[16],
+                ),
+                Simd512::new(
+                    0, 0, keys[1], keys[2], keys[19], keys[20], keys[17], keys[18],
+                ),
+                0b1100_0000,
+            )
         } else {
-            [
-                x[0].to_128i_extract::<3>(), // 256-x1.high
-                x[0].to_128i_extract::<2>(), // 256-x1.low
-                x[0].to_128i_extract::<1>(), // 256-x0.high
-                x[0].to_128i_extract::<0>(), // 256-x0.low
-                x[1].to_128i_extract::<3>(), // 256-x3.high
-                x[1].to_128i_extract::<2>(), // 256-x3.low
-                x[1].to_128i_extract::<1>(), // 256-x2.high
-                x[1].to_128i_extract::<0>(), // 256-x2.low
-            ]
+            (
+                Simd512::new(
+                    keys[16], keys[15], keys[16], keys[15], keys[16], keys[15], keys[16], keys[15],
+                ),
+                Simd512::new(
+                    keys[18], keys[17], keys[20], keys[19], keys[2], keys[1], 0, 0,
+                ),
+                0b0000_0011,
+            )
         };
 
-        // Fold the 8 xmm registers to 1 xmm register
-        let mut res = v128[7];
+        let y = x[0].fold_64(&coeff_64, &x[1]);
+        let lanes = _mm512_ternarylogic_epi64(
+            _mm512_clmulepi64_epi128(y.0, lane_coeffs.0, 0x00),
+            _mm512_clmulepi64_epi128(y.0, lane_coeffs.0, 0x11),
+            _mm512_maskz_mov_epi64(last_lane, y.0),
+            0x96,
+        );
+        let halves = _mm256_xor_si256(
+            _mm512_castsi512_si256(lanes),
+            _mm512_extracti64x4_epi64(lanes, 1),
+        );
 
-        for (i, &coeff) in fold_coefficients.iter().enumerate() {
-            let folded_h = self.carryless_mul_00(v128[i], coeff);
-            let folded_l = self.carryless_mul_11(v128[i], coeff);
-            res = self.xor3_vectors(folded_h, folded_l, res);
-        }
-
-        res
+        _mm_xor_si128(
+            _mm256_castsi256_si128(halves),
+            _mm256_extracti128_si256(halves, 1),
+        )
     }
 }
 
@@ -399,15 +387,57 @@ impl ArchOps for X86_64Avx512VpclmulqdqOps {
     where
         Self::Vector: Copy,
     {
-        // Update the state with the result
+        let reflected = state.reflected;
+        let folded = self.fold_blocks(
+            state,
+            first.as_ptr() as *const u8,
+            1 + rest.len(),
+            keys,
+            reflected,
+        );
         *state = W::create_state(
-            self.process_blocks::<W>(state, first, rest, keys, state.reflected),
-            state.reflected,
+            W::perform_final_reduction(folded, reflected, keys, self),
+            reflected,
             self,
         );
 
         // Return true to indicate we handled it
         true
+    }
+
+    #[inline(always)]
+    unsafe fn fold_short_wide(
+        &self,
+        head: Self::Vector,
+        data: *const u8,
+        units: usize,
+        head_in_data: bool,
+        keys: &[u64; 23],
+        reflected: bool,
+    ) -> Option<Self::Vector> {
+        Some(crate::arch::x86_64::avx2_vpclmulqdq::fold_short_256(
+            head,
+            data,
+            units,
+            head_in_data,
+            keys,
+            reflected,
+        ))
+    }
+
+    #[inline(always)]
+    unsafe fn fold_simd_blocks_unaligned(
+        &self,
+        state: &CrcState<Self::Vector>,
+        data: *const u8,
+        chunks: usize,
+        keys: &[u64; 23],
+    ) -> Option<Self::Vector> {
+        // The 512-bit fold starts from two chunks, 256 bytes.
+        if chunks < 2 {
+            return None;
+        }
+        Some(self.fold_blocks(state, data, chunks, keys, state.reflected))
     }
 
     // Delegate all other methods to X86SsePclmulqdqOps

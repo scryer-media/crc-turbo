@@ -203,12 +203,7 @@ impl EnhancedCrcWidth for crate::structs::Width64 {
 }
 
 /// Process inputs smaller than 16 bytes
-#[inline]
-#[cfg_attr(
-    any(target_arch = "x86", target_arch = "x86_64"),
-    target_feature(enable = "ssse3,sse4.1,pclmulqdq")
-)]
-#[cfg_attr(target_arch = "aarch64", target_feature(enable = "aes"))]
+#[inline(always)]
 pub(crate) unsafe fn process_0_to_15<T: ArchOps, W: EnhancedCrcWidth>(
     data: &[u8],
     state: &mut CrcState<T::Vector>,
@@ -219,11 +214,7 @@ pub(crate) unsafe fn process_0_to_15<T: ArchOps, W: EnhancedCrcWidth>(
 where
     T::Vector: Copy,
 {
-    // Create a zero-initialized aligned buffer
-    let mut buffer = [0u8; CRC_CHUNK_SIZE];
-
-    // Copy input data into the buffer
-    buffer[..data.len()].copy_from_slice(data);
+    let buffer = crate::algorithm::short_block(data, 0);
 
     // Get the length for processing
     let len = data.len() as i32;

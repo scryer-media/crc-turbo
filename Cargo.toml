@@ -1,6 +1,6 @@
 [package]
 name = "crc-turbo"
-version = "1.11.2"
+version = "1.11.1"
 edition = "2021"
 authors = ["Don MacAskill", "NZB Man"]
 # src/combine.rs carries Zlib-licensed code; its notice is in that file.
@@ -12,7 +12,7 @@ repository = "https://github.com/scryer-media/crc-turbo"
 description = "SIMD-accelerated CRC-16, CRC-32 and CRC-64 for every known variant, with a C-compatible library; a maintained fork of crc-fast"
 readme = "README.md"
 # Repository scaffolding that has no business in the crate archive.
-exclude = [".github/", ".githooks/", ".gitleaks.toml", ".gitattributes", ".kiro/", "renovate.json", "AGENTS.md", ".cargo/", "xtask/", "fuzz/", "rust-toolchain.toml", "Makefile", "docs/"]
+exclude = [".github/", ".githooks/", ".gitleaks.toml", ".gitattributes", ".kiro/", "renovate.json", "AGENTS.md", ".cargo/", "xtask/", "fuzz/", "wasm-size/", "rust-toolchain.toml", "Makefile", "docs/"]
 
 # important intrinsics stabilization notes:
 # 1.69.0 added VPCLMULQDQ x86 detection support
@@ -24,7 +24,7 @@ rust-version = "1.89"
 # is its own workspace, built on nightly by cargo-fuzz.
 [workspace]
 members = ["xtask"]
-exclude = ["fuzz"]
+exclude = ["fuzz", "wasm-size"]
 
 # An ordinary Rust library. The C library (libcrc_turbo as cdylib and
 # staticlib) is built by `capi/`: Cargo builds every crate type a library

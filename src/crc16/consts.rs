@@ -828,7 +828,7 @@ pub const CRC16_XMODEM: CrcParams = CrcParams {
 };
 
 pub const KEYS_8005_FORWARD: [u64; 23] = [
-    0x0000000000000000,
+    0xfffbffe7ffaffe1f,
     0x8663000000000000,
     0x8617000000000000,
     0x8665000000000000,
@@ -854,7 +854,7 @@ pub const KEYS_8005_FORWARD: [u64; 23] = [
 ];
 
 pub const KEYS_8005_REFLECTED: [u64; 23] = [
-    0x0000000000000000,
+    0xf0ffebffcfffbfff,
     0x0000000000018cc2,
     0x000000000001d0c2,
     0x0000000000014cc2,
@@ -880,7 +880,7 @@ pub const KEYS_8005_REFLECTED: [u64; 23] = [
 ];
 
 pub const KEYS_C867_FORWARD: [u64; 23] = [
-    0x0000000000000000,
+    0xbcf9ccb5f4565b5d,
     0x1473000000000000,
     0x7386000000000000,
     0x8388000000000000,
@@ -906,7 +906,7 @@ pub const KEYS_C867_FORWARD: [u64; 23] = [
 ];
 
 pub const KEYS_0589_FORWARD: [u64; 23] = [
-    0x0000000000000000,
+    0x05981d3faa15b31e,
     0xc2ee000000000000,
     0xf795000000000000,
     0x58e7000000000000,
@@ -932,7 +932,7 @@ pub const KEYS_0589_FORWARD: [u64; 23] = [
 ];
 
 pub const KEYS_3D65_REFLECTED: [u64; 23] = [
-    0x0000000000000000,
+    0x124f9628f81e8e39,
     0x0000000000001612,
     0x0000000000004d8c,
     0x0000000000017d88,
@@ -958,7 +958,7 @@ pub const KEYS_3D65_REFLECTED: [u64; 23] = [
 ];
 
 pub const KEYS_3D65_FORWARD: [u64; 23] = [
-    0x0000000000000000,
+    0x38e2f03e28d3e490,
     0x90d0000000000000,
     0x6364000000000000,
     0x237d000000000000,
@@ -984,7 +984,7 @@ pub const KEYS_3D65_FORWARD: [u64; 23] = [
 ];
 
 pub const KEYS_1021_FORWARD: [u64; 23] = [
-    0x0000000000000000,
+    0x11303471a041b343,
     0xeb23000000000000,
     0x10e2000000000000,
     0xfa0d000000000000,
@@ -1010,7 +1010,7 @@ pub const KEYS_1021_FORWARD: [u64; 23] = [
 ];
 
 pub const KEYS_6F63_FORWARD: [u64; 23] = [
-    0x0000000000000000,
+    0x7d0b9ecc50d07d1f,
     0xe601000000000000,
     0xf83f000000000000,
     0x29c0000000000000,
@@ -1036,7 +1036,7 @@ pub const KEYS_6F63_FORWARD: [u64; 23] = [
 ];
 
 pub const KEYS_5935_FORWARD: [u64; 23] = [
-    0x0000000000000000,
+    0x4ce5c8be4ded0f76,
     0x0d0e000000000000,
     0x5163000000000000,
     0x1286000000000000,
@@ -1062,7 +1062,7 @@ pub const KEYS_5935_FORWARD: [u64; 23] = [
 ];
 
 pub const KEYS_080B_REFLECTED: [u64; 23] = [
-    0x0000000000000000,
+    0x29a9c7bb80912421,
     0x000000000001986c,
     0x0000000000006b98,
     0x00000000000016a8,
@@ -1088,7 +1088,7 @@ pub const KEYS_080B_REFLECTED: [u64; 23] = [
 ];
 
 pub const KEYS_755B_FORWARD: [u64; 23] = [
-    0x0000000000000000,
+    0x67c863d93444371d,
     0x0e5f000000000000,
     0x21d3000000000000,
     0x16bf000000000000,
@@ -1114,7 +1114,7 @@ pub const KEYS_755B_FORWARD: [u64; 23] = [
 ];
 
 pub const KEYS_1DCF_FORWARD: [u64; 23] = [
-    0x0000000000000000,
+    0x1c84275218939ac6,
     0x4ee2000000000000,
     0x8462000000000000,
     0xfe12000000000000,
@@ -1140,7 +1140,7 @@ pub const KEYS_1DCF_FORWARD: [u64; 23] = [
 ];
 
 pub const KEYS_A097_FORWARD: [u64; 23] = [
-    0x0000000000000000,
+    0xd31c0419bbaa08b9,
     0x4c3f000000000000,
     0xc8aa000000000000,
     0x6e48000000000000,
@@ -1166,7 +1166,7 @@ pub const KEYS_A097_FORWARD: [u64; 23] = [
 ];
 
 pub const KEYS_8BB7_FORWARD: [u64; 23] = [
-    0x0000000000000000,
+    0xf65a57f81d33a48a,
     0x2d56000000000000, // 2^(32* 3) mod Q << 32
     0x06df000000000000, // 2^(32* 5) mod Q << 32
     0x9d9d000000000000, // 2^(32*31) mod Q << 32
@@ -1192,7 +1192,7 @@ pub const KEYS_8BB7_FORWARD: [u64; 23] = [
 ];
 
 pub const KEYS_1021_REVERSE: [u64; 23] = [
-    0x0000000000000000,
+    0x859b040b1c581911,
     0x00000000000189ae, // (2^(32* 3) mod P(x))' << 1
     0x0000000000008e10, // (2^(32* 5) mod P(x))' << 1
     0x00000000000160be, // (2^(32*31) mod P(x))' << 1

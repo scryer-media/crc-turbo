@@ -14,20 +14,32 @@
 
 mod iscsi;
 mod iso_hdlc;
+mod lanes;
+mod shifts;
 
 use core::arch::aarch64::*;
 
 use crate::feature_detection::PerformanceTier;
 
-use iscsi::crc_pmull::crc32_iscsi_v12e_v1;
 use iscsi::crc_pmull_sha3::crc32_iscsi_eor3_v9s3x2e_s3;
-use iso_hdlc::crc_pmull::crc32_iso_hdlc_v12e_v1;
 use iso_hdlc::crc_pmull_sha3::crc32_iso_hdlc_eor3_v9s3x2e_s3;
+use lanes::{
+    crc32_iscsi_eor3_v4, crc32_iscsi_eor3_v8, crc32_iscsi_v3s4, crc32_iscsi_v4, crc32_iscsi_v8,
+    crc32_iso_hdlc_eor3_v4, crc32_iso_hdlc_eor3_v8, crc32_iso_hdlc_v3s4, crc32_iso_hdlc_v4,
+    crc32_iso_hdlc_v8,
+};
 
-/// Buffers shorter than this run the unrolled CRC32 instruction loop. There's some variance among
-/// different aarch64 CPUs (Apple Silicon, AWS Graviton, etc.), but 127 bytes is the "small"
-/// threshold where this is generally faster.
-const SMALL_BUFFER_END: usize = 128;
+/// Buffers shorter than this run the unrolled CRC32 instruction loop; from here the four-lane
+/// fold is faster on Graviton 2, 3 and 4 and on Apple's cores.
+const SMALL_BUFFER_END: usize = 64;
+
+/// Buffers shorter than this run the four-lane fold; from here the eight-lane one.
+const FOUR_LANE_END: usize = 256;
+
+/// Buffers shorter than this run the eight-lane fold; from here the SHA3 tier adds three CRC32
+/// instruction streams beside a nine-lane EOR3 fold (`v9s3x2e_s3`), and the PMULL tier four
+/// beside a three-lane fold (`v3s4x2e_v2`).
+pub(crate) const LARGE_BUFFER_THRESHOLD: usize = 2048;
 
 /// The fusion kernels a tier runs, for CRC-32/ISCSI and CRC-32/ISO-HDLC alike.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,123 +67,69 @@ pub(crate) fn select_kernel(tier: PerformanceTier, has_crc: bool) -> Option<Fusi
     }
 }
 
-/// The CRC-32/ISCSI function for `kernel`, to be resolved once and then called for every buffer.
-///
-/// It is handed out as it is, `unsafe` and with its target features, rather than behind a safe
-/// wrapper: a wrapper cannot be inlined into, and the extra call it makes costs a short buffer
-/// several cycles. Calling it is sound when `kernel` came from [`select_kernel`] for the tier
-/// the CPU runs.
-pub(crate) fn iscsi_kernel_fn(kernel: FusionKernel) -> unsafe fn(u32, &[u8]) -> u32 {
-    match kernel {
-        FusionKernel::Pmull => crc32_iscsi_pmull,
-        FusionKernel::PmullSha3 => crc32_iscsi_pmull_sha3,
-    }
-}
-
-/// The CRC-32/ISO-HDLC function for `kernel`; see [`iscsi_kernel_fn`].
-pub(crate) fn iso_hdlc_kernel_fn(kernel: FusionKernel) -> unsafe fn(u32, &[u8]) -> u32 {
-    match kernel {
-        FusionKernel::Pmull => crc32_iso_hdlc_pmull,
-        FusionKernel::PmullSha3 => crc32_iso_hdlc_pmull_sha3,
-    }
-}
-
-/// CRC-32/ISCSI through the EOR3 kernel, for the `aarch64-neon-pmull-sha3` tier.
+/// CRC-32/ISCSI through `kernel`: the CRC32 instruction loop below [`SMALL_BUFFER_END`]
+/// bytes, then the four-lane fold, the eight-lane fold, and from [`LARGE_BUFFER_THRESHOLD`] the
+/// SHA3 tier's EOR3 kernel with three CRC32 streams beside its fold (`v9s3x2e_s3`) or the PMULL
+/// tier's four CRC32 streams beside a three-lane fold (`v3s4x2e_v2`). Each is a direct call, so where the target already has
+/// the features the caller calls the loop or the fold itself, with nothing in between.
 ///
 /// # Safety
 ///
-/// The CPU must have the CRC32, PMULL and SHA3 extensions.
-#[target_feature(enable = "crc,aes,sha3")]
-pub(crate) unsafe fn crc32_iscsi_pmull_sha3(crc: u32, data: &[u8]) -> u32 {
-    if data.len() < SMALL_BUFFER_END {
-        return crc32_iscsi_small_fast(crc, data);
-    }
-
-    crc32_iscsi_aes_sha3(crc, data, data.len())
-}
-
-/// CRC-32/ISCSI through the PMULL kernel, for the `aarch64-neon-pmull` tier.
-///
-/// # Safety
-///
-/// The CPU must have the CRC32 and PMULL extensions.
-#[target_feature(enable = "crc,aes")]
-pub(crate) unsafe fn crc32_iscsi_pmull(crc: u32, data: &[u8]) -> u32 {
-    if data.len() < SMALL_BUFFER_END {
-        return crc32_iscsi_small_fast(crc, data);
-    }
-
-    crc32_iscsi_aes(crc, data, data.len())
-}
-
-/// CRC-32/ISO-HDLC through the EOR3 kernel, for the `aarch64-neon-pmull-sha3` tier.
-///
-/// # Safety
-///
-/// The CPU must have the CRC32, PMULL and SHA3 extensions.
-#[target_feature(enable = "crc,aes,sha3")]
-pub(crate) unsafe fn crc32_iso_hdlc_pmull_sha3(crc: u32, data: &[u8]) -> u32 {
-    if data.len() < SMALL_BUFFER_END {
-        return crc32_iso_hdlc_small_fast(crc, data);
-    }
-
-    crc32_iso_hdlc_aes_sha3(crc, data, data.len())
-}
-
-/// CRC-32/ISO-HDLC through the PMULL kernel, for the `aarch64-neon-pmull` tier.
-///
-/// # Safety
-///
-/// The CPU must have the CRC32 and PMULL extensions.
-#[target_feature(enable = "crc,aes")]
-pub(crate) unsafe fn crc32_iso_hdlc_pmull(crc: u32, data: &[u8]) -> u32 {
-    if data.len() < SMALL_BUFFER_END {
-        return crc32_iso_hdlc_small_fast(crc, data);
-    }
-
-    crc32_iso_hdlc_aes(crc, data, data.len())
-}
-
-#[inline]
-#[target_feature(enable = "crc,aes,sha3")]
-unsafe fn crc32_iscsi_aes_sha3(crc: u32, data: &[u8], data_len: usize) -> u32 {
+/// `kernel` came from [`select_kernel`] for the tier the CPU runs.
+#[inline(always)]
+pub(crate) unsafe fn crc32_iscsi_with(kernel: FusionKernel, crc: u32, data: &[u8]) -> u32 {
+    let (ptr, len) = (data.as_ptr(), data.len());
+    // SAFETY: either kernel is only selected for a tier with PMULL, and the EOR3 one for the
+    // tier with SHA3, after detecting the CRC32 instructions
     unsafe {
-        const LARGE_BUFFER_THRESHOLD: usize = 1024;
-
-        // Select implementation based on buffer size
-        if data_len <= LARGE_BUFFER_THRESHOLD {
-            crc32_iscsi_v12e_v1(crc, data.as_ptr(), data_len)
+        if len < SMALL_BUFFER_END {
+            crc32_iscsi_small_fast(crc, data)
+        } else if kernel == FusionKernel::PmullSha3 {
+            if len < FOUR_LANE_END {
+                crc32_iscsi_eor3_v4(crc, ptr, len)
+            } else if len < LARGE_BUFFER_THRESHOLD {
+                crc32_iscsi_eor3_v8(crc, ptr, len)
+            } else {
+                crc32_iscsi_eor3_v9s3x2e_s3(crc, ptr, len)
+            }
+        } else if len < FOUR_LANE_END {
+            crc32_iscsi_v4(crc, ptr, len)
+        } else if len < LARGE_BUFFER_THRESHOLD {
+            crc32_iscsi_v8(crc, ptr, len)
         } else {
-            crc32_iscsi_eor3_v9s3x2e_s3(crc, data.as_ptr(), data_len)
+            crc32_iscsi_v3s4(crc, ptr, len)
         }
     }
 }
 
-#[inline]
-#[target_feature(enable = "crc,aes")]
-unsafe fn crc32_iscsi_aes(crc: u32, data: &[u8], data_len: usize) -> u32 {
-    unsafe { crc32_iscsi_v12e_v1(crc, data.as_ptr(), data_len) }
-}
-
-#[inline]
-#[target_feature(enable = "crc,aes,sha3")]
-unsafe fn crc32_iso_hdlc_aes_sha3(crc: u32, data: &[u8], data_len: usize) -> u32 {
+/// CRC-32/ISO-HDLC through `kernel`; see [`crc32_iscsi_with`].
+///
+/// # Safety
+///
+/// `kernel` came from [`select_kernel`] for the tier the CPU runs.
+#[inline(always)]
+pub(crate) unsafe fn crc32_iso_hdlc_with(kernel: FusionKernel, crc: u32, data: &[u8]) -> u32 {
+    let (ptr, len) = (data.as_ptr(), data.len());
+    // SAFETY: as for `crc32_iscsi_with`
     unsafe {
-        const LARGE_BUFFER_THRESHOLD: usize = 1024;
-
-        // Select implementation based on buffer size
-        if data_len <= LARGE_BUFFER_THRESHOLD {
-            crc32_iso_hdlc_v12e_v1(crc, data.as_ptr(), data_len)
+        if len < SMALL_BUFFER_END {
+            crc32_iso_hdlc_small_fast(crc, data)
+        } else if kernel == FusionKernel::PmullSha3 {
+            if len < FOUR_LANE_END {
+                crc32_iso_hdlc_eor3_v4(crc, ptr, len)
+            } else if len < LARGE_BUFFER_THRESHOLD {
+                crc32_iso_hdlc_eor3_v8(crc, ptr, len)
+            } else {
+                crc32_iso_hdlc_eor3_v9s3x2e_s3(crc, ptr, len)
+            }
+        } else if len < FOUR_LANE_END {
+            crc32_iso_hdlc_v4(crc, ptr, len)
+        } else if len < LARGE_BUFFER_THRESHOLD {
+            crc32_iso_hdlc_v8(crc, ptr, len)
         } else {
-            crc32_iso_hdlc_eor3_v9s3x2e_s3(crc, data.as_ptr(), data_len)
+            crc32_iso_hdlc_v3s4(crc, ptr, len)
         }
     }
-}
-
-#[inline]
-#[target_feature(enable = "crc,aes")]
-unsafe fn crc32_iso_hdlc_aes(crc: u32, data: &[u8], data_len: usize) -> u32 {
-    unsafe { crc32_iso_hdlc_v12e_v1(crc, data.as_ptr(), data_len) }
 }
 
 #[inline]
@@ -198,52 +156,134 @@ unsafe fn clmul_scalar(a: u32, b: u32) -> uint64x2_t {
     vreinterpretq_u64_p128(result)
 }
 
+/// `pmull` and the `eor` that consumes it, written as one pair so they stay adjacent.
+///
+/// Apple's cores fuse a `pmull` with an `eor` that directly follows it and reads its result,
+/// which is how the fast-crc32 shapes reach their speed there. Written as intrinsics, LLVM
+/// schedules the two apart or, where SHA3 is enabled, merges two `eor`s into an `eor3`, and the
+/// fusion is lost: on an Apple M5 Max the twelve-lane `v12e_v1` kernel this crate ran then was
+/// 20% slower at 192 bytes to 1 KiB.
+///
+/// Graviton 2 and 3 run the pair 10-15% slower than the intrinsics LLVM schedules, so the pair
+/// is Apple's alone.
+#[cfg(target_vendor = "apple")]
+#[inline]
+#[target_feature(enable = "aes")]
+unsafe fn clmul_lo_and_xor(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint64x2_t {
+    let r: uint64x2_t;
+    // SAFETY: `pmull` needs the `aes` feature this function is compiled with; the pair touches
+    // registers only.
+    unsafe {
+        core::arch::asm!(
+            "pmull {r:v}.1q, {a:v}.1d, {b:v}.1d",
+            "eor {r:v}.16b, {r:v}.16b, {c:v}.16b",
+            r = out(vreg) r,
+            a = in(vreg) a,
+            b = in(vreg) b,
+            c = in(vreg) c,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+    }
+    r
+}
+
+/// The high-half form of [`clmul_lo_and_xor`].
+#[cfg(target_vendor = "apple")]
+#[inline]
+#[target_feature(enable = "aes")]
+unsafe fn clmul_hi_and_xor(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint64x2_t {
+    let r: uint64x2_t;
+    // SAFETY: as for `clmul_lo_and_xor`.
+    unsafe {
+        core::arch::asm!(
+            "pmull2 {a:v}.1q, {a:v}.2d, {b:v}.2d",
+            "eor {a:v}.16b, {a:v}.16b, {c:v}.16b",
+            // The product replaces `a` in its register: the kernels' last use of a lane is its
+            // high product, and a fresh output register cost a move per lane per stride.
+            a = inout(vreg) a => r,
+            b = in(vreg) b,
+            c = in(vreg) c,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+    }
+    r
+}
+
+/// The low product of `a` and `b`, plus `c`.
+#[cfg(not(target_vendor = "apple"))]
 #[inline]
 #[target_feature(enable = "aes")]
 unsafe fn clmul_lo_and_xor(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint64x2_t {
     veorq_u64(clmul_lo(a, b), c)
 }
 
+/// The high product of `a` and `b`, plus `c`.
+#[cfg(not(target_vendor = "apple"))]
 #[inline]
 #[target_feature(enable = "aes")]
 unsafe fn clmul_hi_and_xor(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint64x2_t {
     veorq_u64(clmul_hi(a, b), c)
 }
 
+/// Both products of `x` and `k`, plus `d`: one stride of a lane in the SHA3 kernels.
+///
+/// Off Apple the three are summed with one `eor3`. Apple's cores do not fuse a `pmull` with an
+/// `eor3`, so there each product goes through its own [`clmul_lo_and_xor`] pair instead.
+#[inline]
+#[target_feature(enable = "aes,sha3")]
+unsafe fn fold_eor3(x: uint64x2_t, k: uint64x2_t, d: uint64x2_t) -> uint64x2_t {
+    #[cfg(target_vendor = "apple")]
+    {
+        clmul_hi_and_xor(x, k, clmul_lo_and_xor(x, k, d))
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        veor3q_u64(clmul_hi(x, k), clmul_lo(x, k), d)
+    }
+}
+
 /// CRC-32/ISCSI calculation for small buffers (< 128 bytes) using unrolled native CRC instructions
 #[inline]
 #[target_feature(enable = "crc")]
 pub unsafe fn crc32_iscsi_small_fast(mut crc: u32, data: &[u8]) -> u32 {
-    let (prefix, aligned, suffix) = data.align_to::<u64>();
-
-    // Process unaligned prefix bytes
-    for &byte in prefix {
+    // Unaligned words from the first byte: an aarch64 load costs the same either way. On an
+    // Apple M5 Max, aligning first a byte at a time made a buffer three bytes off alignment
+    // 2.2x slower at 32 bytes and 1.4x at 112, and an aligned one no faster.
+    let word = |bytes: &[u8; 8]| u64::from_le_bytes(*bytes);
+    let mut rest = data;
+    while let Some((block, tail)) = rest.split_first_chunk::<64>() {
+        for chunk in block.as_chunks::<8>().0 {
+            crc = __crc32cd(crc, word(chunk));
+        }
+        rest = tail;
+    }
+    if let Some((quad, tail)) = rest.split_first_chunk::<32>() {
+        for chunk in quad.as_chunks::<8>().0 {
+            crc = __crc32cd(crc, word(chunk));
+        }
+        rest = tail;
+    }
+    if let Some((pair, tail)) = rest.split_first_chunk::<16>() {
+        let (first, second) = pair.split_at(8);
+        crc = __crc32cd(crc, word(first.try_into().unwrap()));
+        crc = __crc32cd(crc, word(second.try_into().unwrap()));
+        rest = tail;
+    }
+    if let Some((chunk, tail)) = rest.split_first_chunk::<8>() {
+        crc = __crc32cd(crc, word(chunk));
+        rest = tail;
+    }
+    if let Some((word, tail)) = rest.split_first_chunk::<4>() {
+        crc = __crc32cw(crc, u32::from_le_bytes(*word));
+        rest = tail;
+    }
+    if let Some((half, tail)) = rest.split_first_chunk::<2>() {
+        crc = __crc32ch(crc, u16::from_le_bytes(*half));
+        rest = tail;
+    }
+    if let Some(&byte) = rest.first() {
         crc = __crc32cb(crc, byte);
     }
-
-    // Process aligned u64s with 8-way unrolling (64 bytes per iteration)
-    let mut chunks = aligned.chunks_exact(8);
-    for chunk in &mut chunks {
-        crc = __crc32cd(crc, chunk[0]);
-        crc = __crc32cd(crc, chunk[1]);
-        crc = __crc32cd(crc, chunk[2]);
-        crc = __crc32cd(crc, chunk[3]);
-        crc = __crc32cd(crc, chunk[4]);
-        crc = __crc32cd(crc, chunk[5]);
-        crc = __crc32cd(crc, chunk[6]);
-        crc = __crc32cd(crc, chunk[7]);
-    }
-
-    // Process remaining aligned u64s
-    for &val in chunks.remainder() {
-        crc = __crc32cd(crc, val);
-    }
-
-    // Process unaligned suffix bytes
-    for &byte in suffix {
-        crc = __crc32cb(crc, byte);
-    }
-
     crc
 }
 
@@ -251,36 +291,44 @@ pub unsafe fn crc32_iscsi_small_fast(mut crc: u32, data: &[u8]) -> u32 {
 #[inline]
 #[target_feature(enable = "crc")]
 pub unsafe fn crc32_iso_hdlc_small_fast(mut crc: u32, data: &[u8]) -> u32 {
-    let (prefix, aligned, suffix) = data.align_to::<u64>();
-
-    // Process unaligned prefix bytes
-    for &byte in prefix {
+    // Unaligned words from the first byte: an aarch64 load costs the same either way. On an
+    // Apple M5 Max, aligning first a byte at a time made a buffer three bytes off alignment
+    // 2.2x slower at 32 bytes and 1.4x at 112, and an aligned one no faster.
+    let word = |bytes: &[u8; 8]| u64::from_le_bytes(*bytes);
+    let mut rest = data;
+    while let Some((block, tail)) = rest.split_first_chunk::<64>() {
+        for chunk in block.as_chunks::<8>().0 {
+            crc = __crc32d(crc, word(chunk));
+        }
+        rest = tail;
+    }
+    if let Some((quad, tail)) = rest.split_first_chunk::<32>() {
+        for chunk in quad.as_chunks::<8>().0 {
+            crc = __crc32d(crc, word(chunk));
+        }
+        rest = tail;
+    }
+    if let Some((pair, tail)) = rest.split_first_chunk::<16>() {
+        let (first, second) = pair.split_at(8);
+        crc = __crc32d(crc, word(first.try_into().unwrap()));
+        crc = __crc32d(crc, word(second.try_into().unwrap()));
+        rest = tail;
+    }
+    if let Some((chunk, tail)) = rest.split_first_chunk::<8>() {
+        crc = __crc32d(crc, word(chunk));
+        rest = tail;
+    }
+    if let Some((word, tail)) = rest.split_first_chunk::<4>() {
+        crc = __crc32w(crc, u32::from_le_bytes(*word));
+        rest = tail;
+    }
+    if let Some((half, tail)) = rest.split_first_chunk::<2>() {
+        crc = __crc32h(crc, u16::from_le_bytes(*half));
+        rest = tail;
+    }
+    if let Some(&byte) = rest.first() {
         crc = __crc32b(crc, byte);
     }
-
-    // Process aligned u64s with 8-way unrolling (64 bytes per iteration)
-    let mut chunks = aligned.chunks_exact(8);
-    for chunk in &mut chunks {
-        crc = __crc32d(crc, chunk[0]);
-        crc = __crc32d(crc, chunk[1]);
-        crc = __crc32d(crc, chunk[2]);
-        crc = __crc32d(crc, chunk[3]);
-        crc = __crc32d(crc, chunk[4]);
-        crc = __crc32d(crc, chunk[5]);
-        crc = __crc32d(crc, chunk[6]);
-        crc = __crc32d(crc, chunk[7]);
-    }
-
-    // Process remaining aligned u64s
-    for &val in chunks.remainder() {
-        crc = __crc32d(crc, val);
-    }
-
-    // Process unaligned suffix bytes
-    for &byte in suffix {
-        crc = __crc32b(crc, byte);
-    }
-
     crc
 }
 
@@ -307,18 +355,24 @@ mod tests {
         select_kernel(tier, true).unwrap()
     }
 
-    /// Calls a kernel the test has already checked this CPU can run.
-    fn run(kernel: unsafe fn(u32, &[u8]) -> u32, crc: u32, data: &[u8]) -> u32 {
+    /// CRC-32/ISCSI through a kernel the test has already checked this CPU can run.
+    fn iscsi(kernel: FusionKernel, crc: u32, data: &[u8]) -> u32 {
         // SAFETY: every caller picks the kernel from the features it detected
-        unsafe { kernel(crc, data) }
+        unsafe { crc32_iscsi_with(kernel, crc, data) }
+    }
+
+    /// CRC-32/ISO-HDLC through a kernel the test has already checked this CPU can run.
+    fn iso_hdlc(kernel: FusionKernel, crc: u32, data: &[u8]) -> u32 {
+        // SAFETY: as for `iscsi`
+        unsafe { crc32_iso_hdlc_with(kernel, crc, data) }
     }
 
     fn crc32_iscsi(crc: u32, data: &[u8]) -> u32 {
-        run(iscsi_kernel_fn(widest_kernel()), crc, data)
+        iscsi(widest_kernel(), crc, data)
     }
 
     fn crc32_iso_hdlc(crc: u32, data: &[u8]) -> u32 {
-        run(iso_hdlc_kernel_fn(widest_kernel()), crc, data)
+        iso_hdlc(widest_kernel(), crc, data)
     }
 
     /// Every tier resolves to its own kernels, and none of them without the CRC32 instructions.
@@ -350,17 +404,102 @@ mod tests {
             for offset in [0, 3] {
                 let slice = &data[offset..offset + len];
                 assert_eq!(
-                    run(iscsi_kernel_fn(FusionKernel::Pmull), 0xffffffff, slice) ^ 0xffffffff,
+                    iscsi(FusionKernel::Pmull, 0xffffffff, slice) ^ 0xffffffff,
                     RUST_CRC32_ISCSI.checksum(slice),
                     "iscsi len {len} offset {offset}"
                 );
                 assert_eq!(
-                    run(iso_hdlc_kernel_fn(FusionKernel::Pmull), 0xffffffff, slice) ^ 0xffffffff,
+                    iso_hdlc(FusionKernel::Pmull, 0xffffffff, slice) ^ 0xffffffff,
                     RUST_CRC32_ISO_HDLC.checksum(slice),
                     "iso-hdlc len {len} offset {offset}"
                 );
             }
         }
+    }
+
+    type Kernel = unsafe fn(u32, *const u8, usize) -> u32;
+
+    /// Each lane kernel, called directly rather than through dispatch, agrees with the reference
+    /// at every length through two full eight-lane strides and their tails, from every start
+    /// offset within 16 bytes, carrying the state of a prefix the reference hashed.
+    fn lane_kernels_agree(kernels: &[(&str, Kernel, bool)]) {
+        kernels_agree(kernels, &(0..=2200).collect::<Vec<_>>());
+    }
+
+    /// [`lane_kernels_agree`] over `lengths`.
+    fn kernels_agree(kernels: &[(&str, Kernel, bool)], lengths: &[usize]) {
+        let longest = lengths.iter().copied().max().unwrap_or(0);
+        let mut data = vec![0u8; longest + 16 + 37];
+        rng().fill(&mut data[..]);
+        let prefix = &data[..37];
+        for &(name, kernel, castagnoli) in kernels {
+            let reference = if castagnoli {
+                &RUST_CRC32_ISCSI
+            } else {
+                &RUST_CRC32_ISO_HDLC
+            };
+            let state = reference.checksum(prefix) ^ 0xffffffff;
+            for &len in lengths {
+                for offset in 0..16 {
+                    let body = &data[37 + offset..37 + offset + len];
+                    let mut digest = reference.digest();
+                    digest.update(prefix);
+                    digest.update(body);
+                    // SAFETY: the caller checked the features each kernel needs
+                    let got = unsafe { kernel(state, body.as_ptr(), body.len()) };
+                    assert_eq!(
+                        got ^ 0xffffffff,
+                        digest.finalize(),
+                        "{name} len {len} offset {offset}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn lane_kernels_agree_with_the_reference() {
+        lane_kernels_agree(&[
+            ("iscsi_v4", lanes::crc32_iscsi_v4, true),
+            ("iscsi_v8", lanes::crc32_iscsi_v8, true),
+            ("iso_hdlc_v4", lanes::crc32_iso_hdlc_v4, false),
+            ("iso_hdlc_v8", lanes::crc32_iso_hdlc_v8, false),
+        ]);
+    }
+
+    /// The stream kernels agree with the reference through their first blocks, and at lengths
+    /// whose stream shifts pass the end of the short shift table, 16 KiB, and so take the
+    /// product of a short entry and a long one.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn stream_kernels_agree_with_the_reference() {
+        let mut lengths: Vec<usize> = (0..=2200).collect();
+        for edge in [16384usize, 4 * 16384, 112 * 2048, 112 * 4096] {
+            lengths.extend(edge - 120..edge + 120);
+        }
+        lengths.extend([1 << 20, (1 << 20) + 111, 3_000_017]);
+        kernels_agree(
+            &[
+                ("iscsi_v3s4", lanes::crc32_iscsi_v3s4, true),
+                ("iso_hdlc_v3s4", lanes::crc32_iso_hdlc_v3s4, false),
+            ],
+            &lengths,
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn eor3_lane_kernels_agree_with_the_reference() {
+        if !std::arch::is_aarch64_feature_detected!("sha3") {
+            return;
+        }
+        lane_kernels_agree(&[
+            ("iscsi_eor3_v4", lanes::crc32_iscsi_eor3_v4, true),
+            ("iscsi_eor3_v8", lanes::crc32_iscsi_eor3_v8, true),
+            ("iso_hdlc_eor3_v4", lanes::crc32_iso_hdlc_eor3_v4, false),
+            ("iso_hdlc_eor3_v8", lanes::crc32_iso_hdlc_eor3_v8, false),
+        ]);
     }
 
     #[test]
@@ -425,6 +564,21 @@ mod tests {
         }
     }
 
+    /// Lengths whose stream shifts come from each part of the shift tables: the short table up to
+    /// 16 KiB of distance, its end, the product of the short and long tables beyond it, and a
+    /// long-table boundary.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_lengths_across_the_shift_tables() {
+        for len in [
+            1025, 1100, 2047, 4096, 9000, 16383, 16384, 16385, 18000, 18617, 18618, 18619, 24000,
+            37236, 37237, 65536, 100_003, 262_144,
+        ] {
+            crc32_iscsi_random(len);
+            crc32_iso_hdlc_random(len);
+        }
+    }
+
     #[cfg(target_feature = "sha3")]
     fn crc32_iso_hdlc_random(len: usize) {
         let mut data = vec![0u8; len];
@@ -441,7 +595,7 @@ mod tests {
             );
 
             assert_eq!(
-                crc32_iso_hdlc_v12e_v1(0xffffffff, data.as_ptr(), data.len()) ^ 0xffffffff,
+                crc32_iso_hdlc_v3s4(0xffffffff, data.as_ptr(), data.len()) ^ 0xffffffff,
                 checksum
             );
         }
@@ -458,7 +612,7 @@ mod tests {
 
         unsafe {
             assert_eq!(
-                crc32_iso_hdlc_v12e_v1(0xffffffff, data.as_ptr(), data.len()) ^ 0xffffffff,
+                crc32_iso_hdlc_v3s4(0xffffffff, data.as_ptr(), data.len()) ^ 0xffffffff,
                 checksum
             );
         }
@@ -480,7 +634,7 @@ mod tests {
             );
 
             assert_eq!(
-                crc32_iscsi_v12e_v1(0xffffffff, data.as_ptr(), data.len()) ^ 0xffffffff,
+                crc32_iscsi_v3s4(0xffffffff, data.as_ptr(), data.len()) ^ 0xffffffff,
                 checksum
             );
         }
@@ -497,7 +651,7 @@ mod tests {
 
         unsafe {
             assert_eq!(
-                crc32_iscsi_v12e_v1(0xffffffff, data.as_ptr(), data.len()) ^ 0xffffffff,
+                crc32_iscsi_v3s4(0xffffffff, data.as_ptr(), data.len()) ^ 0xffffffff,
                 checksum
             );
         }

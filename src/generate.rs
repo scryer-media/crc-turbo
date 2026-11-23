@@ -120,7 +120,7 @@ use core::ops::{BitAnd, BitOr, Shl, Shr};
 ///
 /// See CRC32_EXPONENTS for detailed documentation of the exponent values.
 const CRC16_EXPONENTS: [u64; 23] = [
-    0, // unused, just aligns indexes with the literature
+    0, // the final reduction's Barrett quotient, generated separately
     32 * 3,
     32 * 5,
     32 * 31,
@@ -168,7 +168,7 @@ const CRC16_EXPONENTS: [u64; 23] = [
 ///   - 32*65 = 2080 bits (260 bytes)
 ///   - These enable very high-throughput processing of large buffers
 const CRC32_EXPONENTS: [u64; 23] = [
-    0, // unused, just aligns indexes with the literature
+    0, // the final reduction's Barrett quotient, generated separately
     32 * 3,
     32 * 5,
     32 * 31,
@@ -267,10 +267,47 @@ pub fn keys(width: u8, poly: u64, reflected: bool) -> [u64; 23] {
         keys[i] = key(width, poly, reflected, exponents[i]);
     }
 
+    keys[0] = barrett_quotient_96(width, poly, reflected);
     keys[7] = mu(width, poly, reflected);
     keys[8] = polynomial(width, poly, reflected);
 
     keys
+}
+
+/// The 64-bit Barrett quotient that the final reduction of a CRC computed in 32-bit space
+/// (CRC-32, and CRC-16 scaled to it) uses; 0 for CRC-64.
+///
+/// Reflected, it is floor(x^95 / P(x)), bit-reflected. Forward, it is floor(x^96 / P(x)) less
+/// its leading x^64, which the reduction adds back with an XOR. Either lets the final reduction
+/// take the 96 bits left after one fold, of the high half onto the low by x^96 mod P(x)
+/// (`keys[5]`), to 32 bits in two carry-less multiplies. The Linux kernel's CRC template and
+/// libdeflate reduce the same way. The 33-bit `keys[7]`, floor(x^64 / P(x)), needs a second
+/// fold first, to 64 bits, which is a fourth multiply on the path every buffer ends with.
+///
+/// Its slot, `keys[0]`, had been unused, so key tables built before it hold 0 there, and the
+/// reduction takes the four-multiply path for them.
+fn barrett_quotient_96(width: u8, polynomial: u64, reflected: bool) -> u64 {
+    if !(width == 16 || width == 32) {
+        return 0;
+    }
+
+    // `polynomial` is the 33-bit P(x), leading term included, for both widths here.
+    let degree = if reflected { 95 } else { 96 };
+    let mut remainder: u128 = 1 << degree;
+    let mut quotient: u128 = 0;
+    for bit in (0..=degree - 32).rev() {
+        if remainder & (1u128 << (bit + 32)) != 0 {
+            quotient |= 1 << bit;
+            remainder ^= (polynomial as u128) << bit;
+        }
+    }
+
+    if reflected {
+        bit_reverse(quotient as u64)
+    } else {
+        // floor(x^96 / P(x)) has degree 64; the reduction supplies that term itself.
+        quotient as u64
+    }
 }
 
 fn key(width: u8, poly: u64, reflected: bool, exponent: u64) -> u64 {
@@ -725,6 +762,115 @@ where
     }
 
     result
+}
+
+/// The sparse multiple of a CRC generator that the WebAssembly software path reduces with
+/// (`arch::sparse`), as the stream offsets it moves each bit by.
+///
+/// A multiple `x^n + x^(n - d_1) + ... + 1` of the generator `G` leaves the remainder of a message
+/// unchanged when a bit is replaced by bits `d` places further on, for each offset `d`, `n`
+/// included. The search returns the multiple with the fewest terms, then the lowest degree `n`, then
+/// the smallest offsets, among those whose offsets are all at least 64 (so a 64-bit word moves wholly
+/// past itself), with `n` at most 320 and at most five offsets. `None` when there is no such
+/// multiple, which is every CRC-64 generator in the catalogue.
+#[cfg(test)]
+pub(crate) fn sparse_multiple(width: u8, poly: u64) -> Option<std::vec::Vec<u32>> {
+    use std::vec::Vec;
+
+    const MAX_DEGREE: usize = 320;
+    const MAX_OFFSETS: usize = 5;
+
+    // residue[e] = x^e mod G
+    let mask = if width == 64 { !0 } else { (1u64 << width) - 1 };
+    let mut residue = [0u64; MAX_DEGREE + 1];
+    let mut value = 1u64;
+    for r in residue.iter_mut() {
+        *r = value;
+        let top = (value >> (width - 1)) & 1;
+        value = (value << 1) & mask;
+        if top == 1 {
+            value ^= poly & mask;
+        }
+    }
+
+    // every pair of exponents in 1..=MAX_DEGREE - 64, sorted by the sum of their residues
+    let low = MAX_DEGREE - 64;
+    let mut pairs: Vec<(u64, usize, usize)> = Vec::new();
+    for x in 1..=low {
+        for y in x + 1..=low {
+            pairs.push((residue[x] ^ residue[y], x, y));
+        }
+    }
+    pairs.sort_unstable();
+    let pairs_of = |sum: u64| {
+        let start = pairs.partition_point(|p| p.0 < sum);
+        let end = pairs.partition_point(|p| p.0 <= sum);
+        &pairs[start..end]
+    };
+
+    for offsets in 1..=MAX_OFFSETS {
+        let lower = offsets - 1; // terms other than x^n and 1
+        for n in 64..=MAX_DEGREE {
+            let top = n - 64; // the highest exponent a lower term may have
+            let target = residue[n] ^ 1;
+            let mut found: Vec<Vec<usize>> = Vec::new();
+            match lower {
+                0 => {
+                    if target == 0 {
+                        found.push(Vec::new());
+                    }
+                }
+                1 => {
+                    for (e, &r) in residue.iter().enumerate().take(top + 1).skip(1) {
+                        if r == target {
+                            found.push(vec![e]);
+                        }
+                    }
+                }
+                _ => {
+                    // the lower terms are a pair plus `lower - 2` single exponents
+                    let mut singles: Vec<Vec<usize>> = vec![Vec::new()];
+                    for _ in 0..lower - 2 {
+                        let mut next = Vec::new();
+                        for set in &singles {
+                            let from = set.last().map_or(1, |e| e + 1);
+                            for e in from..=top {
+                                let mut grown = set.clone();
+                                grown.push(e);
+                                next.push(grown);
+                            }
+                        }
+                        singles = next;
+                    }
+                    for set in singles {
+                        let sum = set.iter().fold(target, |acc, &e| acc ^ residue[e]);
+                        for &(_, x, y) in pairs_of(sum) {
+                            if y <= top && !set.contains(&x) && !set.contains(&y) {
+                                let mut terms = set.clone();
+                                terms.push(x);
+                                terms.push(y);
+                                found.push(terms);
+                            }
+                        }
+                    }
+                }
+            }
+            let best = found
+                .into_iter()
+                .map(|terms| {
+                    let mut d: Vec<u32> = terms.iter().map(|&e| (n - e) as u32).collect();
+                    d.push(n as u32);
+                    d.sort_unstable();
+                    d
+                })
+                .filter(|d| d.windows(2).all(|w| w[0] < w[1]))
+                .min();
+            if best.is_some() {
+                return best;
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
