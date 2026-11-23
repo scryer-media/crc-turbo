@@ -427,6 +427,12 @@ where
         None => {
             let chunks = len / 128;
             let (res, pos) = match ops.fold_simd_blocks_unaligned(state, ptr, chunks, keys) {
+                // A buffer of whole 128-byte chunks goes from the fold straight to the
+                // reduction, as the generated `avx512_vpclmulqdq_crc32_v4` kernel does, rather
+                // than through the count of blocks left, an indirect jump on the count.
+                Some(folded) if chunks * 128 == len => {
+                    return W::perform_final_reduction(folded, reflected, keys, ops);
+                }
                 Some(folded) => (folded, chunks * 128),
                 None => fold_lanes::<T, W>(data, state, reflector, keys, ops),
             };

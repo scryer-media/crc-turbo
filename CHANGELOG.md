@@ -214,6 +214,9 @@ own changelog up to the fork point continues below, unchanged.
   every tier; on the `x86-sse-pclmulqdq`, `x86_64-sse-pclmulqdq` and
   `x86_64-avx512-pclmulqdq` tiers it loads its fold keys rather than
   building them in general registers.
+- x86, the 256- and 512-bit VPCLMULQDQ tiers: a buffer of whole 128-byte
+  blocks goes from the fold straight to the final reduction, as fast-crc32's
+  generated `v4` kernel does, without a jump on the count of blocks left.
 - x86: buffers of 16 to 255 bytes (16 to 127 on the 256- and 512-bit
   tiers) are folded by inline assembly, one straight-line arm per number of
   16-byte blocks with each block folded onto the last across its own
@@ -723,6 +726,21 @@ own changelog up to the fork point continues below, unchanged.
     A single build's comparison against another therefore repeats its
     layout's bias from run to run. The figures above are geometric means
     over four link layouts per build.
+- x86, `x86_64-avx2-vpclmulqdq` and `x86_64-avx512-vpclmulqdq` tiers, every
+  algorithm: a buffer of 256 bytes or more that is a whole number of
+  128-byte blocks goes from the fold straight to the final reduction, as
+  fast-crc32's generated `avx512_vpclmulqdq_crc32_v4` kernel does. It went
+  through the step for the blocks left over, which with none left was an
+  indirect jump on the count. CRC-32/ISO-HDLC at 256 bytes from an aligned
+  start, against the fastest other library (fast-crc32's `v4`), GB/s,
+  geometric mean of two interleaved rounds over four link layouts on EC2
+  `.large` instances, checksums compared first: 1.05x on a Xeon 8488C and
+  1.07x on an EPYC 9R14, where the same build without the change measured
+  0.90x and 0.97x; from an unaligned start 1.25x on the 8488C, where it
+  measured 1.04x. On a Xeon 8375C it was 1.45x with the change and 1.46x
+  without. Against 1.11.0 at 256 bytes: 5.36x on the 8488C, 2.91x on the
+  9R14, 3.96x on the 8375C. Lengths that are not a whole number of blocks
+  take the path they took before.
 - x86: the folds of 16 to 255 bytes on the `x86-sse-pclmulqdq` and
   `x86_64-sse-pclmulqdq` tiers, and of 16 to 127 bytes on the three wider
   tiers, are inline assembly, for every algorithm, so that a new LLVM
