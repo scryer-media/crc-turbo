@@ -12,6 +12,7 @@
 
 #![cfg(target_arch = "aarch64")]
 
+mod asm;
 mod iscsi;
 mod iso_hdlc;
 mod lanes;
@@ -21,12 +22,32 @@ use core::arch::aarch64::*;
 
 use crate::feature_detection::PerformanceTier;
 
+#[cfg(all(
+    target_endian = "little",
+    any(target_os = "linux", target_os = "android")
+))]
+use asm::{
+    crc32_iscsi_eor3_v4, crc32_iscsi_loop, crc32_iscsi_short, crc32_iso_hdlc_eor3_v4,
+    crc32_iso_hdlc_loop, crc32_iso_hdlc_short,
+};
 use iscsi::crc_pmull_sha3::crc32_iscsi_eor3_v9s3x2e_s3;
 use iso_hdlc::crc_pmull_sha3::crc32_iso_hdlc_eor3_v9s3x2e_s3;
+#[cfg(not(all(
+    target_endian = "little",
+    any(target_os = "linux", target_os = "android")
+)))]
+use lanes::{crc32_iscsi_eor3_v4, crc32_iso_hdlc_eor3_v4};
+#[cfg(not(all(
+    target_endian = "little",
+    any(target_os = "linux", target_os = "android")
+)))]
+use {
+    crc32_iscsi_small_fast as crc32_iscsi_loop, crc32_iso_hdlc_small_fast as crc32_iso_hdlc_loop,
+};
+
 use lanes::{
-    crc32_iscsi_eor3_v4, crc32_iscsi_eor3_v8, crc32_iscsi_v3s4, crc32_iscsi_v4, crc32_iscsi_v8,
-    crc32_iso_hdlc_eor3_v4, crc32_iso_hdlc_eor3_v8, crc32_iso_hdlc_v3s4, crc32_iso_hdlc_v4,
-    crc32_iso_hdlc_v8,
+    crc32_iscsi_eor3_v8, crc32_iscsi_v3s4, crc32_iscsi_v4, crc32_iscsi_v8, crc32_iso_hdlc_eor3_v8,
+    crc32_iso_hdlc_v3s4, crc32_iso_hdlc_v4, crc32_iso_hdlc_v8,
 };
 
 /// Buffers shorter than this run the unrolled CRC32 instruction loop; from here the four-lane
@@ -40,6 +61,45 @@ const FOUR_LANE_END: usize = 256;
 /// instruction streams beside a nine-lane EOR3 fold (`v9s3x2e_s3`), and the PMULL tier four
 /// beside a three-lane fold (`v3s4x2e_v2`).
 pub(crate) const LARGE_BUFFER_THRESHOLD: usize = 2048;
+
+/// Buffers shorter than this run the SHA3 tier's CRC32 instruction loop. At 64 bytes the loop
+/// ran 12.8 GB/s on Graviton 3 against the four-lane fold's 9.2 to 10.4, and 17.2 to 17.5 on
+/// Graviton 4 against 13.8 to 14.9; from 80 bytes the two compiled kernels were level within
+/// the noise. On Linux and Android, where both are the assembly in `asm`, the loop runs to 128
+/// bytes: from 80 to 112 bytes it ran 1.17x to 1.22x of the assembly fold on Graviton 3 and
+/// 1.01x to 1.49x on Graviton 4 from an aligned start, 0.99x to 1.18x from an unaligned one
+/// (2026-11-23). Apple's cores, where this was not measured, keep [`SMALL_BUFFER_END`].
+const SHA3_SMALL_END: usize = if cfg!(target_vendor = "apple") {
+    SMALL_BUFFER_END
+} else if cfg!(all(
+    target_endian = "little",
+    any(target_os = "linux", target_os = "android")
+)) {
+    128
+} else {
+    80
+};
+
+/// Buffers shorter than this run the PMULL tier's CRC32 instruction loop, from here its four
+/// CRC32 streams beside a three-lane fold (`v3s4x2e_v2`). On Graviton 2 the CRC32 instruction
+/// retires one a cycle, and the loop alone outran both lane folds at every length from 64
+/// bytes to 1 KiB: 13.8 GB/s at 112 bytes against the four-lane fold's 10.1, 15.6 at 256
+/// against 13.1, 18.3 at 768 against 15.5. The stream kernel then ran 20.2 at 1 KiB, against
+/// the loop's 18.7 and the eight-lane fold's 16.0, and lost below 768 bytes. Apple's cores,
+/// where this was not measured, keep the lane folds from [`SMALL_BUFFER_END`] and the stream
+/// kernel from [`LARGE_BUFFER_THRESHOLD`].
+const PMULL_SMALL_END: usize = if cfg!(target_vendor = "apple") {
+    SMALL_BUFFER_END
+} else {
+    PMULL_STREAM_THRESHOLD
+};
+
+/// See [`PMULL_SMALL_END`].
+const PMULL_STREAM_THRESHOLD: usize = if cfg!(target_vendor = "apple") {
+    LARGE_BUFFER_THRESHOLD
+} else {
+    1024
+};
 
 /// The fusion kernels a tier runs, for CRC-32/ISCSI and CRC-32/ISO-HDLC alike.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,11 +127,14 @@ pub(crate) fn select_kernel(tier: PerformanceTier, has_crc: bool) -> Option<Fusi
     }
 }
 
-/// CRC-32/ISCSI through `kernel`: the CRC32 instruction loop below [`SMALL_BUFFER_END`]
-/// bytes, then the four-lane fold, the eight-lane fold, and from [`LARGE_BUFFER_THRESHOLD`] the
-/// SHA3 tier's EOR3 kernel with three CRC32 streams beside its fold (`v9s3x2e_s3`) or the PMULL
-/// tier's four CRC32 streams beside a three-lane fold (`v3s4x2e_v2`). Each is a direct call, so where the target already has
-/// the features the caller calls the loop or the fold itself, with nothing in between.
+/// CRC-32/ISCSI through `kernel`. The SHA3 tier runs the CRC32 instruction loop below
+/// [`SHA3_SMALL_END`] bytes, then the four-lane fold, the eight-lane fold, and from
+/// [`LARGE_BUFFER_THRESHOLD`] its EOR3 kernel with three CRC32 streams beside its fold
+/// (`v9s3x2e_s3`). The PMULL tier runs the loop below [`PMULL_SMALL_END`], the lane folds
+/// where that leaves room before [`PMULL_STREAM_THRESHOLD`] (on Apple's cores), and from there
+/// four CRC32 streams beside a three-lane fold (`v3s4x2e_v2`). Each is a direct call, so where
+/// the target already has the features the caller calls the loop or the fold itself, with
+/// nothing in between.
 ///
 /// # Safety
 ///
@@ -82,19 +145,25 @@ pub(crate) unsafe fn crc32_iscsi_with(kernel: FusionKernel, crc: u32, data: &[u8
     // SAFETY: either kernel is only selected for a tier with PMULL, and the EOR3 one for the
     // tier with SHA3, after detecting the CRC32 instructions
     unsafe {
+        // The shortest buffers take the loop before the kernel is looked at, so every tier
+        // runs the same code for them.
         if len < SMALL_BUFFER_END {
-            crc32_iscsi_small_fast(crc, data)
+            crc32_iscsi_short(crc, data)
         } else if kernel == FusionKernel::PmullSha3 {
-            if len < FOUR_LANE_END {
+            if len < SHA3_SMALL_END {
+                crc32_iscsi_loop(crc, data)
+            } else if len < FOUR_LANE_END {
                 crc32_iscsi_eor3_v4(crc, ptr, len)
             } else if len < LARGE_BUFFER_THRESHOLD {
                 crc32_iscsi_eor3_v8(crc, ptr, len)
             } else {
                 crc32_iscsi_eor3_v9s3x2e_s3(crc, ptr, len)
             }
+        } else if len < PMULL_SMALL_END {
+            crc32_iscsi_loop(crc, data)
         } else if len < FOUR_LANE_END {
             crc32_iscsi_v4(crc, ptr, len)
-        } else if len < LARGE_BUFFER_THRESHOLD {
+        } else if len < PMULL_STREAM_THRESHOLD {
             crc32_iscsi_v8(crc, ptr, len)
         } else {
             crc32_iscsi_v3s4(crc, ptr, len)
@@ -112,19 +181,25 @@ pub(crate) unsafe fn crc32_iso_hdlc_with(kernel: FusionKernel, crc: u32, data: &
     let (ptr, len) = (data.as_ptr(), data.len());
     // SAFETY: as for `crc32_iscsi_with`
     unsafe {
+        // The shortest buffers take the loop before the kernel is looked at, so every tier
+        // runs the same code for them.
         if len < SMALL_BUFFER_END {
-            crc32_iso_hdlc_small_fast(crc, data)
+            crc32_iso_hdlc_short(crc, data)
         } else if kernel == FusionKernel::PmullSha3 {
-            if len < FOUR_LANE_END {
+            if len < SHA3_SMALL_END {
+                crc32_iso_hdlc_loop(crc, data)
+            } else if len < FOUR_LANE_END {
                 crc32_iso_hdlc_eor3_v4(crc, ptr, len)
             } else if len < LARGE_BUFFER_THRESHOLD {
                 crc32_iso_hdlc_eor3_v8(crc, ptr, len)
             } else {
                 crc32_iso_hdlc_eor3_v9s3x2e_s3(crc, ptr, len)
             }
+        } else if len < PMULL_SMALL_END {
+            crc32_iso_hdlc_loop(crc, data)
         } else if len < FOUR_LANE_END {
             crc32_iso_hdlc_v4(crc, ptr, len)
-        } else if len < LARGE_BUFFER_THRESHOLD {
+        } else if len < PMULL_STREAM_THRESHOLD {
             crc32_iso_hdlc_v8(crc, ptr, len)
         } else {
             crc32_iso_hdlc_v3s4(crc, ptr, len)
@@ -225,111 +300,107 @@ unsafe fn clmul_hi_and_xor(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint6
     veorq_u64(clmul_hi(a, b), c)
 }
 
-/// Both products of `x` and `k`, plus `d`: one stride of a lane in the SHA3 kernels.
-///
-/// Off Apple the three are summed with one `eor3`. Apple's cores do not fuse a `pmull` with an
-/// `eor3`, so there each product goes through its own [`clmul_lo_and_xor`] pair instead.
+/// Both products of `x` and `k`, plus `d`: one stride of a lane in the SHA3 kernels on Apple's
+/// cores, which do not fuse a `pmull` with an `eor3`, so each product goes through its own
+/// [`clmul_lo_and_xor`] pair. Elsewhere the kernels take every product of a stride first and sum
+/// each lane's two with its data in one `eor3`.
+#[cfg(target_vendor = "apple")]
 #[inline]
 #[target_feature(enable = "aes,sha3")]
 unsafe fn fold_eor3(x: uint64x2_t, k: uint64x2_t, d: uint64x2_t) -> uint64x2_t {
-    #[cfg(target_vendor = "apple")]
-    {
-        clmul_hi_and_xor(x, k, clmul_lo_and_xor(x, k, d))
-    }
-    #[cfg(not(target_vendor = "apple"))]
-    {
-        veor3q_u64(clmul_hi(x, k), clmul_lo(x, k), d)
-    }
+    clmul_hi_and_xor(x, k, clmul_lo_and_xor(x, k, d))
 }
 
-/// CRC-32/ISCSI calculation for small buffers (< 128 bytes) using unrolled native CRC instructions
+/// The CRC32 instruction loop's body: unaligned words from the first byte, as an aarch64 load
+/// costs the same either way. On an Apple M5 Max, aligning first a byte at a time made a buffer
+/// three bytes off alignment 2.2x slower at 32 bytes and 1.4x at 112, and an aligned one no
+/// faster. `$blocks` adds the loop over 64-byte blocks, which the short entry points leave out.
+macro_rules! crc_loop {
+    ($crc:ident, $data:ident, $d:ident, $w:ident, $h:ident, $b:ident, $blocks:expr) => {{
+        let word = |bytes: &[u8; 8]| u64::from_le_bytes(*bytes);
+        let mut rest = $data;
+        if $blocks {
+            while let Some((block, tail)) = rest.split_first_chunk::<64>() {
+                for chunk in block.as_chunks::<8>().0 {
+                    $crc = $d($crc, word(chunk));
+                }
+                rest = tail;
+            }
+        }
+        if let Some((quad, tail)) = rest.split_first_chunk::<32>() {
+            for chunk in quad.as_chunks::<8>().0 {
+                $crc = $d($crc, word(chunk));
+            }
+            rest = tail;
+        }
+        if let Some((pair, tail)) = rest.split_first_chunk::<16>() {
+            let (first, second) = pair.split_at(8);
+            $crc = $d($crc, word(first.try_into().unwrap()));
+            $crc = $d($crc, word(second.try_into().unwrap()));
+            rest = tail;
+        }
+        if let Some((chunk, tail)) = rest.split_first_chunk::<8>() {
+            $crc = $d($crc, word(chunk));
+            rest = tail;
+        }
+        if let Some((word, tail)) = rest.split_first_chunk::<4>() {
+            $crc = $w($crc, u32::from_le_bytes(*word));
+            rest = tail;
+        }
+        if let Some((half, tail)) = rest.split_first_chunk::<2>() {
+            $crc = $h($crc, u16::from_le_bytes(*half));
+            rest = tail;
+        }
+        if let Some(&byte) = rest.first() {
+            $crc = $b($crc, byte);
+        }
+        $crc
+    }};
+}
+
+/// CRC-32/ISCSI by the CRC32 instruction alone, one chain of 64-bit steps. Dispatch sends it
+/// the SHA3 tier's buffers below [`SHA3_SMALL_END`], and on the PMULL tier off Apple everything
+/// below 1 KiB.
 #[inline]
 #[target_feature(enable = "crc")]
 pub unsafe fn crc32_iscsi_small_fast(mut crc: u32, data: &[u8]) -> u32 {
-    // Unaligned words from the first byte: an aarch64 load costs the same either way. On an
-    // Apple M5 Max, aligning first a byte at a time made a buffer three bytes off alignment
-    // 2.2x slower at 32 bytes and 1.4x at 112, and an aligned one no faster.
-    let word = |bytes: &[u8; 8]| u64::from_le_bytes(*bytes);
-    let mut rest = data;
-    while let Some((block, tail)) = rest.split_first_chunk::<64>() {
-        for chunk in block.as_chunks::<8>().0 {
-            crc = __crc32cd(crc, word(chunk));
-        }
-        rest = tail;
-    }
-    if let Some((quad, tail)) = rest.split_first_chunk::<32>() {
-        for chunk in quad.as_chunks::<8>().0 {
-            crc = __crc32cd(crc, word(chunk));
-        }
-        rest = tail;
-    }
-    if let Some((pair, tail)) = rest.split_first_chunk::<16>() {
-        let (first, second) = pair.split_at(8);
-        crc = __crc32cd(crc, word(first.try_into().unwrap()));
-        crc = __crc32cd(crc, word(second.try_into().unwrap()));
-        rest = tail;
-    }
-    if let Some((chunk, tail)) = rest.split_first_chunk::<8>() {
-        crc = __crc32cd(crc, word(chunk));
-        rest = tail;
-    }
-    if let Some((word, tail)) = rest.split_first_chunk::<4>() {
-        crc = __crc32cw(crc, u32::from_le_bytes(*word));
-        rest = tail;
-    }
-    if let Some((half, tail)) = rest.split_first_chunk::<2>() {
-        crc = __crc32ch(crc, u16::from_le_bytes(*half));
-        rest = tail;
-    }
-    if let Some(&byte) = rest.first() {
-        crc = __crc32cb(crc, byte);
-    }
-    crc
+    crc_loop!(crc, data, __crc32cd, __crc32cw, __crc32ch, __crc32cb, true)
 }
 
-/// CRC-32/ISO-HDLC calculation for small buffers (< 128 bytes) using unrolled native CRC instructions
+/// [`crc32_iscsi_small_fast`] for a buffer shorter than [`SMALL_BUFFER_END`], without the
+/// 64-byte loop. A separate function, as one call site for each length range leaves the
+/// compiler free to fit each to its range: called for the short buffers and the longer ones
+/// alike, CRC-32/ISCSI and CRC-32/ISO-HDLC from 16 to 48 bytes ran at 0.78x to 0.92x of
+/// 2ee9ff1's speed on Graviton 2, 3 and 4. Linux and Android take the assembly copy in
+/// `asm` instead, which fixes where the loop sits.
+#[cfg(not(all(
+    target_endian = "little",
+    any(target_os = "linux", target_os = "android")
+)))]
+#[inline]
+#[target_feature(enable = "crc")]
+unsafe fn crc32_iscsi_short(mut crc: u32, data: &[u8]) -> u32 {
+    debug_assert!(data.len() < SMALL_BUFFER_END);
+    crc_loop!(crc, data, __crc32cd, __crc32cw, __crc32ch, __crc32cb, false)
+}
+
+/// CRC-32/ISO-HDLC by the CRC32 instruction alone; see [`crc32_iscsi_small_fast`].
 #[inline]
 #[target_feature(enable = "crc")]
 pub unsafe fn crc32_iso_hdlc_small_fast(mut crc: u32, data: &[u8]) -> u32 {
-    // Unaligned words from the first byte: an aarch64 load costs the same either way. On an
-    // Apple M5 Max, aligning first a byte at a time made a buffer three bytes off alignment
-    // 2.2x slower at 32 bytes and 1.4x at 112, and an aligned one no faster.
-    let word = |bytes: &[u8; 8]| u64::from_le_bytes(*bytes);
-    let mut rest = data;
-    while let Some((block, tail)) = rest.split_first_chunk::<64>() {
-        for chunk in block.as_chunks::<8>().0 {
-            crc = __crc32d(crc, word(chunk));
-        }
-        rest = tail;
-    }
-    if let Some((quad, tail)) = rest.split_first_chunk::<32>() {
-        for chunk in quad.as_chunks::<8>().0 {
-            crc = __crc32d(crc, word(chunk));
-        }
-        rest = tail;
-    }
-    if let Some((pair, tail)) = rest.split_first_chunk::<16>() {
-        let (first, second) = pair.split_at(8);
-        crc = __crc32d(crc, word(first.try_into().unwrap()));
-        crc = __crc32d(crc, word(second.try_into().unwrap()));
-        rest = tail;
-    }
-    if let Some((chunk, tail)) = rest.split_first_chunk::<8>() {
-        crc = __crc32d(crc, word(chunk));
-        rest = tail;
-    }
-    if let Some((word, tail)) = rest.split_first_chunk::<4>() {
-        crc = __crc32w(crc, u32::from_le_bytes(*word));
-        rest = tail;
-    }
-    if let Some((half, tail)) = rest.split_first_chunk::<2>() {
-        crc = __crc32h(crc, u16::from_le_bytes(*half));
-        rest = tail;
-    }
-    if let Some(&byte) = rest.first() {
-        crc = __crc32b(crc, byte);
-    }
-    crc
+    crc_loop!(crc, data, __crc32d, __crc32w, __crc32h, __crc32b, true)
+}
+
+/// [`crc32_iscsi_short`] for CRC-32/ISO-HDLC.
+#[cfg(not(all(
+    target_endian = "little",
+    any(target_os = "linux", target_os = "android")
+)))]
+#[inline]
+#[target_feature(enable = "crc")]
+unsafe fn crc32_iso_hdlc_short(mut crc: u32, data: &[u8]) -> u32 {
+    debug_assert!(data.len() < SMALL_BUFFER_END);
+    crc_loop!(crc, data, __crc32d, __crc32w, __crc32h, __crc32b, false)
 }
 
 #[cfg(test)]
@@ -394,13 +465,14 @@ mod tests {
     }
 
     /// The PMULL kernels the `aarch64-neon-pmull` tier is held to agree with the reference at
-    /// every length through the small path, across the fold boundary and at a megabyte, from
-    /// aligned and unaligned starts; on an SHA3 part dispatch would never reach them.
+    /// every length through the small path, across the fold boundaries and the stream kernel's
+    /// threshold, and at a megabyte, from aligned and unaligned starts; on an SHA3 part dispatch
+    /// would never reach them.
     #[test]
     fn held_kernels_agree_with_the_reference() {
         let mut data = vec![0u8; 1_048_577 + 3];
         rng().fill(&mut data[..]);
-        for len in (0..=1024).chain(1_048_575..=1_048_577) {
+        for len in (0..=PMULL_STREAM_THRESHOLD + 128).chain(1_048_575..=1_048_577) {
             for offset in [0, 3] {
                 let slice = &data[offset..offset + len];
                 assert_eq!(
@@ -418,6 +490,126 @@ mod tests {
     }
 
     type Kernel = unsafe fn(u32, *const u8, usize) -> u32;
+
+    unsafe fn pmull_iscsi(crc: u32, buf: *const u8, len: usize) -> u32 {
+        // SAFETY: the caller holds `len` bytes at `buf` and checked for PMULL
+        unsafe {
+            crc32_iscsi_with(
+                FusionKernel::Pmull,
+                crc,
+                core::slice::from_raw_parts(buf, len),
+            )
+        }
+    }
+
+    unsafe fn pmull_iso_hdlc(crc: u32, buf: *const u8, len: usize) -> u32 {
+        // SAFETY: as for `pmull_iscsi`
+        unsafe {
+            crc32_iso_hdlc_with(
+                FusionKernel::Pmull,
+                crc,
+                core::slice::from_raw_parts(buf, len),
+            )
+        }
+    }
+
+    unsafe fn sha3_iscsi(crc: u32, buf: *const u8, len: usize) -> u32 {
+        // SAFETY: the caller holds `len` bytes at `buf` and checked for SHA3
+        unsafe {
+            crc32_iscsi_with(
+                FusionKernel::PmullSha3,
+                crc,
+                core::slice::from_raw_parts(buf, len),
+            )
+        }
+    }
+
+    unsafe fn sha3_iso_hdlc(crc: u32, buf: *const u8, len: usize) -> u32 {
+        // SAFETY: as for `sha3_iscsi`
+        unsafe {
+            crc32_iso_hdlc_with(
+                FusionKernel::PmullSha3,
+                crc,
+                core::slice::from_raw_parts(buf, len),
+            )
+        }
+    }
+
+    unsafe fn short_iscsi(crc: u32, buf: *const u8, len: usize) -> u32 {
+        // SAFETY: the caller holds `len` bytes at `buf`, fewer than `SMALL_BUFFER_END`, and
+        // checked for CRC32
+        unsafe { crc32_iscsi_short(crc, core::slice::from_raw_parts(buf, len)) }
+    }
+
+    unsafe fn short_iso_hdlc(crc: u32, buf: *const u8, len: usize) -> u32 {
+        // SAFETY: as for `short_iscsi`
+        unsafe { crc32_iso_hdlc_short(crc, core::slice::from_raw_parts(buf, len)) }
+    }
+
+    unsafe fn loop_iscsi(crc: u32, buf: *const u8, len: usize) -> u32 {
+        // SAFETY: the caller holds `len` bytes at `buf` and checked for CRC32
+        unsafe { crc32_iscsi_loop(crc, core::slice::from_raw_parts(buf, len)) }
+    }
+
+    unsafe fn loop_iso_hdlc(crc: u32, buf: *const u8, len: usize) -> u32 {
+        // SAFETY: as for `loop_iscsi`
+        unsafe { crc32_iso_hdlc_loop(crc, core::slice::from_raw_parts(buf, len)) }
+    }
+
+    /// The CRC32 instruction loops the dispatch calls, the assembly on Linux and Android,
+    /// agree with the reference across their 64-byte turns and every tail.
+    #[test]
+    fn loop_entry_points_agree_with_the_reference() {
+        assert!(std::arch::is_aarch64_feature_detected!("crc"));
+        let kernels: [(&str, Kernel, bool); 2] = [
+            ("loop iscsi", loop_iscsi, true),
+            ("loop iso-hdlc", loop_iso_hdlc, false),
+        ];
+        kernels_agree(&kernels, &(0..=1100).collect::<Vec<_>>());
+    }
+
+    /// The short entry points, called directly, agree with the reference at every length they
+    /// are given, from every start offset within 16 bytes, carrying a prefix's state.
+    #[test]
+    fn short_entry_points_agree_with_the_reference() {
+        assert!(std::arch::is_aarch64_feature_detected!("crc"));
+        let kernels: [(&str, Kernel, bool); 2] = [
+            ("short iscsi", short_iscsi, true),
+            ("short iso-hdlc", short_iso_hdlc, false),
+        ];
+        kernels_agree(&kernels, &(0..SMALL_BUFFER_END).collect::<Vec<_>>());
+    }
+
+    /// Dispatch agrees with the reference on either side of every length it switches kernels
+    /// at, for each tier this CPU has, from every start offset within 16 bytes, carrying the
+    /// state of a prefix the reference hashed.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn dispatch_agrees_across_its_thresholds() {
+        let mut lengths = Vec::new();
+        for edge in [
+            SMALL_BUFFER_END,
+            SHA3_SMALL_END,
+            FOUR_LANE_END,
+            PMULL_SMALL_END,
+            PMULL_STREAM_THRESHOLD,
+            LARGE_BUFFER_THRESHOLD,
+        ] {
+            lengths.extend(edge.saturating_sub(40)..edge + 140);
+        }
+        lengths.sort_unstable();
+        lengths.dedup();
+
+        let mut kernels: Vec<(&str, Kernel, bool)> = vec![
+            ("pmull iscsi", pmull_iscsi, true),
+            ("pmull iso-hdlc", pmull_iso_hdlc, false),
+        ];
+        if std::arch::is_aarch64_feature_detected!("sha3") {
+            kernels.push(("sha3 iscsi", sha3_iscsi, true));
+            kernels.push(("sha3 iso-hdlc", sha3_iso_hdlc, false));
+        }
+        kernels_agree(&kernels, &lengths);
+    }
 
     /// Each lane kernel, called directly rather than through dispatch, agrees with the reference
     /// at every length through two full eight-lane strides and their tails, from every start
@@ -500,6 +692,22 @@ mod tests {
             ("iso_hdlc_eor3_v4", lanes::crc32_iso_hdlc_eor3_v4, false),
             ("iso_hdlc_eor3_v8", lanes::crc32_iso_hdlc_eor3_v8, false),
         ]);
+    }
+
+    /// The four-lane EOR3 kernels dispatch calls, the assembly copies on Linux and Android,
+    /// agree with the reference at every length they are given, from 64 bytes, from every
+    /// start offset within 16 bytes, carrying a prefix's state.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn dispatched_eor3_v4_agrees_with_the_reference() {
+        if !std::arch::is_aarch64_feature_detected!("sha3") {
+            return;
+        }
+        let kernels: [(&str, Kernel, bool); 2] = [
+            ("dispatched iscsi_eor3_v4", crc32_iscsi_eor3_v4, true),
+            ("dispatched iso_hdlc_eor3_v4", crc32_iso_hdlc_eor3_v4, false),
+        ];
+        kernels_agree(&kernels, &(64..=2200).collect::<Vec<_>>());
     }
 
     #[test]

@@ -21,7 +21,10 @@
 
 use crate::crc32::fusion::aarch64::iscsi::crc_pmull_sha3::shift_iscsi;
 use crate::crc32::fusion::aarch64::iso_hdlc::crc_pmull_sha3::shift_iso_hdlc;
-use crate::crc32::fusion::aarch64::{clmul_hi_and_xor, clmul_lo_and_xor, clmul_scalar, shifts};
+use crate::crc32::fusion::aarch64::{
+    clmul_hi_and_xor, clmul_lo_and_xor, clmul_scalar, crc32_iscsi_small_fast,
+    crc32_iso_hdlc_small_fast, shifts,
+};
 use core::arch::aarch64::{
     __crc32b, __crc32cb, __crc32cd, __crc32d, uint64x2_t, veorq_u64, vgetq_lane_u64, vld1q_u64,
     vmovq_n_u64, vsetq_lane_u64,
@@ -191,7 +194,12 @@ lane_kernel!(
     __crc32cd, __crc32cb, VECTOR_TAIL_PMULL
 );
 lane_kernel!(
-    /// CRC-32/ISCSI, four lanes, EOR3 folds.
+    /// CRC-32/ISCSI, four lanes, EOR3 folds. Linux and Android run the
+    /// assembly copy in `asm`, which fixes where the kernel sits.
+    #[cfg_attr(
+        all(target_endian = "little", any(target_os = "linux", target_os = "android")),
+        allow(dead_code)
+    )]
     crc32_iscsi_eor3_v4, 4, "crc,aes,sha3", fold_eor3, shifts::iscsi_fold_keys, __crc32cd,
     __crc32cb, true
 );
@@ -211,7 +219,12 @@ lane_kernel!(
     __crc32d, __crc32b, VECTOR_TAIL_PMULL
 );
 lane_kernel!(
-    /// CRC-32/ISO-HDLC, four lanes, EOR3 folds.
+    /// CRC-32/ISO-HDLC, four lanes, EOR3 folds. Linux and Android run the
+    /// assembly copy in `asm`, which fixes where the kernel sits.
+    #[cfg_attr(
+        all(target_endian = "little", any(target_os = "linux", target_os = "android")),
+        allow(dead_code)
+    )]
     crc32_iso_hdlc_eor3_v4, 4, "crc,aes,sha3", fold_eor3, shifts::iso_hdlc_fold_keys, __crc32d,
     __crc32b, true
 );
@@ -228,7 +241,9 @@ lane_kernel!(
 /// Each stream's CRC is then moved past the bytes after it by the shift tables' multiplier and
 /// added to the fold's. On Graviton 2, which has no SHA3, it ran 1.5 to 1.6 times the speed of
 /// 1.11.0's twelve-lane `v12e_v1` fold from 2 KiB to 1 MiB: the core issues the CRC32
-/// instructions and the folds side by side. What is left after the last block runs the four-lane kernel.
+/// instructions and the folds side by side. What is left after the last block, under 112
+/// bytes, runs the CRC32 instruction loop, which on Graviton 2 outran the four-lane fold at
+/// those lengths; Apple's cores, where that was not measured, run the four-lane fold.
 macro_rules! stream_kernel {
     ($(#[$meta:meta])* $name:ident, $keys:path, $shift:path, $crc_d:ident, $crc_b:ident,
      $tail:ident) => {
@@ -319,12 +334,38 @@ macro_rules! stream_kernel {
     };
 }
 
+/// The stream kernels' tail: the CRC32 instruction loop, or on Apple's cores the four-lane fold.
+macro_rules! stream_tail {
+    ($name:ident, $lanes:ident, $small:ident) => {
+        #[inline(always)]
+        unsafe fn $name(crc: u32, buf: *const u8, len: usize) -> u32 {
+            // SAFETY: the stream kernel's caller holds `len` readable bytes at `buf` and runs on
+            // a CPU with the CRC32 instructions and PMULL
+            unsafe {
+                if cfg!(target_vendor = "apple") {
+                    $lanes(crc, buf, len)
+                } else {
+                    $small(crc, core::slice::from_raw_parts(buf, len))
+                }
+            }
+        }
+    };
+}
+
+stream_tail!(iscsi_stream_tail, crc32_iscsi_v4, crc32_iscsi_small_fast);
+stream_tail!(
+    iso_hdlc_stream_tail,
+    crc32_iso_hdlc_v4,
+    crc32_iso_hdlc_small_fast
+);
+
 stream_kernel!(
     /// CRC-32/ISCSI, four CRC32 streams and three lanes.
-    crc32_iscsi_v3s4, shifts::iscsi_fold_keys, shift_iscsi, __crc32cd, __crc32cb, crc32_iscsi_v4
+    crc32_iscsi_v3s4, shifts::iscsi_fold_keys, shift_iscsi, __crc32cd, __crc32cb,
+    iscsi_stream_tail
 );
 stream_kernel!(
     /// CRC-32/ISO-HDLC, four CRC32 streams and three lanes.
     crc32_iso_hdlc_v3s4, shifts::iso_hdlc_fold_keys, shift_iso_hdlc, __crc32d, __crc32b,
-    crc32_iso_hdlc_v4
+    iso_hdlc_stream_tail
 );
