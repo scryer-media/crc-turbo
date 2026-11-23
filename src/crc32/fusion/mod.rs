@@ -16,6 +16,13 @@ mod aarch64;
 pub(crate) mod powers;
 mod x86;
 
+/// Whether this CPU is one of Intel's E-core parts, [`x86::CpuId::is_intel_ecore`]: the CPUs
+/// whose dispatch takes the E-core plans, under the ISA tier.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn is_intel_ecore() -> bool {
+    x86::CpuId::detect().is_intel_ecore()
+}
+
 /// The aarch64 fusion kernel's choice, kept in one byte and read with a relaxed load: 0 before
 /// it is made, then 1 for none, 2 for the PMULL kernel and 3 for the EOR3 one. The byte carries
 /// the choice itself and publishes nothing else, and every thread that makes it makes the same
@@ -110,6 +117,11 @@ aarch64_entry!(
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
 static ISCSI_DIRECT_END: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
+/// [`x86::IscsiPlan::v4_end`]: 0 until the plan is made, and 0 for good on every CPU but Intel's
+/// E-core parts. A nonzero value is only ever stored after detecting AVX2, SSE4.2 and PCLMULQDQ.
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+static ISCSI_V4_END: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
 /// x86's CRC-32/ISCSI plan, made once, or `None` where the CPU has no kernel.
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
 static ISCSI_PLAN: std::sync::OnceLock<Option<x86::IscsiPlan>> = std::sync::OnceLock::new();
@@ -132,6 +144,17 @@ pub(crate) fn crc32_iscsi<const XOROUT: u32>(state: u32, data: &[u8]) -> Option<
     if data.len() < ISCSI_DIRECT_END.load(Ordering::Relaxed) {
         // SAFETY: the limit is nonzero only once a kernel was selected, after detecting SSE4.2
         return Some(unsafe { x86::crc32_iscsi_direct(state, data) } ^ XOROUT);
+    }
+
+    // Intel's E-cores: the vector-only window straight to its kernel, one call as fast-crc32's
+    // `v4` is, rather than through the plan, its indirect call and the kernel's entry
+    #[cfg(target_arch = "x86_64")]
+    if data.len() < ISCSI_V4_END.load(Ordering::Relaxed) {
+        // SAFETY: the limit is nonzero only once the E-core plan was made, after detecting AVX2,
+        // SSE4.2 and PCLMULQDQ
+        return Some(
+            unsafe { x86::crc32_iscsi_avx2_v4_aligned(state, data.as_ptr(), data.len()) } ^ XOROUT,
+        );
     }
 
     Some(crc32_iscsi_planned::<XOROUT>(state, data))
@@ -182,6 +205,8 @@ fn iscsi_first_call<const XOROUT: u32>(state: u32, data: &[u8]) -> u32 {
             std::arch::is_x86_feature_detected!("avx2"),
         )?;
         let plan = x86::iscsi_plan(kernel, tier, x86::CpuId::detect());
+        #[cfg(target_arch = "x86_64")]
+        ISCSI_V4_END.store(plan.v4_end, Ordering::Relaxed);
         ISCSI_DIRECT_END.store(plan.direct_max + 1, Ordering::Relaxed);
 
         Some(plan)

@@ -180,15 +180,22 @@ own changelog up to the fork point continues below, unchanged.
   fusion kernel still computes its shifts per buffer.
 - Below AVX-512, CRC-32/ISCSI follows a plan chosen per CPU model: the
   plain CRC32 instruction loop runs up to 384 bytes (320 on AMD family
-  0x19, 288 on family 0x17, 240 on Haswell, 199 on Intel's E-core parts),
+  0x19, 288 on family 0x17, 240 on Haswell, 199 on Intel's E-core parts
+  and 159 there with the AVX2 build),
   where crc-fast hands over to its kernel at 257 on every CPU, and on AMD
   family 0x19 the `x86_64-avx2-vpclmulqdq` tier's 256-bit fold takes
   buffers from 4 KiB instead of the fusion kernel.
 - On Haswell, Zen 2, Zen 3, the AVX-512 PCLMULQDQ tier, Sapphire Rapids,
-  Ice Lake and Zen 4, a window of lengths past the CRC32 instruction's
-  limit takes a kernel of carry-less folds alone (fast-crc32's `v4`); on
-  Zen 2 buffers from 32 KiB take three CRC32 streams alone (fast-crc32's
-  `s3`). crc-fast has neither.
+  Ice Lake, Zen 4 and Intel's E-core parts, a window of lengths past the
+  CRC32 instruction's limit takes a kernel of carry-less folds alone
+  (fast-crc32's `v4`; on the E-core parts from a 16-byte boundary, called
+  straight from the inlined entry); on Zen 2 buffers from 32 KiB take three
+  CRC32 streams alone (fast-crc32's `s3`). crc-fast has neither.
+- On Intel's E-core parts on the `x86_64-avx2-vpclmulqdq` tier,
+  CRC-32/ISO-HDLC from 256 bytes to 4 KiB takes libdeflate's cascade of
+  256-bit folds (eight accumulators, then four onto four, two onto two and
+  one onto one) instead of this tier's own fold; crc-fast has the generic
+  fold there.
 - CRC-32/ISCSI buffers up to the plan's limit (256 bytes on the AVX-512
   tiers) are checksummed with the CRC32 instruction over unaligned words,
   written as inline assembly inside the caller on x86_64, ahead of the
@@ -470,7 +477,9 @@ own changelog up to the fork point continues below, unchanged.
     loop was faster on the 7R32;
   - up to 199 bytes on Intel's E-core parts (family 6, models 0xaf Sierra
     Forest, 0xb6 Grand Ridge, 0xdd Clearwater Forest and 0xbe Alder
-    Lake-N), where the Xeon 6731E's kernel won from 200;
+    Lake-N), where the Xeon 6731E's kernel won from 200, and up to 159
+    bytes there with the AVX2 build, whose vector-only window starts at
+    160 (below);
   - on AMD family 0x19 (Zen 3, and Zen 4 pinned below AVX-512) on the
     `x86_64-avx2-vpclmulqdq` tier, buffers from 4 KiB go to that tier's
     256-bit fold instead of the fusion kernel: on the 7R13 it was 1.05x
@@ -1064,10 +1073,71 @@ own changelog up to the fork point continues below, unchanged.
   | Xeon Platinum 8488C (Sapphire Rapids) | 256 | 383; 447 off a 64-byte boundary |
   | Xeon Platinum 8375C (Ice Lake) | 256 | 383; 447 off a 64-byte boundary |
   | EPYC 9R14 (Zen 4) | 256 | 447 off a 64-byte boundary only |
+  | Xeon 6731E (Sierra Forest), AVX2 build | 159 | 703 |
 
   On the AVX-512 VPCLMULQDQ tier the 512-bit kernel stays ahead from a
   64-byte aligned start, where its loads do not split cache lines; from
   any other start `v4` was 1.17x to 1.5x faster at 320 and 384 bytes.
+- On Intel's E-core parts (family 6, models 0xaf, 0xb6, 0xdd and 0xbe)
+  with the AVX2 build, the `v4` window takes buffers from a 16-byte
+  boundary, the bytes before it with the CRC32 instruction, as fast-crc32's
+  generated `v4` does, and the inlined entry calls it directly for the
+  window's lengths, one call where the plan's path was a call, an indirect
+  call through the plan and a jump; past the window the plan's kernel is
+  the tier's default. Every other CPU pays one relaxed load and compare
+  more on lengths past its direct limit. Measured on a Xeon 6731E only
+  (model 0xaf; the other three models are planned as it is, unmeasured),
+  GB/s, median of three interleaved rounds over four link layouts on two
+  cores, checksums compared first, against 1.11.0 and the fastest of
+  fast-crc32's generated kernels (the kit's and 49 generated `sse_` and
+  `avx2_` shapes), aligned and three bytes off:
+
+  | bytes | 1.11.0 | without | with | fastest other | with / other |
+  |---:|---:|---:|---:|---:|---:|
+  | 160 | 9.6 | 13.4 | 16.9 | 19.6 | 0.87 |
+  | 192 | 10.2 | 12.9 | 18.6 | 21.7 | 0.86 |
+  | 256 | 9.4 | 13.2 | 21.2 | 22.6 | 0.94 |
+  | 384 | 6.3 | 16.3 | 22.4 | 23.5 | 0.95 |
+  | 512 | 7.6 | 20.2 | 23.0 | 24.4 | 0.94 |
+  | 160, off | 7.3 | 13.4 | 15.7 | 13.9 | 1.13 |
+  | 256, off | 7.4 | 11.8 | 17.7 | 17.4 | 1.02 |
+  | 512, off | 7.3 | 18.7 | 21.9 | 20.4 | 1.07 |
+
+  From an aligned start fast-crc32's VEX-encoded `v4`, `v6` and `v8`
+  stay ahead from 96 to 512 bytes (0.65x at 128, where the CRC32
+  instruction alone still runs). From 704 bytes to 16 KiB, past the window,
+  this build measured 0.95x to 1.00x the build without the change: about
+  two runs in five, in every link layout, were 9% slower at 4 KiB, which
+  the build without it never was; the cause is not known.
+- On Intel's E-core parts on the `x86_64-avx2-vpclmulqdq` tier,
+  CRC-32/ISO-HDLC from 256 bytes to 4 KiB takes the shape of libdeflate's
+  `crc32_x86_vpclmulqdq_avx2` (`crc32_pclmul_template.h`, reimplemented
+  from it; no code is taken): eight 256-bit accumulators over 256-byte
+  steps, folded four onto four, two onto two and one onto one, each
+  halving taking the next piece of the buffer the length calls for, then
+  256 bits onto 128, a 16-byte block, the last bytes by one overlapping
+  read and the 96-bit Barrett reduction. Every fold is onto the
+  accumulator a fixed distance ahead, so five coefficient pairs serve every
+  length; they are computed at compile time from powers of x and checked
+  equal to the generated keys where the table has them. The checksum
+  entry is the tier's ladder with the cascade in place of its middle fold,
+  so lengths below 256 bytes take exactly the path they took. Measured on
+  the same Xeon 6731E and runs, GB/s, aligned (unaligned within 1%):
+
+  | bytes | 1.11.0 | without | with | libdeflate | with / libdeflate |
+  |---:|---:|---:|---:|---:|---:|
+  | 256 | 7.4 | 18.8 | 19.6 | 20.8 | 0.94 |
+  | 320 | 6.7 | 18.3 | 20.4 | 21.5 | 0.95 |
+  | 384 | 9.5 | 20.6 | 21.1 | 22.0 | 0.96 |
+  | 512 | 11.5 | 21.6 | 21.9 | 22.2 | 0.98 |
+  | 1024 | 15.7 | 23.0 | 23.2 | 23.6 | 0.98 |
+  | 2048 | 19.3 | 23.8 | 23.9 | 24.2 | 0.99 |
+
+  Below 256 bytes the cascade measured behind the ladder (0.70x to 0.96x at
+  48 to 224 bytes, ahead only at 32 and 128), so the ladder keeps them;
+  libdeflate leads there at 32, 96, 128 and 192 bytes (0.92x to 0.94x).
+  The cascade is a candidate for every CPU on the tier, measured so far on
+  this one alone.
 - On AMD family 0x17 (Zen 2), CRC-32/ISCSI from 32 KiB runs three CRC32
   instruction streams alone, fast-crc32's `s3` shape, with the stream
   shifts from the compile-time tables above. The EPYC 7R32 issues the CRC32

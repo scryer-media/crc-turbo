@@ -388,6 +388,11 @@ fn choose_iso_hdlc() -> (IsoHdlcChecksum, IsoHdlcUpdate) {
             iso_hdlc_checksum_x86_64_avx512_pclmulqdq,
             iso_hdlc_x86_64_avx512_pclmulqdq,
         ),
+        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        ArchOpsInstance::X86_64Avx2Vpclmulqdq(_) if crate::crc32::fusion::is_intel_ecore() => (
+            iso_hdlc_checksum_x86_64_avx2_ecore,
+            iso_hdlc_x86_64_avx2_ecore,
+        ),
         #[cfg(target_arch = "x86_64")]
         ArchOpsInstance::X86_64Avx2Vpclmulqdq(_) => (
             iso_hdlc_checksum_x86_64_avx2_vpclmulqdq,
@@ -406,6 +411,32 @@ fn choose_iso_hdlc() -> (IsoHdlcChecksum, IsoHdlcUpdate) {
     ISO_HDLC_CHECKSUM.store(entries.0 as *mut (), Ordering::Relaxed);
 
     entries
+}
+
+/// The `x86_64-avx2-vpclmulqdq` tier's CRC-32/ISO-HDLC from 256 bytes up to [`MID_END`] on
+/// Intel's E-core parts: libdeflate's cascade, [`x86_64::iso_hdlc_cascade`], in place of the
+/// tier's `iso_hdlc_mid`. Below 256 bytes the tier's ladder stays ahead of it there.
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+use x86_64::iso_hdlc_cascade::iso_hdlc_cascade as iso_hdlc_mid_x86_64_avx2_ecore;
+
+/// The E-core parts' checksum entry: the tier's ladder in line, then the cascade for 256 bytes
+/// to [`MID_END`] in place of the tier's mid fold, and the tier's long fold after that.
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+use crate::arch::x86::short_asm::iso_hdlc_checksum_avx2_ecore as iso_hdlc_checksum_x86_64_avx2_ecore;
+
+/// [`iso_hdlc_x86_64_avx2_vpclmulqdq`] on Intel's E-core parts: the same entry, with the
+/// cascade for 256 bytes to [`MID_END`].
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[inline]
+#[target_feature(enable = "avx2,vpclmulqdq,sse4.1,pclmulqdq")]
+unsafe fn iso_hdlc_x86_64_avx2_ecore(crc: u32, bytes: &[u8]) -> u32 {
+    if bytes.len() >= 16 && bytes.len() < 128 {
+        return crate::arch::x86::short_asm::iso_hdlc_short128_avx(crc, bytes) as u32;
+    }
+    if bytes.len() >= 256 && bytes.len() < MID_END {
+        return iso_hdlc_mid_x86_64_avx2_ecore(crc, bytes) as u32;
+    }
+    iso_hdlc_x86_64_avx2_vpclmulqdq(crc, bytes)
 }
 
 /// Whether a CPU on the SSE tier has AVX, so that CRC-32/ISO-HDLC takes the SSE tier's entries
@@ -916,8 +947,8 @@ mod tests {
         let init = params.init_algorithm;
         let carried = crate::arch::software::update(init, &data[8192..8192 + 7], params);
 
-        let mut lengths: Vec<usize> = (0..=400).collect();
-        lengths.extend([511, 512, 513, 1023, 1024, 1025, 4095, 4096, 4097, 8192]);
+        let mut lengths: Vec<usize> = (0..=600).collect();
+        lengths.extend([1023, 1024, 1025, 4095, 4096, 4097, 8192]);
         for offset in [0usize, 1, 15, 33] {
             for &len in &lengths {
                 let input = &data[offset..offset + len];
@@ -964,6 +995,28 @@ mod tests {
         check_iso_hdlc_matches_software(
             |state, bytes| unsafe { !iso_hdlc_x86_sse_avx(!state, bytes) },
             |bytes| unsafe { iso_hdlc_checksum_x86_sse_avx(bytes) },
+        );
+    }
+
+    /// The E-core parts' CRC-32/ISO-HDLC entries on the `x86_64-avx2-vpclmulqdq` tier, forced on
+    /// any CPU with its features, against the table-driven software path.
+    #[test]
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    #[cfg_attr(miri, ignore)]
+    fn test_avx2_ecore_iso_hdlc_matches_software() {
+        if !(is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("vpclmulqdq")
+            && is_x86_feature_detected!("sse4.1")
+            && is_x86_feature_detected!("pclmulqdq"))
+        {
+            eprintln!(
+                "skipping test_avx2_ecore_iso_hdlc_matches_software: the CPU lacks VPCLMULQDQ"
+            );
+            return;
+        }
+        check_iso_hdlc_matches_software(
+            |state, bytes| unsafe { !iso_hdlc_x86_64_avx2_ecore(!state, bytes) },
+            |bytes| unsafe { iso_hdlc_checksum_x86_64_avx2_ecore(bytes) },
         );
     }
 
