@@ -252,13 +252,16 @@ own changelog up to the fork point continues below, unchanged.
   Below 64 bytes every tier calls a copy of the loop without its 64-byte
   block step, so that the compiler fits each copy to its length range.
 - On aarch64 Linux and Android those loops (below 64 bytes; on the SHA3
-  tier below 128 bytes, on the PMULL tier below 1 KiB) and the SHA3 tier's
-  four-lane fold (128 to 255 bytes) are assembly shipped in the crate, so
+  tier below 96 bytes, on the PMULL tier below 1 KiB) and the SHA3 tier's
+  four-lane fold (96 to 255 bytes) are assembly shipped in the crate, so
   every consumer's compiler builds the same instructions at the same
   64-byte alignment. The compiled loops and fold stay as the other targets'
   path and as the tests' reference.
 - `checksum` naming CRC-32/ISCSI or CRC-32/ISO-HDLC is that algorithm's
   entry point inlined, not a match over every algorithm.
+- On aarch64 every CRC-32/ISCSI and CRC-32/ISO-HDLC kernel applies the
+  final XOR itself, as fast-crc32's kernels apply their complement, so the
+  inlined entry point ends in a jump to the kernel with no frame around it.
 - The other algorithms fold a buffer from 128 bytes to 64 KiB (256 KiB on
   Apple) from wherever it starts and reduce it once, where crc-fast folds
   the bytes before and after an aligned middle separately. That fold is
@@ -918,6 +921,29 @@ own changelog up to the fork point continues below, unchanged.
   pinned 1.97.1 build, but CRC-32/ISO-HDLC from 16 to 64 bytes ran 0.90x to
   0.92x: the dispatch around the assembly is still compiled. The other
   targets, Apple's included, keep the compiled code.
+- aarch64, CRC-32/ISCSI and CRC-32/ISO-HDLC: each kernel takes the
+  algorithm's final XOR and applies it before returning, the assembly ones
+  with one more instruction (`eor w0, w0, w3`), the compiled ones in an
+  out-of-line wrapper on Linux and Android. `checksum` naming either
+  algorithm then compiles to a byte load, the length compares and a jump to
+  the kernel, with no stack frame; fast-crc32's kernels, which apply their
+  complement themselves, have the same shape. On Linux and Android the SHA3
+  tier runs the four-lane fold from 96 bytes, where fast-crc32's `v4` wins
+  on Graviton 4, rather than from 128. Against the best of fast-crc32's
+  generated kernels, libdeflate, zlib and 1.11.0, median of seven
+  interleaved rounds, checksums compared first: Graviton2 CRC-32/ISO-HDLC
+  at 128 bytes ran 1.14x, Graviton3
+  CRC-32/ISO-HDLC at 192 bytes 1.00x and at 112 bytes 1.06x (0.90x to
+  0.94x with the loop to 128). Graviton2 CRC-32/ISCSI at 1 MiB ran 0.97x
+  to 0.98x of fast-crc32's `v3s4x2e_v2` and 1.63x of 1.11.0. On Graviton4
+  from 96 bytes to 1 KiB, two builds whose code is identical at a length
+  differed by up to 29% in the same batch, more than any difference under
+  test, so those lengths are not settled by these runs. A test checks every
+  kernel's result with a final XOR against the reference across all
+  lengths to 300 bytes and the fold thresholds; dropping the assembly's XOR
+  failed it on Graviton 2, 3 and 4. On the Apple M5 Max, where the code
+  shape is unchanged, both algorithms ran 1.07x to 3.2x of 1.11.0 from
+  16 bytes to 1 MiB, aligned and unaligned.
 - With that kernel, the direct call above and this release's aarch64 short paths,
   CRC-32/ISCSI and CRC-32/ISO-HDLC against 1.11.0 on Graviton, median of
   seven interleaved rounds, checksums compared first and the test suite

@@ -1401,6 +1401,14 @@ pub fn crc32_iso_hdlc(data: &[u8]) -> u32 {
         arch::crc32_iso_hdlc(data) as u32
     }
 
+    // aarch64 applies the final XOR in the kernel, so that this is a jump to it.
+    #[cfg(all(target_arch = "aarch64", feature = "std"))]
+    if let Some(crc) =
+        fusion::crc32_iso_hdlc::<{ CRC32_ISO_HDLC.xorout as u32 }>(CRC32_ISO_HDLC.init as u32, data)
+    {
+        return crc;
+    }
+
     #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
     {
         crc32_iso_hdlc_calculator(CRC32_ISO_HDLC.init, data, &CRC32_ISO_HDLC) as u32
@@ -1589,7 +1597,7 @@ fn crc32_iscsi_xorout<const XOROUT: u32>(state: u64, data: &[u8], _params: &CrcP
 #[inline(always)]
 fn crc32_iso_hdlc_calculator(state: u64, data: &[u8], _params: &CrcParams) -> u64 {
     #[cfg(all(target_arch = "aarch64", feature = "std"))]
-    if let Some(crc) = fusion::crc32_iso_hdlc(state as u32, data) {
+    if let Some(crc) = fusion::crc32_iso_hdlc::<0>(state as u32, data) {
         return crc as u64;
     }
 

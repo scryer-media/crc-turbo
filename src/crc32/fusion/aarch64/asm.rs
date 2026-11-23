@@ -35,49 +35,49 @@ macro_rules! tail_steps {
         concat!(
             // 32 bytes
             "tbz x2, #5, 2f\n",
-            "ldp x3, x4, [x1]\n",
-            "ldp x5, x6, [x1, #16]\n",
+            "ldp x4, x5, [x1]\n",
+            "ldp x6, x7, [x1, #16]\n",
             "add x1, x1, #32\n",
-            $x,
-            " w0, w0, x3\n",
             $x,
             " w0, w0, x4\n",
             $x,
             " w0, w0, x5\n",
             $x,
             " w0, w0, x6\n",
+            $x,
+            " w0, w0, x7\n",
             // 16 bytes
             "2:\n",
             "tbz x2, #4, 3f\n",
-            "ldp x3, x4, [x1], #16\n",
-            $x,
-            " w0, w0, x3\n",
+            "ldp x4, x5, [x1], #16\n",
             $x,
             " w0, w0, x4\n",
+            $x,
+            " w0, w0, x5\n",
             // A multiple of 16 is done
             "3:\n",
             "tst x2, #15\n",
             "b.eq 9f\n",
             // 8, 4, 2 and 1 bytes
             "tbz x2, #3, 4f\n",
-            "ldr x3, [x1], #8\n",
+            "ldr x4, [x1], #8\n",
             $x,
-            " w0, w0, x3\n",
+            " w0, w0, x4\n",
             "4:\n",
             "tbz x2, #2, 5f\n",
-            "ldr w3, [x1], #4\n",
+            "ldr w4, [x1], #4\n",
             $w,
-            " w0, w0, w3\n",
+            " w0, w0, w4\n",
             "5:\n",
             "tbz x2, #1, 6f\n",
-            "ldrh w3, [x1], #2\n",
+            "ldrh w4, [x1], #2\n",
             $h,
-            " w0, w0, w3\n",
+            " w0, w0, w4\n",
             "6:\n",
             "tbz x2, #0, 9f\n",
-            "ldrb w3, [x1]\n",
+            "ldrb w4, [x1]\n",
             $b,
-            " w0, w0, w3\n",
+            " w0, w0, w4\n",
             "9:\n",
         )
     };
@@ -98,14 +98,12 @@ macro_rules! block_loop {
             "cmp x2, #64\n",
             "b.lo 8f\n",
             "7:\n",
-            "ldp x3, x4, [x1]\n",
-            "ldp x5, x6, [x1, #16]\n",
-            "ldp x7, x8, [x1, #32]\n",
-            "ldp x9, x10, [x1, #48]\n",
+            "ldp x4, x5, [x1]\n",
+            "ldp x6, x7, [x1, #16]\n",
+            "ldp x8, x9, [x1, #32]\n",
+            "ldp x10, x11, [x1, #48]\n",
             "add x1, x1, #64\n",
             "sub x2, x2, #64\n",
-            $x,
-            " w0, w0, x3\n",
             $x,
             " w0, w0, x4\n",
             $x,
@@ -120,6 +118,8 @@ macro_rules! block_loop {
             " w0, w0, x9\n",
             $x,
             " w0, w0, x10\n",
+            $x,
+            " w0, w0, x11\n",
             "cmp x2, #64\n",
             "b.hs 7b\n",
             "8:\n",
@@ -135,12 +135,12 @@ macro_rules! v4_loop {
     ($x:literal, $w:literal, $h:literal, $b:literal) => {
         concat!(
             ".p2align 6\n",
-            "adrp x3, {keys}\n",
-            "add x3, x3, :lo12:{keys}\n",
+            "adrp x6, {keys}\n",
+            "add x6, x6, :lo12:{keys}\n",
             // The first 64 bytes, the state added to the first lane
             "ld1 {{v0.16b, v1.16b, v2.16b, v3.16b}}, [x1], #64\n",
             "fmov s4, w0\n",
-            "ldr q5, [x3]\n",
+            "ldr q5, [x6]\n",
             "sub x2, x2, #64\n",
             "eor v0.16b, v0.16b, v4.16b\n",
             "cmp x2, #64\n",
@@ -165,8 +165,8 @@ macro_rules! v4_loop {
             "b.hs 2b\n",
             // The lanes into the first: neighbours 16 bytes apart, then pairs 32 apart
             "3:\n",
-            "ldr q5, [x3, #16]\n",
-            "ldr q6, [x3, #32]\n",
+            "ldr q5, [x6, #16]\n",
+            "ldr q6, [x6, #32]\n",
             "pmull v20.1q, v0.1d, v5.1d\n",
             "pmull2 v21.1q, v0.2d, v5.2d\n",
             "pmull v22.1q, v2.1d, v5.1d\n",
@@ -220,7 +220,8 @@ macro_rules! v4_loop {
 }
 
 /// Defines `$name`, an `#[inline(never)]` C-convention function running `$template` with the
-/// state in `w0`, the buffer in `x1` and its length in `x2`, under `$features`; `$clobbers` are
+/// state in `w0`, the buffer in `x1` and its length in `x2`, under `$features`, then adding the
+/// final XOR in `w3` to the result; `$clobbers` are
 /// the further registers the template writes, and `$($op)*` any further operands.
 macro_rules! asm_fn {
     (
@@ -235,7 +236,12 @@ macro_rules! asm_fn {
         /// function's `target_feature`.
         #[inline(never)]
         #[target_feature(enable = $features)]
-        pub(super) unsafe extern "C" fn $name(crc: u32, data: *const u8, len: usize) -> u32 {
+        pub(super) unsafe extern "C" fn $name(
+            crc: u32,
+            data: *const u8,
+            len: usize,
+            xorout: u32,
+        ) -> u32 {
             let out: u32;
             // SAFETY: the caller holds `len` bytes at `data` and checked the features; the
             // template reads those bytes (and the keys it names), and writes only the registers
@@ -243,9 +249,12 @@ macro_rules! asm_fn {
             unsafe {
                 core::arch::asm!(
                     $template,
+                    // The checksum's final XOR, so that the caller's call is its last act
+                    "eor w0, w0, w3",
                     inout("w0") crc => out,
                     inout("x1") data => _,
                     inout("x2") len => _,
+                    in("w3") xorout,
                     $($clobber)*
                     $($($op)*,)?
                     options(nostack, readonly, pure),
@@ -261,7 +270,7 @@ asm_fn!(
     crc32c_short,
     "crc",
     short_loop!("crc32cx", "crc32cw", "crc32ch", "crc32cb"),
-    [out("x3") _, out("x4") _, out("x5") _, out("x6") _,]
+    [out("x4") _, out("x5") _, out("x6") _, out("x7") _,]
 );
 
 asm_fn!(
@@ -269,7 +278,7 @@ asm_fn!(
     crc32_short,
     "crc",
     short_loop!("crc32x", "crc32w", "crc32h", "crc32b"),
-    [out("x3") _, out("x4") _, out("x5") _, out("x6") _,]
+    [out("x4") _, out("x5") _, out("x6") _, out("x7") _,]
 );
 
 asm_fn!(
@@ -278,8 +287,8 @@ asm_fn!(
     "crc",
     block_loop!("crc32cx", "crc32cw", "crc32ch", "crc32cb"),
     [
-        out("x3") _, out("x4") _, out("x5") _, out("x6") _, out("x7") _, out("x8") _,
-        out("x9") _, out("x10") _,
+        out("x4") _, out("x5") _, out("x6") _, out("x7") _, out("x8") _, out("x9") _,
+        out("x10") _, out("x11") _,
     ]
 );
 
@@ -289,8 +298,8 @@ asm_fn!(
     "crc",
     block_loop!("crc32x", "crc32w", "crc32h", "crc32b"),
     [
-        out("x3") _, out("x4") _, out("x5") _, out("x6") _, out("x7") _, out("x8") _,
-        out("x9") _, out("x10") _,
+        out("x4") _, out("x5") _, out("x6") _, out("x7") _, out("x8") _, out("x9") _,
+        out("x10") _, out("x11") _,
     ]
 );
 
@@ -315,7 +324,7 @@ asm_fn!(
     "crc,aes,sha3",
     v4_loop!("crc32cx", "crc32cw", "crc32ch", "crc32cb"),
     [
-        out("x3") _, out("x4") _, out("x5") _,
+        out("x4") _, out("x5") _, out("x6") _,
         out("v0") _, out("v1") _, out("v2") _, out("v3") _, out("v4") _, out("v5") _,
         out("v6") _, out("v16") _, out("v17") _, out("v18") _, out("v19") _, out("v20") _,
         out("v21") _, out("v22") _, out("v23") _, out("v24") _, out("v25") _, out("v26") _,
@@ -330,7 +339,7 @@ asm_fn!(
     "crc,aes,sha3",
     v4_loop!("crc32x", "crc32w", "crc32h", "crc32b"),
     [
-        out("x3") _, out("x4") _, out("x5") _,
+        out("x4") _, out("x5") _, out("x6") _,
         out("v0") _, out("v1") _, out("v2") _, out("v3") _, out("v4") _, out("v5") _,
         out("v6") _, out("v16") _, out("v17") _, out("v18") _, out("v19") _, out("v20") _,
         out("v21") _, out("v22") _, out("v23") _, out("v24") _, out("v25") _, out("v26") _,
@@ -339,63 +348,63 @@ asm_fn!(
     keys = sym ISO_HDLC_V4_KEYS
 );
 
-/// CRC-32/ISCSI of `data`, shorter than 64 bytes, from `crc`.
+/// CRC-32/ISCSI of `data`, shorter than 64 bytes, from `crc`, plus `xorout`.
 ///
 /// # Safety
 ///
 /// The CPU has the CRC32 instructions, and `data` is shorter than 64 bytes.
 #[inline(always)]
-pub(super) unsafe fn crc32_iscsi_short(crc: u32, data: &[u8]) -> u32 {
+pub(super) unsafe fn crc32_iscsi_short(crc: u32, data: &[u8], xorout: u32) -> u32 {
     debug_assert!(data.len() < 64);
     // SAFETY: the caller checked for the CRC32 instructions; the loop reads `data`
-    unsafe { crc32c_short(crc, data.as_ptr(), data.len()) }
+    unsafe { crc32c_short(crc, data.as_ptr(), data.len(), xorout) }
 }
 
-/// CRC-32/ISO-HDLC of `data`, shorter than 64 bytes, from `crc`.
+/// CRC-32/ISO-HDLC of `data`, shorter than 64 bytes, from `crc`, plus `xorout`.
 ///
 /// # Safety
 ///
 /// As for [`crc32_iscsi_short`].
 #[inline(always)]
-pub(super) unsafe fn crc32_iso_hdlc_short(crc: u32, data: &[u8]) -> u32 {
+pub(super) unsafe fn crc32_iso_hdlc_short(crc: u32, data: &[u8], xorout: u32) -> u32 {
     debug_assert!(data.len() < 64);
     // SAFETY: as for `crc32_iscsi_short`
-    unsafe { crc32_short(crc, data.as_ptr(), data.len()) }
+    unsafe { crc32_short(crc, data.as_ptr(), data.len(), xorout) }
 }
 
-/// CRC-32/ISCSI of `data` by the CRC32 instruction alone, from `crc`.
+/// CRC-32/ISCSI of `data` by the CRC32 instruction alone, from `crc`, plus `xorout`.
 ///
 /// # Safety
 ///
 /// The CPU has the CRC32 instructions.
 #[inline(always)]
-pub(super) unsafe fn crc32_iscsi_loop(crc: u32, data: &[u8]) -> u32 {
+pub(super) unsafe fn crc32_iscsi_loop(crc: u32, data: &[u8], xorout: u32) -> u32 {
     // SAFETY: the caller checked for the CRC32 instructions; the loop reads `data`
-    unsafe { crc32c_blocks(crc, data.as_ptr(), data.len()) }
+    unsafe { crc32c_blocks(crc, data.as_ptr(), data.len(), xorout) }
 }
 
-/// CRC-32/ISO-HDLC of `data` by the CRC32 instruction alone, from `crc`.
+/// CRC-32/ISO-HDLC of `data` by the CRC32 instruction alone, from `crc`, plus `xorout`.
 ///
 /// # Safety
 ///
 /// As for [`crc32_iscsi_loop`].
 #[inline(always)]
-pub(super) unsafe fn crc32_iso_hdlc_loop(crc: u32, data: &[u8]) -> u32 {
+pub(super) unsafe fn crc32_iso_hdlc_loop(crc: u32, data: &[u8], xorout: u32) -> u32 {
     // SAFETY: as for `crc32_iscsi_loop`
-    unsafe { crc32_blocks(crc, data.as_ptr(), data.len()) }
+    unsafe { crc32_blocks(crc, data.as_ptr(), data.len(), xorout) }
 }
 
-/// CRC-32/ISCSI by the four-lane fold, EOR3 form, for 64 bytes and more.
+/// CRC-32/ISCSI by the four-lane fold, EOR3 form, for 64 bytes and more, plus `xorout`.
 ///
 /// # Safety
 ///
 /// `buf` holds `len` readable bytes, `len` is at least 64, and the CPU has the CRC32
 /// instructions, PMULL and SHA3.
 #[inline(always)]
-pub(super) unsafe fn crc32_iscsi_eor3_v4(crc: u32, buf: *const u8, len: usize) -> u32 {
+pub(super) unsafe fn crc32_iscsi_eor3_v4(crc: u32, buf: *const u8, len: usize, xorout: u32) -> u32 {
     debug_assert!(len >= 64);
     // SAFETY: the caller holds `len` bytes at `buf`, at least 64, and checked the features
-    unsafe { crc32c_eor3_v4(crc, buf, len) }
+    unsafe { crc32c_eor3_v4(crc, buf, len, xorout) }
 }
 
 /// [`crc32_iscsi_eor3_v4`] for CRC-32/ISO-HDLC.
@@ -404,8 +413,13 @@ pub(super) unsafe fn crc32_iscsi_eor3_v4(crc: u32, buf: *const u8, len: usize) -
 ///
 /// As for [`crc32_iscsi_eor3_v4`].
 #[inline(always)]
-pub(super) unsafe fn crc32_iso_hdlc_eor3_v4(crc: u32, buf: *const u8, len: usize) -> u32 {
+pub(super) unsafe fn crc32_iso_hdlc_eor3_v4(
+    crc: u32,
+    buf: *const u8,
+    len: usize,
+    xorout: u32,
+) -> u32 {
     debug_assert!(len >= 64);
     // SAFETY: as for `crc32_iscsi_eor3_v4`
-    unsafe { crc32_eor3_v4(crc, buf, len) }
+    unsafe { crc32_eor3_v4(crc, buf, len, xorout) }
 }
