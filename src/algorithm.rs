@@ -358,9 +358,18 @@ where
 /// On an Apple M5 Max the unaligned fold was 1.7x to 5x faster from 128 bytes to 1 KiB, 1.01x
 /// at 256 KiB, and 0.97x to 0.99x at 1 MiB, where the aligned loads win.
 ///
+/// Off Apple the cutoff is 64 KiB. From an unaligned start at 64 KiB, against 1.11.0 in the same
+/// process (median of five processes of seven interleaved rounds, every generic algorithm), the
+/// unaligned fold's slowest algorithm ran 0.98x on Graviton4 and the split buffer 1.04x; on
+/// Graviton3 1.01x and 1.03x. On the M5 Max the unaligned fold stays ahead there, a geometric
+/// mean of 1.14x against 1.12x, so Apple keeps 256 KiB.
+///
 /// x86 has its own cutoff, [`X86_UNALIGNED_FOLD_END`].
-#[cfg(target_arch = "aarch64")]
-const UNALIGNED_FOLD_END: usize = 256 << 10;
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+pub(crate) const UNALIGNED_FOLD_END: usize = 256 << 10;
+/// See the Apple cutoff above.
+#[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+pub(crate) const UNALIGNED_FOLD_END: usize = 64 << 10;
 
 /// On x86, buffers from 128 bytes up to this many are folded by [`process_unaligned`], aligned
 /// or not. For a buffer that does not start on a 16-byte boundary, against a 4 KiB cutoff,
@@ -533,6 +542,30 @@ where
     }
 }
 
+/// The reflector for a 128-byte fold loop. On aarch64 the forward mask is read through a
+/// volatile load so that LLVM cannot see it is the byte reversal: seen as a constant, each
+/// block's `TBL` becomes `REV64` and `EXT`, two vector instructions where one does.
+#[inline(always)]
+unsafe fn bulk_reflector<T: ArchOps>(
+    reflector: &Reflector<T::Vector>,
+    ops: &T,
+) -> Reflector<T::Vector>
+where
+    T::Vector: Copy,
+{
+    #[cfg(target_arch = "aarch64")]
+    if let Reflector::ForwardReflector { smask } = reflector {
+        let mask = ops.extract_u64s(*smask);
+        let mask = core::ptr::read_volatile(&mask);
+        return Reflector::ForwardReflector {
+            smask: ops.load_aligned(&mask),
+        };
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    let _ = ops;
+    *reflector
+}
+
 /// [`process_unaligned`]'s 128-bit fold: eight 16-byte lanes over each whole 128-byte chunk of
 /// `data`, folded into one. Returns that and the bytes it covered.
 #[inline(always)]
@@ -549,6 +582,7 @@ where
     let ptr = data.as_ptr();
     let len = data.len();
     let reflected = state.reflected;
+    let reflector = &bulk_reflector(reflector, ops);
     // A macro and an array literal rather than a closure and `array::from_fn`: those are
     // functions of their own, which LLVM left out of line for some tiers and widths, without
     // the tier's target features and with the lanes passed back through memory.
@@ -568,15 +602,35 @@ where
         load!(96),
         load!(112),
     ];
-    let mut pos = 128;
-
     let coeff = W::create_coefficient(keys[4], keys[3], reflected, ops);
-    while len - pos >= 128 {
-        for (i, xi) in x.iter_mut().enumerate() {
-            *xi = fold_and_xor::<T, W>(*xi, coeff, load!(pos + 16 * i), reflected, ops);
+
+    // On aarch64 the loop runs a pointer to the end of the last chunk, one add and one compare
+    // per 128 bytes as in 1.11.0's aligned loop, rather than an offset and the bytes left.
+    #[cfg(target_arch = "aarch64")]
+    let pos = {
+        let pos = len / 128 * 128;
+        let end = ptr.add(pos);
+        let mut p = ptr.add(128);
+        while p != end {
+            for (i, xi) in x.iter_mut().enumerate() {
+                let block = reflect_bytes(reflector, ops.load_bytes(p.add(16 * i)), ops);
+                *xi = fold_and_xor::<T, W>(*xi, coeff, block, reflected, ops);
+            }
+            p = p.add(128);
         }
-        pos += 128;
-    }
+        pos
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    let pos = {
+        let mut pos = 128;
+        while len - pos >= 128 {
+            for (i, xi) in x.iter_mut().enumerate() {
+                *xi = fold_and_xor::<T, W>(*xi, coeff, load!(pos + 16 * i), reflected, ops);
+            }
+            pos += 128;
+        }
+        pos
+    };
 
     // Fold the eight lanes into the last, each across the distance from it to the end
     let fold_coefficients = [
@@ -690,6 +744,7 @@ unsafe fn process_simd_chunks<T: ArchOps, W: EnhancedCrcWidth>(
 {
     // Create a copy of the first 128 bytes
     let mut x = *first;
+    let reflector = &bulk_reflector(reflector, ops);
 
     // Apply initial reflection if needed
     for item in &mut x {

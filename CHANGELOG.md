@@ -253,11 +253,15 @@ own changelog up to the fork point continues below, unchanged.
   path and as the tests' reference.
 - `checksum` naming CRC-32/ISCSI or CRC-32/ISO-HDLC is that algorithm's
   entry point inlined, not a match over every algorithm.
-- The other algorithms fold a buffer from 128 bytes to 256 KiB from
-  wherever it starts and reduce it once, where crc-fast folds the bytes
-  before and after an aligned middle separately. That fold is kept out of
-  line, compiled once per bit order; buffers under 128 bytes run crc-fast's
-  code inlined in the tier's entry point.
+- The other algorithms fold a buffer from 128 bytes to 64 KiB (256 KiB on
+  Apple) from wherever it starts and reduce it once, where crc-fast folds
+  the bytes before and after an aligned middle separately. That fold is
+  kept out of line, compiled once per bit order; buffers under 128 bytes
+  run crc-fast's code inlined in the tier's entry point. The 128-byte fold
+  loops, this one and the aligned one, step a pointer to the end with one
+  add and one compare, and a forward (not reflected) algorithm reverses
+  each block's bytes with one `TBL`, where crc-fast's loop compiles to a
+  `REV64` and an `EXT`.
 
 ### Tier selection
 
@@ -911,6 +915,41 @@ own changelog up to the fork point continues below, unchanged.
   loops did not close them; they are not explained. On the M5 Max 4 KiB,
   8 KiB and 128 KiB ran 0.94x to 0.96x in both bit orders, also not
   explained.
+- The other algorithms' fold on aarch64 is back at or above 1.11.0 from
+  2 KiB. The forward algorithms' loop reversed each 16-byte block with a
+  `REV64` and an `EXT`, the compiler's rewrite of the `TBL` the source
+  asks for, once it saw the mask was the constant byte reversal: 55
+  instructions per 128 bytes, 48 of them vector, on Neoverse N1's two
+  vector pipes (one of which runs PMULL). 1.11.0 has the same 55 and ran
+  ahead only by the order the compiler gave them. The mask is now read
+  through a volatile load, so each block takes one `TBL`: 47 instructions
+  on the PMULL tier, 39 on the SHA3 tier. The fold for buffers under the
+  cutoff ran its loop on an offset and a byte count, 41 instructions to
+  the aligned loop's 39 (33 to 31 on SHA3), and now runs a pointer to the
+  end as the aligned loop does. Off Apple the cutoff from that fold to the
+  aligned one drops from 256 KiB to 64 KiB, where an unaligned start's
+  loads split cache lines on Graviton3 and Graviton4 (see the
+  `UNALIGNED_FOLD_END` notes); Apple keeps 256 KiB. Against 1.11.0 in the
+  same process, all 50 algorithms, median of seven processes of seven
+  interleaved rounds (five on Apple), checksums compared first, slowest algorithm and the
+  range of geometric means from 2 KiB to 1 MiB, aligned start (three bytes
+  off in brackets):
+
+  | CPU | slowest | geometric mean |
+  |---|---:|---:|
+  | Graviton2 c6g | 1.00x (1.01x) | 1.10x to 1.17x (1.10x to 1.54x) |
+  | Graviton3 c7g | 0.98x (1.00x) | 1.01x to 1.16x (1.02x to 2.31x) |
+  | Graviton4 c8g | 0.98x (1.00x) | 1.11x to 1.22x (1.11x to 2.67x) |
+  | Apple M5 Max | 0.99x (0.99x) | 1.12x to 1.16x (1.12x to 1.51x) |
+
+  Before the change the forward algorithms ran 0.97x to 0.98x on Graviton2
+  from 8 KiB, and 132 cells were under 0.99x there, 66 on Graviton4. Under
+  0.99x now: on Graviton3 five reflected algorithms at 256 KiB from an
+  aligned start (0.98x to 0.99x, where the code is unchanged and 1.11.0
+  against a copy of itself in the same process ran as low as 0.98x), and on
+  Graviton4 three cells at 32 KiB and 64 KiB (0.98x to 0.99x; that copy ran
+  as low as 0.95x there). From 16 bytes to 1 KiB the slowest algorithm
+  stays at 1.04x of 1.11.0 or above on every CPU here.
 
 - On x86, CRC-32/ISCSI's short buffers are checksummed inside the caller.
   The plan's direct limit is kept in a static the entry reads with one
