@@ -15,8 +15,16 @@
 
 mod iscsi;
 
-#[cfg(target_arch = "x86_64")]
-pub(crate) use iscsi::sse_pclmulqdq::crc32_iscsi_avx2_v4_aligned;
+#[cfg(all(target_arch = "x86_64", test))]
+use iscsi::sse_pclmulqdq::crc32_iscsi_avx2_v4_aligned;
+#[cfg(all(target_arch = "x86_64", miri))]
+pub(crate) use iscsi::sse_pclmulqdq::crc32_iscsi_avx2_v4_aligned as crc32_iscsi_ecore_window;
+#[cfg(all(target_arch = "x86_64", not(miri), test))]
+use iscsi::sse_pclmulqdq::crc32_iscsi_avx2_v4_asm;
+/// The E-core window's kernel: the assembly where it can be built, the intrinsics under Miri,
+/// which runs no inline assembly.
+#[cfg(all(target_arch = "x86_64", not(miri)))]
+pub(crate) use iscsi::sse_pclmulqdq::crc32_iscsi_avx2_v4_asm as crc32_iscsi_ecore_window;
 use iscsi::sse_pclmulqdq::crc32_iscsi_sse_v4x2s4x4;
 #[cfg(target_arch = "x86_64")]
 use iscsi::sse_pclmulqdq::{crc32_iscsi_avx2_s3, crc32_iscsi_avx2_v4, crc32_iscsi_avx2_v4x2s4x4};
@@ -108,11 +116,16 @@ const ECORE_DIRECT_MAX: usize = SSE_SMALL_BUFFER_MAX;
 /// to the vector-only kernel: on a Xeon 6731E the `v4` shape from a 16-byte boundary was ahead
 /// of the CRC32 instruction alone at 160 bytes, aligned or not, and level with it or behind at 128.
 #[cfg(target_arch = "x86_64")]
-const ECORE_V4_DIRECT_MAX: usize = 159;
+pub(crate) const ECORE_V4_DIRECT_MAX: usize = 159;
 /// The longest buffer the vector-only kernel takes there: on a Xeon 6731E it was ahead of the
 /// four-stream kernel at 640 bytes and behind it at 768.
 #[cfg(target_arch = "x86_64")]
-const ECORE_MID_MAX: usize = 703;
+pub(crate) const ECORE_MID_MAX: usize = 703;
+/// The shortest buffer the E-core window takes from a 16-byte aligned start, where the fold has
+/// no head to take first: on a Xeon 6731E fast-crc32's `v4` was ahead of the CRC32 instruction
+/// alone from 112 bytes aligned and behind it at 96.
+#[cfg(target_arch = "x86_64")]
+pub(crate) const ECORE_V4_ALIGNED_MIN: usize = 112;
 /// [`IscsiPlan::direct_max`] on AMD's family 0x17 (Zen, Zen+, Zen 2).
 const ZEN2_DIRECT_MAX: usize = 288;
 /// [`IscsiPlan::direct_max`] below AVX-512 everywhere else, and the longest any plan has.
@@ -321,6 +334,88 @@ pub(crate) struct IscsiPlan {
     /// Buffers this long or longer take the kernel again; `usize::MAX` where the folding path
     /// stays ahead.
     pub(crate) fold_end: usize,
+}
+
+impl IscsiPlan {
+    /// What the dispatch entry compares a length against before anything else: one more than
+    /// `direct_max`, or on the plans with the E-core window its shortest aligned length,
+    /// [`ECORE_V4_ALIGNED_MIN`], which no other plan has. A shorter buffer takes the CRC32
+    /// instruction alone with exactly the instructions it took before the window was added; a
+    /// longer one tests [`is_ecore_entry_end`] on the value already loaded, and a plan without the
+    /// window goes on to its kernel as before, past one compare of that register.
+    pub(crate) fn entry_end(&self) -> usize {
+        #[cfg(target_arch = "x86_64")]
+        if self.v4_end != 0 {
+            return ECORE_V4_ALIGNED_MIN;
+        }
+        self.direct_max + 1
+    }
+}
+
+// No plan without the window has its entry end
+#[cfg(target_arch = "x86_64")]
+const _: () = {
+    let ends = [
+        SMALL_BUFFER_MAX,
+        INTEL_DIRECT_MAX,
+        SSE_SMALL_BUFFER_MAX,
+        ECORE_DIRECT_MAX,
+        ZEN2_DIRECT_MAX,
+        ZEN3_DIRECT_MAX,
+        DIRECT_MAX,
+    ];
+    let mut i = 0;
+    while i < ends.len() {
+        assert!(ends[i] + 1 != ECORE_V4_ALIGNED_MIN);
+        i += 1;
+    }
+};
+
+/// Whether `end`, the dispatch entry's loaded [`IscsiPlan::entry_end`], is the E-core plan's.
+/// The entry tests it once a length is past it, on the register it compared the length with, and
+/// only then leaves for [`ecore_window`], out of line: a plan without the window adds that
+/// compare and a branch not taken ahead of the jump to its kernel, and reads nothing more.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub(crate) fn is_ecore_entry_end(end: usize) -> bool {
+    end == ECORE_V4_ALIGNED_MIN
+}
+
+/// The kernel the E-core window takes for a buffer, if any.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EcoreWindow {
+    /// Not the window's: the plan.
+    Plan,
+    /// Below the window from an unaligned start: the CRC32 instruction alone, as the plan's
+    /// direct limit would take it, without going through the plan.
+    Direct,
+    /// [`crc32_iscsi_ecore_window`], `v4`.
+    V4,
+}
+
+/// Which kernel the E-core window takes `len` bytes from address `start` with, `len` being past
+/// the plan's entry end: through [`ECORE_MID_MAX`], from [`ECORE_V4_ALIGNED_MIN`] when the start
+/// is 16-byte aligned, where the fold has no head, and past [`ECORE_V4_DIRECT_MAX`] from any start.
+/// The unaligned ones below that take the CRC32 instruction alone, the longer ones the plan.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub(crate) fn ecore_window(len: usize, start: usize) -> EcoreWindow {
+    // The window's test first and whole, so its call is the fall-through; split as three
+    // arms, LLVM put the jump to the plan ahead of it and every window call took a branch more
+    if len <= ECORE_MID_MAX && (len > ECORE_V4_DIRECT_MAX || start & 15 == 0) {
+        EcoreWindow::V4
+    } else if len > ECORE_MID_MAX {
+        EcoreWindow::Plan
+    } else {
+        EcoreWindow::Direct
+    }
+}
+
+/// The two tests together, as the dispatch entry makes them on a length past `end`.
+#[cfg(all(target_arch = "x86_64", test))]
+fn ecore_window_takes(end: usize, len: usize, start: usize) -> Option<EcoreWindow> {
+    is_ecore_entry_end(end).then(|| ecore_window(len, start))
 }
 
 /// The plan for `kernel` on `tier` and `cpu`.
@@ -1330,6 +1425,50 @@ mod tests {
                 v4_end,
                 "{id:?} {kernel:?}"
             );
+            // The entry's one loaded value, and the split it makes past it with the length and
+            // the start: the window on the E-cores, from 112 bytes aligned and 160 from any start
+            // through 703, the unaligned ones below 160 to the CRC32 instruction, never on any
+            // other plan, at any length past the value or any start
+            let plan = iscsi_plan(kernel, tier, id);
+            let end = plan.entry_end();
+            if v4_end != 0 {
+                assert_eq!(end, ECORE_V4_ALIGNED_MIN, "{id:?} {kernel:?}");
+                use EcoreWindow::*;
+                for (len, start, takes) in [
+                    (112, 0x1000, V4),
+                    (112, 0x1008, Direct),
+                    (127, 0x1000, V4),
+                    (128, 0x1010, V4),
+                    (143, 0x1000, V4),
+                    (143, 0x1001, Direct),
+                    (144, 0x1000, V4),
+                    (159, 0x1001, Direct),
+                    (159, 0x1000, V4),
+                    (160, 0x1001, V4),
+                    (703, 0x100f, V4),
+                    (703, 0x1000, V4),
+                    (704, 0x1000, Plan),
+                    (4096, 0x1000, Plan),
+                    (usize::MAX, 0x1000, Plan),
+                ] {
+                    assert_eq!(
+                        ecore_window_takes(end, len, start),
+                        Some(takes),
+                        "{id:?} {kernel:?} len {len} start {start:#x}"
+                    );
+                }
+            } else {
+                assert_eq!(end, plan.direct_max + 1, "{id:?} {kernel:?}");
+                for len in end..end + 2048 {
+                    for start in [0x1000, 0x1001, 0x1008, 0x100f] {
+                        assert_eq!(
+                            ecore_window_takes(end, len, start),
+                            None,
+                            "{id:?} {kernel:?} len {len} start {start:#x}"
+                        );
+                    }
+                }
+            }
             // The E-cores' window is the dispatch entry's, and their plan's kernel the default
             if v4_end != 0 {
                 assert_eq!(
@@ -1584,6 +1723,17 @@ mod tests {
                             actual, expected,
                             "v4 aligned offset {offset} len {len} state {state:#x}"
                         );
+
+                        // Forced: the assembly runs here on any CPU with the features, not only
+                        // on the E-cores whose plan takes it
+                        #[cfg(not(miri))]
+                        {
+                            let actual = unsafe { crc32_iscsi_avx2_v4_asm(crc, ptr, len) } as u64;
+                            assert_eq!(
+                                actual, expected,
+                                "v4 asm offset {offset} len {len} state {state:#x}"
+                            );
+                        }
                     }
 
                     let actual = unsafe { crc32_iscsi_avx2_s3(crc, ptr, len) } as u64;
