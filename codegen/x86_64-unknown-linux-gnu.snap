@@ -4,3 +4,26 @@
 # and their count, `glue` the instructions the compiler generated around it,
 # `calls` how many of those are calls. Rewrite the numbers with
 # `cargo xtask codegen bless --target x86_64-unknown-linux-gnu`.
+# `body=compiler` marks a function whose assembly covers only part of it: the
+# rest is intrinsics, exact on the pinned build and not bounded elsewhere.
+crc_turbo::crc32::fusion::x86::iscsi::avx512_vpclmulqdq::crc32_iscsi_avx512_vpclmulqdq_v3x2 asm=15a9874e82553ff4/30 glue=77 calls=0 body=compiler
+crc_turbo::arch::x86::short_asm::short_sse_r16 asm=dce057e8a8a243d1/456 glue=41 calls=0
+crc_turbo::arch::x86::short_asm::short_sse_r32 asm=dce057e8a8a243d1/456 glue=38 calls=0
+crc_turbo::arch::x86::short_asm::short_sse_r64 asm=dce057e8a8a243d1/456 glue=18 calls=0
+crc_turbo::arch::x86::short_asm::short_sse_f16 asm=55829eedd40799d4/515 glue=41 calls=0
+crc_turbo::arch::x86::short_asm::short_sse_f32 asm=55829eedd40799d4/515 glue=41 calls=0
+crc_turbo::arch::x86::short_asm::short_sse_f64 asm=55829eedd40799d4/515 glue=20 calls=0
+crc_turbo::arch::x86::short_asm::short128_avx_r16 asm=87f33530c3c5036d/134 glue=31 calls=0
+crc_turbo::arch::x86::short_asm::short128_avx_r32 asm=87f33530c3c5036d/134 glue=29 calls=0
+crc_turbo::arch::x86::short_asm::short128_avx_r64 asm=87f33530c3c5036d/134 glue=17 calls=0
+crc_turbo::arch::x86::short_asm::short128_avx_f16 asm=c0c0639b114bdd36/164 glue=36 calls=0
+crc_turbo::arch::x86::short_asm::short128_avx_f32 asm=c0c0639b114bdd36/164 glue=36 calls=0
+crc_turbo::arch::x86::short_asm::short128_avx_f64 asm=c0c0639b114bdd36/164 glue=18 calls=0
+crc_turbo::arch::x86::short_asm::iso_hdlc_short_sse asm=dce057e8a8a243d1/456 glue=18 calls=0
+crc_turbo::arch::x86::short_asm::iso_hdlc_short_avx asm=1c900475ea877c3f/326 glue=18 calls=0
+crc_turbo::arch::x86::short_asm::iso_hdlc_short128_avx asm=87f33530c3c5036d/134 glue=18 calls=0
+crc_turbo::arch::x86::short_asm::iso_hdlc_checksum_sse asm=dce057e8a8a243d1/456 glue=89 calls=0
+crc_turbo::arch::x86::short_asm::iso_hdlc_checksum_avx asm=1c900475ea877c3f/326 glue=93 calls=0
+crc_turbo::arch::x86::short_asm::iso_hdlc_checksum_avx2_vpclmulqdq asm=87f33530c3c5036d/134 glue=93 calls=0
+crc_turbo::arch::x86::short_asm::iso_hdlc_checksum_avx512_pclmulqdq asm=87f33530c3c5036d/134 glue=96 calls=0
+crc_turbo::arch::x86::short_asm::iso_hdlc_checksum_avx512_vpclmulqdq asm=87f33530c3c5036d/134 glue=96 calls=0

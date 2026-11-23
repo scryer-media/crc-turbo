@@ -342,6 +342,16 @@ fn mnemonic(line: &str) -> Option<&str> {
     (first.is_ascii_alphabetic() && !word.ends_with(':')).then_some(word)
 }
 
+/// Whether the snapshot marks `path` with `body=compiler`: a function whose
+/// assembly covers only part of it, the rest being intrinsics whose compiled
+/// size is not bounded off the pinned build.
+fn compiler_body(snap_text: &str, path: &str) -> bool {
+    snap_text.lines().any(|line| {
+        let mut words = line.split_whitespace();
+        words.next() == Some(path) && words.any(|word| word == "body=compiler")
+    })
+}
+
 fn check(snap_text: &str, found: &BTreeMap<String, Vec<Shape>>, exact: bool) -> ExitCode {
     let mut failures = Vec::new();
     for (path, want) in parse_snapshot(snap_text) {
@@ -377,6 +387,20 @@ fn check(snap_text: &str, found: &BTreeMap<String, Vec<Shape>>, exact: bool) -> 
                         want.glue, want.calls, got.glue, got.calls
                     ));
                 }
+            } else if compiler_body(snap_text, &path) {
+                // The function's body is still intrinsics, so its size off
+                // the pinned build is the compiler's to choose: report it,
+                // and hold only the assembly and the absence of new calls.
+                println!(
+                    "note: {path}: compiler-built body, glue={} pinned, glue={} built",
+                    want.glue, got.glue
+                );
+                if got.calls > want.calls {
+                    failures.push(format!(
+                        "{path}: this compiler or profile added a call: calls={} pinned, calls={} built",
+                        want.calls, got.calls
+                    ));
+                }
             } else if got.glue > glue_limit(want.glue) || got.calls > want.calls {
                 failures.push(format!(
                     "{path}: this compiler or profile grew it: glue={} calls={} pinned, glue={} calls={} built",
@@ -407,7 +431,12 @@ fn bless(snap_path: &Path, snap_text: &str, found: &BTreeMap<String, Vec<Shape>>
         } else {
             let path = trimmed.split_whitespace().next().unwrap_or_default();
             match found.get(path).map(Vec::as_slice) {
-                Some([shape]) => out.push_str(&shape.line(path)),
+                Some([shape]) => {
+                    out.push_str(&shape.line(path));
+                    if compiler_body(snap_text, path) {
+                        out.push_str(" body=compiler");
+                    }
+                }
                 Some(shapes) => {
                     eprintln!(
                         "xtask codegen: {path}: {} functions match, expected one",
