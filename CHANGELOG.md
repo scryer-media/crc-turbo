@@ -188,6 +188,12 @@ own changelog up to the fork point continues below, unchanged.
   1.11.0, ran feature detection on every checksum call: up to four atomic
   loads before the first byte.
 
+- AVX-512 tiers: the two 512-bit registers a fold ends with are reduced to
+  128 bits in one step with per-lane generated keys; buffers of 128 bytes to
+  4 KiB have an entry of their own; folds from 64 KiB start at a 64-byte
+  boundary; and CRC-32/ISCSI has a kernel of four 512-bit folding streams
+  beside five CRC32-instruction streams, selected by CPU model and length.
+
 - Every architecture: 32 to 255 bytes, the generic fold no longer runs its
   16-byte blocks as one chain of dependent multiplies. Each of the last
   seven blocks is folded straight onto the last with the generated key for
@@ -591,6 +597,46 @@ own changelog up to the fork point continues below, unchanged.
   fast-crc32's AVX-512 kernel (0.76x to 0.93x); CRC-32/ISCSI from 16 to 48
   bytes on the 7R13 and the 8375C (0.81x to 0.88x) and at 1 MiB on the
   8375C (0.81x).
+- The AVX-512 tiers are faster again for short and middling buffers, and
+  for CRC-32/ISCSI on the CPUs where the stream kernel lost to the fold.
+  The methods are those of the Linux kernel's x86 CRC template (Eric
+  Biggers): the two 512-bit registers left by the main loop are reduced to
+  128 bits in one step, each 128-bit lane multiplied by the generated key
+  for its distance from the last, the keys read as memory operands; no
+  kernel code is taken.
+  - CRC-32/ISO-HDLC from 128 bytes to 4 KiB is folded from where it starts
+    by a function of its own, apart from the short arms and from the long
+    fold's set-up; from 128 bytes the `x86_64-avx512-vpclmulqdq` tier takes
+    the first 128 bytes as two 512-bit registers.
+  - From 64 KiB the folds first run to a 64-byte boundary. On a Xeon 8488C
+    a buffer whose 64-byte loads split cache lines ran at 0.80x to 0.85x of
+    an aligned one.
+  - CRC-32/ISCSI on the `x86_64-avx512-vpclmulqdq` tier takes the 512-bit
+    fold from 4 KiB up to 8 KiB (16 KiB on Ice Lake server parts), and on
+    Ice Lake and AMD family 0x19 a new kernel from 16 KiB and 64 KiB: four
+    512-bit folding streams beside five CRC32-instruction streams, the
+    streams shifted together with multipliers built at compile time. On
+    Sapphire Rapids that kernel ran at 0.77x of the existing one, so it is
+    not selected there.
+  - CRC-32/ISCSI on the `x86_64-avx512-pclmulqdq` tier (Skylake-X, Cascade
+    Lake) uses the AVX2 `v4x2s4x4` kernel below 32 KiB.
+
+  Against this branch's previous commit, GB/s, median of seven interleaved
+  rounds on EC2 `.large` instances, checksums compared first: CRC-32/ISCSI
+  on a Xeon 8275CL 1.11x to 1.92x from 512 bytes to 16 KiB; CRC-32/ISO-HDLC
+  on a Xeon 8488C 1.25x to 1.38x from 256 bytes to 2 KiB, and 1.25x and
+  1.22x at 64 KiB and 1 MiB from an unaligned start; on an EPYC 9R14 1.30x
+  to 1.33x at 128, 256 and 512 bytes. The tiers that did not change, on a Xeon
+  E5-2666 v3, an EPYC 7R32 and an EPYC 7R13, were 0.99x to 1.02x from
+  512 bytes to 1 MiB. Below 0.97x: CRC-32/ISCSI from 32 to 128 bytes on the
+  E5-2666 v3 and the 8275CL (0.91x to 0.96x, with that path's source
+  unchanged), and CRC-32/ISO-HDLC on the 8275CL at 16 bytes (0.80x) and
+  128 bytes (0.90x); neither is explained. Against 1.11.0 every size from
+  16 bytes to 1 MiB on those six CPUs was 0.99x or better. An Ice Lake
+  server part (Xeon 8375C) measured the changes up to the stream kernel's
+  thresholds; the last revision of the 128-byte entry and the 64-byte
+  alignment were not measured there.
+
 - WebAssembly is faster for 43 of the 50 built-in algorithms. Every table
   load there is bounds-checked, so for a long input the software path now
   reduces the message by a sparse multiple of the generator first, in the

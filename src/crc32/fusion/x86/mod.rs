@@ -30,6 +30,8 @@ use core::arch::x86_64::*;
 use iscsi::avx512_pclmulqdq::crc32_iscsi_avx512_v4s3x3;
 #[cfg(target_arch = "x86_64")]
 use iscsi::avx512_vpclmulqdq::crc32_iscsi_avx512_vpclmulqdq_v3x2;
+#[cfg(target_arch = "x86_64")]
+use iscsi::avx512_vpclmulqdq_streams::crc32_iscsi_avx512_vpclmulqdq_v4s5x3;
 
 use crate::feature_detection::PerformanceTier;
 
@@ -38,6 +40,31 @@ use crate::feature_detection::PerformanceTier;
 /// more than it saves.
 #[cfg(target_arch = "x86_64")]
 const SMALL_BUFFER_MAX: usize = 256;
+
+/// Where the AVX-512 VPCLMULQDQ tier's kernel starts running CRC32 instruction streams beside
+/// its fold lanes on Ice Lake servers: below it the streams' partial CRCs cost more to multiply
+/// back together than the streams save. The folding path runs up to here.
+#[cfg(target_arch = "x86_64")]
+const ICE_LAKE_STREAMS_MIN: usize = 16 << 10;
+
+/// The same on Zen 4, where the streams ran at 0.93x the fold lanes' speed at 16 KiB and, from
+/// an unaligned start, 0.98x at 32 KiB.
+#[cfg(target_arch = "x86_64")]
+const ZEN4_STREAMS_MIN: usize = 64 << 10;
+
+/// [`IscsiPlan::fold_end`] on the AVX-512 VPCLMULQDQ tier away from Ice Lake.
+#[cfg(target_arch = "x86_64")]
+const AVX512_FOLD_END: usize = 8192;
+
+/// [`IscsiPlan::fold_min`] on the AVX-512 VPCLMULQDQ tier where it was measured.
+#[cfg(target_arch = "x86_64")]
+const AVX512_FOLD_MIN: usize = 4096;
+
+/// Buffers shorter than this take the four-stream kernel's AVX2 build on the AVX-512 PCLMULQDQ
+/// tier; from here up the tier's own kernel, whose three streams and four 128-bit fold lanes
+/// need a long buffer to pay for their set-up.
+#[cfg(target_arch = "x86_64")]
+const AVX512_PCLMULQDQ_MIN: usize = 32 << 10;
 
 /// The SSE and AVX2 entry points take buffers up to this length with the CRC32 instruction alone.
 /// It is the lowest of the per-CPU limits in [`IscsiPlan::direct_max`], so the direct call has
@@ -131,7 +158,7 @@ pub(crate) fn iscsi_kernel_fn(kernel: IscsiKernel) -> unsafe fn(u32, &[u8]) -> u
         #[cfg(target_arch = "x86_64")]
         IscsiKernel::Avx512Pclmulqdq => crc32_iscsi_avx512_pclmulqdq,
         #[cfg(target_arch = "x86_64")]
-        IscsiKernel::Avx512Vpclmulqdq => crc32_iscsi_avx512_vpclmulqdq,
+        IscsiKernel::Avx512Vpclmulqdq => crc32_iscsi_avx512_vpclmulqdq::<{ usize::MAX }>,
     }
 }
 
@@ -188,6 +215,24 @@ impl CpuId {
             && matches!(self.model, 0xbe | 0xaf | 0xb6 | 0xdd)
     }
 
+    /// Any Intel family 6 part.
+    #[cfg(target_arch = "x86_64")]
+    fn is_intel_family_6(&self) -> bool {
+        &self.vendor == b"GenuineIntel" && self.family == 6
+    }
+
+    /// Ice Lake servers, models 0x6a and 0x6c.
+    #[cfg(target_arch = "x86_64")]
+    fn is_ice_lake_server(&self) -> bool {
+        self.is_intel_family_6() && matches!(self.model, 0x6a | 0x6c)
+    }
+
+    /// AMD's family 0x19, whose AVX-512 parts are Zen 4.
+    #[cfg(target_arch = "x86_64")]
+    fn is_amd_family_19(&self) -> bool {
+        self.is_amd() && self.family == 0x19
+    }
+
     /// Alder Lake's hybrid parts, models 0x97 (desktop) and 0x9a (mobile): Golden Cove P-cores
     /// beside Gracemont E-cores.
     #[cfg(target_arch = "x86_64")]
@@ -208,20 +253,47 @@ pub(crate) struct IscsiPlan {
     /// Buffers this long or longer take the folding path instead of the kernel; `usize::MAX`
     /// where the kernel is faster at every length.
     pub(crate) fold_min: usize,
+    /// Buffers this long or longer take the kernel again; `usize::MAX` where the folding path
+    /// stays ahead.
+    pub(crate) fold_end: usize,
 }
 
 /// The plan for `kernel` on `tier` and `cpu`.
 pub(crate) fn iscsi_plan(kernel: IscsiKernel, tier: PerformanceTier, cpu: CpuId) -> IscsiPlan {
     let (direct_max, fold_min) = iscsi_limits(kernel, tier, cpu);
+    let fold_end = iscsi_fold_end(kernel, tier, cpu);
     let kernel = match (kernel, iscsi_far_min(kernel, cpu)) {
         #[cfg(target_arch = "x86_64")]
         (IscsiKernel::Avx2, ALDER_LAKE_FAR_MIN) => crc32_iscsi_avx2::<ALDER_LAKE_FAR_MIN>,
+        #[cfg(target_arch = "x86_64")]
+        (IscsiKernel::Avx512Vpclmulqdq, _) if cpu.is_ice_lake_server() => {
+            crc32_iscsi_avx512_vpclmulqdq::<ICE_LAKE_STREAMS_MIN>
+        }
+        #[cfg(target_arch = "x86_64")]
+        (IscsiKernel::Avx512Vpclmulqdq, _) if cpu.is_amd_family_19() => {
+            crc32_iscsi_avx512_vpclmulqdq::<ZEN4_STREAMS_MIN>
+        }
         _ => iscsi_kernel_fn(kernel),
     };
     IscsiPlan {
         kernel,
         direct_max,
         fold_min,
+        fold_end,
+    }
+}
+
+/// [`IscsiPlan::fold_end`] for `kernel` on `tier` and `cpu`: the AVX-512 VPCLMULQDQ tier folds
+/// a window of lengths, see [`iscsi_limits`]; Zen 3 on the AVX2 tier folds to any length.
+fn iscsi_fold_end(kernel: IscsiKernel, tier: PerformanceTier, cpu: CpuId) -> usize {
+    match kernel {
+        #[cfg(target_arch = "x86_64")]
+        IscsiKernel::Avx512Vpclmulqdq if cpu.is_ice_lake_server() => ICE_LAKE_STREAMS_MIN,
+        #[cfg(target_arch = "x86_64")]
+        IscsiKernel::Avx512Vpclmulqdq if iscsi_limits(kernel, tier, cpu).1 != usize::MAX => {
+            AVX512_FOLD_END
+        }
+        _ => usize::MAX,
     }
 }
 
@@ -274,9 +346,17 @@ fn iscsi_far_min(kernel: IscsiKernel, cpu: CpuId) -> usize {
 fn iscsi_limits(kernel: IscsiKernel, tier: PerformanceTier, cpu: CpuId) -> (usize, usize) {
     match kernel {
         #[cfg(target_arch = "x86_64")]
-        IscsiKernel::Avx512Pclmulqdq | IscsiKernel::Avx512Vpclmulqdq => {
-            (SMALL_BUFFER_MAX, usize::MAX)
+        IscsiKernel::Avx512Vpclmulqdq => {
+            let fold_min = if cpu.is_intel_family_6() || cpu.is_amd_family_19() {
+                AVX512_FOLD_MIN
+            } else {
+                usize::MAX
+            };
+            (SMALL_BUFFER_MAX, fold_min)
         }
+        // AVX-512 without VPCLMULQDQ is Skylake-X, Cascade Lake and Cooper Lake, one core.
+        #[cfg(target_arch = "x86_64")]
+        IscsiKernel::Avx512Pclmulqdq => (DIRECT_MAX, usize::MAX),
         _ => {
             let direct_max = if cpu.is_intel_ecore() {
                 ECORE_DIRECT_MAX
@@ -335,16 +415,21 @@ pub(crate) unsafe fn crc32_iscsi_avx2<const FAR_MIN: usize>(crc: u32, data: &[u8
     crc32_iscsi_avx2_v4x2s4x4(crc, data.as_ptr(), data.len())
 }
 
-/// CRC-32/ISCSI through the AVX-512 PCLMULQDQ kernel, for the `x86_64-avx512-pclmulqdq` tier.
+/// CRC-32/ISCSI for the `x86_64-avx512-pclmulqdq` tier: the four-stream kernel's AVX2 build below
+/// `AVX512_PCLMULQDQ_MIN`, the AVX-512 PCLMULQDQ kernel from there up.
 ///
 /// # Safety
 ///
-/// The CPU must have AVX512VL and PCLMULQDQ.
+/// The CPU must have AVX512VL, which no CPU has without AVX2, SSE4.2 and PCLMULQDQ.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512vl,pclmulqdq")]
+#[target_feature(enable = "avx512vl,avx2,sse4.2,pclmulqdq")]
 pub(crate) unsafe fn crc32_iscsi_avx512_pclmulqdq(crc: u32, data: &[u8]) -> u32 {
     if data.len() <= SMALL_BUFFER_MAX {
         return crc32_iscsi_small_fast(crc, data);
+    }
+
+    if data.len() < AVX512_PCLMULQDQ_MIN {
+        return crc32_iscsi_avx2_v4x2s4x4(crc, data.as_ptr(), data.len());
     }
 
     crc32_iscsi_avx512_v4s3x3(crc, data.as_ptr(), data.len())
@@ -357,9 +442,16 @@ pub(crate) unsafe fn crc32_iscsi_avx512_pclmulqdq(crc: u32, data: &[u8]) -> u32 
 /// The CPU must have AVX512VL and VPCLMULQDQ.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512vl,vpclmulqdq")]
-pub(crate) unsafe fn crc32_iscsi_avx512_vpclmulqdq(crc: u32, data: &[u8]) -> u32 {
+pub(crate) unsafe fn crc32_iscsi_avx512_vpclmulqdq<const STREAMS_MIN: usize>(
+    crc: u32,
+    data: &[u8],
+) -> u32 {
     if data.len() <= SMALL_BUFFER_MAX {
         return crc32_iscsi_small_fast(crc, data);
+    }
+
+    if data.len() >= STREAMS_MIN {
+        return crc32_iscsi_avx512_vpclmulqdq_v4s5x3(crc, data.as_ptr(), data.len());
     }
 
     crc32_iscsi_avx512_vpclmulqdq_v3x2(crc, data.as_ptr(), data.len())
@@ -737,19 +829,33 @@ mod tests {
             );
 
             #[cfg(target_arch = "x86_64")]
-            for (kernel, tier) in [
+            for (kernel, tier, direct_max) in [
                 (
                     IscsiKernel::Avx512Pclmulqdq,
                     PerformanceTier::X86_64Avx512Pclmulqdq,
+                    DIRECT_MAX,
                 ),
                 (
                     IscsiKernel::Avx512Vpclmulqdq,
                     PerformanceTier::X86_64Avx512Vpclmulqdq,
+                    SMALL_BUFFER_MAX,
                 ),
             ] {
+                let folds = kernel == IscsiKernel::Avx512Vpclmulqdq
+                    && (id.is_intel_family_6() || id.is_amd_family_19());
+                let fold_end = if id.is_ice_lake_server() {
+                    ICE_LAKE_STREAMS_MIN
+                } else {
+                    AVX512_FOLD_END
+                };
                 assert_eq!(
                     iscsi_limits(kernel, tier, id),
-                    (SMALL_BUFFER_MAX, NONE),
+                    (direct_max, if folds { AVX512_FOLD_MIN } else { NONE }),
+                    "{id:?} {kernel:?}"
+                );
+                assert_eq!(
+                    iscsi_fold_end(kernel, tier, id),
+                    if folds { fold_end } else { NONE },
                     "{id:?} {kernel:?}"
                 );
             }

@@ -70,6 +70,11 @@ pub unsafe fn update<T: ArchOps, W: EnhancedCrcWidth>(
 where
     T::Vector: Copy,
 {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    let mut bytes = bytes;
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    let mut len = bytes.len();
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
     let len = bytes.len();
     if len == 0 {
         return state;
@@ -104,6 +109,26 @@ where
     #[cfg(target_arch = "aarch64")]
     if len < UNALIGNED_FOLD_END {
         return process_unaligned::<T, W>(bytes, &crc_state, &reflector, keys, ops);
+    }
+
+    // On x86 a long buffer is taken from a 64-byte boundary, see `X86_ALIGN_MIN`.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if len >= X86_ALIGN_MIN {
+        let head = bytes.as_ptr().align_offset(64);
+        if head != 0 {
+            let (left, rest) = bytes.split_at(head);
+            let left_crc = process_by_strategy::<T, W>(
+                DataChunkProcessor::for_length(head),
+                left,
+                &mut crc_state,
+                reflector,
+                keys,
+                ops,
+            );
+            crc_state = W::create_state(left_crc, params.refin, ops);
+            bytes = rest;
+            len = rest.len();
+        }
     }
 
     // On x86, below `X86_UNALIGNED_FOLD_END`, whatever the alignment.
@@ -158,6 +183,149 @@ where
     )
 }
 
+/// [`update`] for a buffer of 128 bytes or more that [`process_unaligned`] is to fold whole,
+/// with nothing else in the function: a tier keeps it apart from its entry, whose short arms
+/// then stay in line, and from the fold for long buffers, whose set-up it does not pay.
+///
+/// # Safety
+///
+/// `bytes` must be at least 128 bytes long.
+#[inline(always)]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+pub(crate) unsafe fn update_mid<T: ArchOps, W: EnhancedCrcWidth>(
+    state: W::Value,
+    bytes: &[u8],
+    params: &CrcParams,
+    ops: &T,
+) -> W::Value
+where
+    T::Vector: Copy,
+{
+    debug_assert!(bytes.len() >= 128);
+    let reflector = if params.refin {
+        Reflector::NoReflector
+    } else {
+        let smask = ops.load_aligned(&W::load_constants(params.refin)[0] as *const [u64; 2]);
+        Reflector::ForwardReflector { smask }
+    };
+    let crc_state = W::create_state(state, params.refin, ops);
+    let keys = extract_keys_array(params);
+
+    process_unaligned::<T, W>(bytes, &crc_state, &reflector, keys, ops)
+}
+
+/// [`update_short`] laid out for the fewest taken branches: 32 bytes and up are looked at
+/// first and their block count is picked by three bit tests, each arm folding, reducing and
+/// returning on its own, where [`update_short`] compares its way past the shorter lengths, jumps
+/// through a table on the block count and jumps again to a shared reduction. The Linux
+/// kernel's CRC routines keep their short paths free of taken branches the same way, the
+/// arm64 one with conditional selects.
+///
+/// # Safety
+///
+/// `bytes` must be shorter than 128 bytes.
+#[inline(always)]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+pub(crate) unsafe fn update_short_ladder<T: ArchOps, W: EnhancedCrcWidth>(
+    state: W::Value,
+    bytes: &[u8],
+    params: &CrcParams,
+    ops: &T,
+) -> W::Value
+where
+    T::Vector: Copy,
+{
+    let len = bytes.len();
+    debug_assert!(len < 128);
+
+    let reflector = if params.refin {
+        Reflector::NoReflector
+    } else {
+        let smask = ops.load_aligned(&W::load_constants(params.refin)[0] as *const [u64; 2]);
+        Reflector::ForwardReflector { smask }
+    };
+    let mut crc_state = W::create_state(state, params.refin, ops);
+    let keys = extract_keys_array(params);
+
+    // The shortest buffers first, so that they fall through to their fold.
+    if len < 2 * CRC_CHUNK_SIZE {
+        if len == 0 {
+            return state;
+        }
+        return process_by_strategy::<T, W>(
+            DataChunkProcessor::for_length(len),
+            bytes,
+            &mut crc_state,
+            reflector,
+            keys,
+            ops,
+        );
+    }
+
+    // One block count, folded, reduced and returned.
+    macro_rules! arm {
+        ($blocks:literal) => {{
+            let wide = if $blocks >= 4 {
+                ops.fold_short_wide(
+                    crc_state.value,
+                    bytes.as_ptr(),
+                    $blocks,
+                    true,
+                    keys,
+                    crc_state.reflected,
+                )
+            } else {
+                None
+            };
+            let mut folded = match wide {
+                Some(folded) => folded,
+                None => fold_blocks_onto_last::<T, W>(
+                    $blocks,
+                    bytes.as_ptr(),
+                    &crc_state,
+                    &reflector,
+                    keys,
+                    ops,
+                ),
+            };
+            let remaining = len - $blocks * CRC_CHUNK_SIZE;
+            if remaining > 0 {
+                folded = get_last_two_xmms::<T, W>(
+                    DataRegion {
+                        full_data: bytes,
+                        offset: $blocks * CRC_CHUNK_SIZE,
+                        remaining,
+                    },
+                    folded,
+                    keys,
+                    &reflector,
+                    crc_state.reflected,
+                    ops,
+                );
+            }
+            return W::perform_final_reduction(folded, crc_state.reflected, keys, ops);
+        }};
+    }
+    // Bit tests rather than a match on the count, which compiles to a jump table.
+    if len & 64 == 0 {
+        if len & 16 == 0 {
+            arm!(2)
+        } else {
+            arm!(3)
+        }
+    } else if len & 32 == 0 {
+        if len & 16 == 0 {
+            arm!(4)
+        } else {
+            arm!(5)
+        }
+    } else if len & 16 == 0 {
+        arm!(6)
+    } else {
+        arm!(7)
+    }
+}
+
 /// Buffers from 128 bytes up to this many are folded by [`process_unaligned`]. Longer ones are
 /// split at a 128-byte boundary: the bytes before it and after the last whole block are each
 /// folded and reduced on their own, up to two reductions more than the unaligned fold makes.
@@ -177,6 +345,14 @@ const UNALIGNED_FOLD_END: usize = 256 << 10;
 /// EPYC 7R13 folding it whole was 1.39x faster at 320 bytes and the same from 1 KiB.
 #[cfg(not(target_arch = "aarch64"))]
 const X86_UNALIGNED_FOLD_END: usize = 1 << 20;
+
+/// On x86, a buffer this long or longer that does not start on a 64-byte boundary has the bytes
+/// before the boundary folded and reduced on their own first, one reduction more, so that no
+/// 64-byte load of the fold crosses a cache line. On a Xeon Platinum 8488C a buffer three bytes
+/// off a boundary ran at 0.85x the speed of an aligned one at 64 KiB and 0.80x at 1 MiB; at
+/// 32 KiB and below it was no slower, and the reduction is a larger share of a shorter buffer.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+const X86_ALIGN_MIN: usize = 64 << 10;
 
 /// Folds a buffer of 128 bytes or more from wherever it starts: eight 16-byte lanes over each
 /// 128-byte chunk, those eight folded into one, then the remaining 16-byte blocks and an
@@ -665,6 +841,69 @@ where
     W::perform_final_reduction(final_xmm7, state.reflected, keys, ops)
 }
 
+/// Folds `blocks` whole 16-byte blocks at `data`, two or more, into one vector.
+///
+/// The last seven whole blocks but the last are each folded straight onto the last, across
+/// the distance between them, rather than each into the next: the products are independent,
+/// so the chain is one carry-less multiply and the XORs, where folding block by block was one
+/// multiply per block, the multiply's latency each time. The Linux kernel's x86 CRC template
+/// breaks the chain the same way for short buffers, by folding several vectors and halving
+/// them. The keys are the generated ones the 128-byte fold collapses its lanes with, which
+/// reach 112 bytes; blocks before those seven, from the remainders of longer buffers on x86,
+/// are folded one by one into the first of them.
+///
+/// # Safety
+///
+/// `data` must be readable for `blocks * 16` bytes, and `blocks` at least 2.
+#[inline(always)]
+unsafe fn fold_blocks_onto_last<T: ArchOps, W: EnhancedCrcWidth>(
+    blocks: usize,
+    data: *const u8,
+    state: &CrcState<T::Vector>,
+    reflector: &Reflector<T::Vector>,
+    keys: &[u64; 23],
+    ops: &T,
+) -> T::Vector
+where
+    T::Vector: Copy,
+{
+    const DISTANCE_KEYS: [(usize, usize); 6] =
+        [(2, 1), (20, 19), (18, 17), (16, 15), (14, 13), (12, 11)];
+
+    // Macros rather than closures: a closure is a function of its own, which LLVM may leave out
+    // of line, where the tier's target features do not reach.
+    macro_rules! load {
+        ($i:expr) => {
+            reflect_bytes(
+                reflector,
+                ops.load_bytes(data.add($i * CRC_CHUNK_SIZE)),
+                ops,
+            )
+        };
+    }
+    macro_rules! fold_onto_last {
+        ($block:expr, $i:expr, $acc:expr) => {{
+            let (hi, lo) = DISTANCE_KEYS[blocks - 2 - $i];
+            let coeff = W::create_coefficient(keys[hi], keys[lo], state.reflected, ops);
+            fold_and_xor::<T, W>($block, coeff, $acc, state.reflected, ops)
+        }};
+    }
+
+    let first = blocks.saturating_sub(DISTANCE_KEYS.len() + 1);
+    let mut head = ops.xor_vectors(load!(0), state.value);
+    if first > 0 {
+        let rk01rk02 = W::create_coefficient(keys[2], keys[1], state.reflected, ops);
+        for i in 1..=first {
+            head = fold_and_xor::<T, W>(head, rk01rk02, load!(i), state.reflected, ops);
+        }
+    }
+    let mut acc = fold_onto_last!(head, first, load!(blocks - 1));
+    for i in first + 1..blocks - 1 {
+        acc = fold_onto_last!(load!(i), i, acc);
+    }
+    acc
+}
+
 // Process inputs between 32 and 255 bytes
 /// This implementation works for both CRC-32 and CRC-64 using the width-specific traits
 #[inline(always)]
@@ -678,61 +917,17 @@ unsafe fn process_32_to_255<T: ArchOps, W: EnhancedCrcWidth>(
 where
     T::Vector: Copy,
 {
-    // The last seven whole blocks but the last are each folded straight onto the last, across
-    // the distance between them, rather than each into the next: the products are independent,
-    // so the chain is one carry-less multiply and the XORs, where folding block by block was one
-    // multiply per block, the multiply's latency each time. The Linux kernel's x86 CRC template
-    // breaks the chain the same way for short buffers, by folding several vectors and halving
-    // them. The keys are the generated ones the 128-byte fold collapses its lanes with, which
-    // reach 112 bytes; blocks before those seven, from the remainders of longer buffers on x86,
-    // are folded one by one into the first of them.
-    const DISTANCE_KEYS: [(usize, usize); 6] =
-        [(2, 1), (20, 19), (18, 17), (16, 15), (14, 13), (12, 11)];
-
     let len = data.len();
     debug_assert!((32..256).contains(&len));
     let blocks = len / CRC_CHUNK_SIZE;
-    // Macros rather than closures: a closure is a function of its own, which LLVM may leave out
-    // of line, where the tier's target features do not reach.
-    macro_rules! load {
-        ($i:expr) => {
-            reflect_bytes(
-                reflector,
-                ops.load_bytes(data.as_ptr().add($i * CRC_CHUNK_SIZE)),
-                ops,
-            )
-        };
-    }
-
-    // The fold for a given block count, written once and instantiated below for each count a
-    // buffer under 128 bytes has: with the count a constant, the loops unroll and each block's
-    // keys are at a fixed index, where a run-time count looked both indices up in
-    // `DISTANCE_KEYS` and then loaded the keys through them, block by block.
+    // The fold for a given block count, instantiated below for each count a buffer under 128
+    // bytes has: with the count a constant, the loops unroll and each block's keys are at a
+    // fixed index, where a run-time count looked both indices up in `DISTANCE_KEYS` and then
+    // loaded the keys through them, block by block.
     macro_rules! fold_blocks {
-        ($blocks:expr) => {{
-            let blocks: usize = $blocks;
-            let first = blocks.saturating_sub(DISTANCE_KEYS.len() + 1);
-            let mut head = ops.xor_vectors(load!(0), state.value);
-            if first > 0 {
-                let rk01rk02 = W::create_coefficient(keys[2], keys[1], state.reflected, ops);
-                for i in 1..=first {
-                    head = fold_and_xor::<T, W>(head, rk01rk02, load!(i), state.reflected, ops);
-                }
-            }
-
-            macro_rules! fold_onto_last {
-                ($block:expr, $i:expr, $acc:expr) => {{
-                    let (hi, lo) = DISTANCE_KEYS[blocks - 2 - $i];
-                    let coeff = W::create_coefficient(keys[hi], keys[lo], state.reflected, ops);
-                    fold_and_xor::<T, W>($block, coeff, $acc, state.reflected, ops)
-                }};
-            }
-            let mut acc = fold_onto_last!(head, first, load!(blocks - 1));
-            for i in first + 1..blocks - 1 {
-                acc = fold_onto_last!(load!(i), i, acc);
-            }
-            acc
-        }};
+        ($blocks:expr) => {
+            fold_blocks_onto_last::<T, W>($blocks, data.as_ptr(), state, reflector, keys, ops)
+        };
     }
     // From four blocks, two to a multiply where the tier has the registers; below that the
     // 128-bit fold takes no more multiplies and a shorter chain.

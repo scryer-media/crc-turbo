@@ -46,14 +46,10 @@ impl Simd512 {
 
     #[inline]
     #[target_feature(enable = "avx512vl,vpclmulqdq")]
-    unsafe fn fold_64(&self, coeff: &Self, new_data: &Self) -> Self {
-        // Use 512-bit ternary logic XOR3 with carryless multiplication
-        Self(_mm512_ternarylogic_epi64(
-            _mm512_clmulepi64_epi128(self.0, coeff.0, 0), // Low parts
-            _mm512_clmulepi64_epi128(self.0, coeff.0, 17), // High parts
-            new_data.0,
-            0x96, // XOR3 operation
-        ))
+    unsafe fn fold_64(&self, coeff: &Self, new_data: &Self, reflected: bool) -> Self {
+        let (low, high) = clmul_keys(self.0, coeff.0, reflected);
+        // 512-bit ternary logic XOR3
+        Self(_mm512_ternarylogic_epi64(low, high, new_data.0, 0x96))
     }
 
     #[cfg(feature = "std")]
@@ -122,12 +118,14 @@ impl X86_64Avx512VpclmulqdqOps {
         reflected: bool,
     ) -> __m128i {
         debug_assert!(chunks >= 2);
-        let state_u64s = self.extract_u64s(state.value);
-
+        // The state sits where the first bytes of the buffer do: the low 128 bits for a
+        // reflected CRC, the high 128 for a forward one, whose bytes are reversed across the
+        // whole register. Its other half is zero already, and the move stays in the vector
+        // unit, where it used to go out through the general registers and back.
         let positioned_state = if reflected {
-            Simd512::new(0, 0, 0, 0, 0, 0, 0, state_u64s[0])
+            Simd512(_mm512_zextsi128_si512(state.value))
         } else {
-            Simd512::new(state_u64s[1], 0, 0, 0, 0, 0, 0, 0)
+            Simd512(_mm512_inserti32x4(_mm512_setzero_si512(), state.value, 3))
         };
 
         let reflector = create_reflector512(reflected);
@@ -145,7 +143,7 @@ impl X86_64Avx512VpclmulqdqOps {
 
         x[0] = positioned_state.xor(&x[0]);
 
-        let coeff = self.create_avx512_256byte_coefficient(keys, reflected);
+        let coeff = self.create_avx512_256byte_coefficient(keys);
 
         let remaining = chunks - 2;
         let pair_count = remaining / 2;
@@ -157,18 +155,22 @@ impl X86_64Avx512VpclmulqdqOps {
             x[0] = x[0].fold_64(
                 &coeff,
                 &reflect_bytes512(&reflector, Simd512::load_from_ptr(block1_ptr)),
+                reflected,
             );
             x[1] = x[1].fold_64(
                 &coeff,
                 &reflect_bytes512(&reflector, Simd512::load_from_ptr(block1_ptr.add(64))),
+                reflected,
             );
             x[2] = x[2].fold_64(
                 &coeff,
                 &reflect_bytes512(&reflector, Simd512::load_from_ptr(block2_ptr)),
+                reflected,
             );
             x[3] = x[3].fold_64(
                 &coeff,
                 &reflect_bytes512(&reflector, Simd512::load_from_ptr(block2_ptr.add(64))),
+                reflected,
             );
         }
 
@@ -176,7 +178,7 @@ impl X86_64Avx512VpclmulqdqOps {
             // We have 1 unprocessed block (128 bytes)
             // Fold 4×512 down to 2×512 and process the remaining block with 2-register mode
             let folded_2reg = self.fold_from_4x512_to_2x256(x, keys, reflected);
-            let coeff_2reg = self.create_avx512_128byte_coefficient(keys, reflected);
+            let coeff_2reg = self.create_avx512_128byte_coefficient(keys);
 
             let last_block_ptr = data.add((chunks - 1) * 128);
 
@@ -184,10 +186,12 @@ impl X86_64Avx512VpclmulqdqOps {
                 folded_2reg[0].fold_64(
                     &coeff_2reg,
                     &reflect_bytes512(&reflector, Simd512::load_from_ptr(last_block_ptr)),
+                    reflected,
                 ),
                 folded_2reg[1].fold_64(
                     &coeff_2reg,
                     &reflect_bytes512(&reflector, Simd512::load_from_ptr(last_block_ptr.add(64))),
+                    reflected,
                 ),
             ];
 
@@ -198,38 +202,59 @@ impl X86_64Avx512VpclmulqdqOps {
         self.fold_from_4x512_to_1x128(x, keys, reflected)
     }
 
-    /// Create a folding coefficient for AVX-512 for 128-byte folding distances
-    #[inline(always)]
-    unsafe fn create_avx512_128byte_coefficient(
+    /// [`ArchOps::fold_short_wide`] for a buffer's first eight to fifteen blocks: the first eight
+    /// as two 512-bit registers, each lane folded straight onto the eighth block in one step,
+    /// and the blocks after those in 256-bit registers with that result as their head. In
+    /// 256-bit registers alone the eight blocks were three multiplies deep.
+    ///
+    /// # Safety
+    ///
+    /// `data` must be valid for reads of `units * 16` bytes, and `units` from 8 to 15.
+    #[inline]
+    #[target_feature(enable = "avx512vl,avx512bw,vpclmulqdq")]
+    unsafe fn fold_short_512(
         &self,
+        head: __m128i,
+        data: *const u8,
+        units: usize,
         keys: &[u64; 23],
         reflected: bool,
-    ) -> Simd512 {
-        let (k1, k2) = if reflected {
-            (keys[3], keys[4])
+    ) -> __m128i {
+        debug_assert!((8..16).contains(&units));
+        let positioned_state = if reflected {
+            Simd512(_mm512_zextsi128_si512(head))
         } else {
-            (keys[4], keys[3])
+            Simd512(_mm512_inserti32x4(_mm512_setzero_si512(), head, 3))
         };
+        let reflector = create_reflector512(reflected);
+        let x = [
+            reflect_bytes512(&reflector, Simd512::load_from_ptr(data)).xor(&positioned_state),
+            reflect_bytes512(&reflector, Simd512::load_from_ptr(data.add(64))),
+        ];
+        let folded = self.fold_from_2x512_to_1x128(x, keys, reflected);
+        if units == 8 {
+            return folded;
+        }
+        crate::arch::x86_64::avx2_vpclmulqdq::fold_short_256(
+            folded,
+            data.add(128),
+            units - 7,
+            false,
+            keys,
+            reflected,
+        )
+    }
 
-        // Replicate the coefficient pair
-        Simd512::new(k1, k2, k1, k2, k1, k2, k1, k2)
+    /// Create a folding coefficient for AVX-512 for 128-byte folding distances
+    #[inline(always)]
+    unsafe fn create_avx512_128byte_coefficient(&self, keys: &[u64; 23]) -> Simd512 {
+        key_pair512(keys, 3)
     }
 
     /// Create a folding coefficient for AVX-512 for 256-byte folding distances
     #[inline(always)]
-    unsafe fn create_avx512_256byte_coefficient(
-        &self,
-        keys: &[u64; 23],
-        reflected: bool,
-    ) -> Simd512 {
-        let (k1, k2) = if reflected {
-            (keys[21], keys[22])
-        } else {
-            (keys[22], keys[21])
-        };
-
-        // Replicate the coefficient pair
-        Simd512::new(k1, k2, k1, k2, k1, k2, k1, k2)
+    unsafe fn create_avx512_256byte_coefficient(&self, keys: &[u64; 23]) -> Simd512 {
+        key_pair512(keys, 21)
     }
 
     /// Fold from 4 x 512-bit to 1 x 128-bit
@@ -256,18 +281,22 @@ impl X86_64Avx512VpclmulqdqOps {
         reflected: bool,
     ) -> [Simd512; 2] {
         // This folds registers that are 128 bytes apart (x[0] with x[2], x[1] with x[3])
-        let coeff = self.create_avx512_128byte_coefficient(keys, reflected);
+        let coeff = self.create_avx512_128byte_coefficient(keys);
 
         // Fold pairs:
         // x[0] (bytes 0-63) + x[2] (bytes 128-191) → result[0]
         // x[1] (bytes 64-127) + x[3] (bytes 192-255) → result[1]
-        [x[0].fold_64(&coeff, &x[2]), x[1].fold_64(&coeff, &x[3])]
+        [
+            x[0].fold_64(&coeff, &x[2], reflected),
+            x[1].fold_64(&coeff, &x[3], reflected),
+        ]
     }
 
-    /// Fold from 2 x 512-bit to 1 x 128-bit as a tree: the first register onto the second, 64
-    /// bytes on, then each lane of that onto the last lane by its own distance in one multiply
-    /// with a coefficient per lane, and the four lanes xored together. Four 512-bit multiplies
-    /// in place of fourteen 128-bit ones folded in a chain.
+    /// Fold from 2 x 512-bit to 1 x 128-bit in one step: each of the eight lanes onto the last
+    /// lane by its own distance, 112 bytes down to 16, in two multiplies that do not wait on
+    /// each other, with a coefficient per lane, and the eight lanes xored together. Folding
+    /// the first register onto the second and then that one's lanes was one multiply deeper,
+    /// on the path every buffer of 256 bytes or more ends with.
     #[inline(always)]
     unsafe fn fold_from_2x512_to_1x128(
         &self,
@@ -277,36 +306,35 @@ impl X86_64Avx512VpclmulqdqOps {
     ) -> __m128i {
         // Reflected streams hold the earliest 16 bytes in lane 0; forward ones, byte-reversed
         // per 64 bytes, hold them in lane 3. Each lane takes the key for its distance from the
-        // last 16 bytes (48, 32, 16), and the last lane, which does not move, a zero key.
-        let (coeff_64, lane_coeffs, last_lane) = if reflected {
-            (
-                Simd512::new(
-                    keys[15], keys[16], keys[15], keys[16], keys[15], keys[16], keys[15], keys[16],
-                ),
-                Simd512::new(
-                    0, 0, keys[1], keys[2], keys[19], keys[20], keys[17], keys[18],
-                ),
-                0b1100_0000,
-            )
+        // last 16 bytes, and the last lane, which does not move, a zero key.
+        //
+        // The keys for 112, 96, 80 and 64 bytes are keys[9..17], and those for 48 and 32 are
+        // keys[17..21], in that order, so each coefficient is a load, with the 16-byte pair
+        // from keys[1..3] set beside the second: built a key at a time they went through the
+        // general registers and the port the multiplies run on. A forward CRC has its lanes
+        // the other way round.
+        let key = keys.as_ptr();
+        let first_keys = _mm512_loadu_si512(key.add(9).cast());
+        let second_keys = _mm512_inserti32x4(
+            _mm512_zextsi256_si512(_mm256_loadu_si256(key.add(17).cast())),
+            _mm_loadu_si128(key.add(1).cast()),
+            2,
+        );
+        let (first_keys, second_keys, last_lane) = if reflected {
+            (first_keys, second_keys, 0b1100_0000)
         } else {
             (
-                Simd512::new(
-                    keys[16], keys[15], keys[16], keys[15], keys[16], keys[15], keys[16], keys[15],
-                ),
-                Simd512::new(
-                    keys[18], keys[17], keys[20], keys[19], keys[2], keys[1], 0, 0,
-                ),
+                _mm512_shuffle_i64x2(first_keys, first_keys, 0b00_01_10_11),
+                _mm512_shuffle_i64x2(second_keys, second_keys, 0b00_01_10_11),
                 0b0000_0011,
             )
         };
 
-        let y = x[0].fold_64(&coeff_64, &x[1]);
-        let lanes = _mm512_ternarylogic_epi64(
-            _mm512_clmulepi64_epi128(y.0, lane_coeffs.0, 0x00),
-            _mm512_clmulepi64_epi128(y.0, lane_coeffs.0, 0x11),
-            _mm512_maskz_mov_epi64(last_lane, y.0),
-            0x96,
-        );
+        let (low, high) = clmul_keys(x[0].0, first_keys, reflected);
+        let first =
+            _mm512_ternarylogic_epi64(low, high, _mm512_maskz_mov_epi64(last_lane, x[1].0), 0x96);
+        let (low, high) = clmul_keys(x[1].0, second_keys, reflected);
+        let lanes = _mm512_ternarylogic_epi64(low, high, first, 0x96);
         let halves = _mm256_xor_si256(
             _mm512_castsi512_si256(lanes),
             _mm512_extracti64x4_epi64(lanes, 1),
@@ -315,6 +343,37 @@ impl X86_64Avx512VpclmulqdqOps {
         _mm_xor_si128(
             _mm256_castsi256_si128(halves),
             _mm256_extracti128_si256(halves, 1),
+        )
+    }
+}
+
+/// The fold coefficient `keys[low]` and `keys[low + 1]`, in each of the four lanes, in the
+/// order they are stored: one broadcast load. [`clmul_keys`] multiplies by it.
+#[inline]
+#[target_feature(enable = "avx512f")]
+unsafe fn key_pair512(keys: &[u64; 23], low: usize) -> Simd512 {
+    let pair: &[u64; 2] = keys[low..low + 2].try_into().unwrap_unchecked();
+    Simd512(_mm512_broadcast_i32x4(_mm_loadu_si128(
+        pair.as_ptr().cast(),
+    )))
+}
+
+/// The two products of a fold: each lane of `x` by its lane of `keys`, a pair of generated keys
+/// in the order they are stored. A reflected CRC multiplies its low half by the second key and
+/// its high half by the first, a forward CRC the other way round; the multiply picks the
+/// halves, so the keys are never swapped, a shuffle that ran on the multiplies' own port.
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn clmul_keys(x: __m512i, keys: __m512i, reflected: bool) -> (__m512i, __m512i) {
+    if reflected {
+        (
+            _mm512_clmulepi64_epi128(x, keys, 0x10),
+            _mm512_clmulepi64_epi128(x, keys, 0x01),
+        )
+    } else {
+        (
+            _mm512_clmulepi64_epi128(x, keys, 0x00),
+            _mm512_clmulepi64_epi128(x, keys, 0x11),
         )
     }
 }
@@ -415,6 +474,9 @@ impl ArchOps for X86_64Avx512VpclmulqdqOps {
         keys: &[u64; 23],
         reflected: bool,
     ) -> Option<Self::Vector> {
+        if head_in_data && units >= 8 {
+            return Some(self.fold_short_512(head, data, units, keys, reflected));
+        }
         Some(crate::arch::x86_64::avx2_vpclmulqdq::fold_short_256(
             head,
             data,
