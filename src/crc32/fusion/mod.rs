@@ -138,17 +138,14 @@ aarch64_entry!(
 );
 
 /// One more than the longest buffer x86's CRC-32/ISCSI takes with the CRC32 instruction alone,
-/// [`x86::IscsiPlan::direct_max`]: 0 until the plan is made, and 0 for good where it has no
+/// [`x86::IscsiPlan::direct_max`], or on Intel's E-cores the start of their window,
+/// [`x86::IscsiPlan::entry_end`]: 0 until the plan is made, and 0 for good where it has no
 /// kernel. A buffer shorter than it is a relaxed load and a compare ahead of the CRC32
 /// instructions; nothing else of the plan is read for it. A nonzero value is only ever stored
-/// after detecting SSE4.2, and every thread that stores one stores the same.
+/// after detecting SSE4.2, the E-core value only after detecting AVX2 and PCLMULQDQ too, and every
+/// thread that stores one stores the same.
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
 static ISCSI_DIRECT_END: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-
-/// [`x86::IscsiPlan::v4_end`]: 0 until the plan is made, and 0 for good on every CPU but Intel's
-/// E-core parts. A nonzero value is only ever stored after detecting AVX2, SSE4.2 and PCLMULQDQ.
-#[cfg(all(feature = "std", target_arch = "x86_64"))]
-static ISCSI_V4_END: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// x86's CRC-32/ISCSI plan, made once, or `None` where the CPU has no kernel.
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
@@ -169,23 +166,48 @@ static ISCSI_PLAN: std::sync::OnceLock<Option<x86::IscsiPlan>> = std::sync::Once
 pub(crate) fn crc32_iscsi<const XOROUT: u32>(state: u32, data: &[u8]) -> Option<u32> {
     use core::sync::atomic::Ordering;
 
-    if data.len() < ISCSI_DIRECT_END.load(Ordering::Relaxed) {
+    let end = ISCSI_DIRECT_END.load(Ordering::Relaxed);
+    if data.len() < end {
         // SAFETY: the limit is nonzero only once a kernel was selected, after detecting SSE4.2
         return Some(unsafe { x86::crc32_iscsi_direct(state, data) } ^ XOROUT);
     }
 
-    // Intel's E-cores: the vector-only window straight to its kernel, one call as fast-crc32's
-    // `v4` is, rather than through the plan, its indirect call and the kernel's entry
+    // Intel's E-cores, told apart by the value already loaded: their window, out of line, so that
+    // every other plan reads nothing more and adds one compare
     #[cfg(target_arch = "x86_64")]
-    if data.len() < ISCSI_V4_END.load(Ordering::Relaxed) {
-        // SAFETY: the limit is nonzero only once the E-core plan was made, after detecting AVX2,
-        // SSE4.2 and PCLMULQDQ
-        return Some(
-            unsafe { x86::crc32_iscsi_avx2_v4_aligned(state, data.as_ptr(), data.len()) } ^ XOROUT,
-        );
+    if x86::is_ecore_entry_end(end) {
+        return Some(crc32_iscsi_ecore::<XOROUT>(state, data));
     }
 
     Some(crc32_iscsi_planned::<XOROUT>(state, data))
+}
+
+/// [`crc32_iscsi`] past its short arm on Intel's E-cores, with `XOROUT` applied: their window
+/// straight to its kernel, one call as fast-crc32's `v4` is, from its shortest length when the start
+/// is 16-byte aligned and from any start past the CRC32 instruction's limit; the unaligned buffers
+/// below that limit to the CRC32 instruction alone; anything longer to the plan.
+/// [`x86::ecore_window`] picks.
+#[inline(never)]
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+fn crc32_iscsi_ecore<const XOROUT: u32>(state: u32, data: &[u8]) -> u32 {
+    let (ptr, len) = (data.as_ptr(), data.len());
+    // SAFETY: only the E-core plan stores the entry end that leads here, after detecting AVX2,
+    // SSE4.2 and PCLMULQDQ; the CRC32 instruction alone needs SSE4.2 only
+    match x86::ecore_window(len, ptr as usize) {
+        x86::EcoreWindow::V4 => unsafe { x86::crc32_iscsi_ecore_window(state, ptr, len) ^ XOROUT },
+        x86::EcoreWindow::Direct => crc32_iscsi_ecore_direct::<XOROUT>(state, data),
+        x86::EcoreWindow::Plan => crc32_iscsi_planned::<XOROUT>(state, data),
+    }
+}
+
+/// The unaligned arm of [`crc32_iscsi_ecore`], kept out of it so both arms that leave the window
+/// are tail jumps and the window's own call is the fall-through: inlined, the CRC32 loop put the
+/// jump to the plan ahead of the window and every call through it took a branch more.
+#[inline(never)]
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+fn crc32_iscsi_ecore_direct<const XOROUT: u32>(state: u32, data: &[u8]) -> u32 {
+    // SAFETY: reached only from the E-core plan's entry, after detecting SSE4.2
+    unsafe { x86::crc32_iscsi_direct(state, data) ^ XOROUT }
 }
 
 /// [`crc32_iscsi`] past its short arm, with `XOROUT` applied: the plan's kernel, or the folding
@@ -233,9 +255,7 @@ fn iscsi_first_call<const XOROUT: u32>(state: u32, data: &[u8]) -> u32 {
             std::arch::is_x86_feature_detected!("avx2"),
         )?;
         let plan = x86::iscsi_plan(kernel, tier, x86::CpuId::detect());
-        #[cfg(target_arch = "x86_64")]
-        ISCSI_V4_END.store(plan.v4_end, Ordering::Relaxed);
-        ISCSI_DIRECT_END.store(plan.direct_max + 1, Ordering::Relaxed);
+        ISCSI_DIRECT_END.store(plan.entry_end(), Ordering::Relaxed);
 
         Some(plan)
     });

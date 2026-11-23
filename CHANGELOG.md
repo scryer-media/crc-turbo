@@ -186,15 +186,16 @@ own changelog up to the fork point continues below, unchanged.
 - Below AVX-512, CRC-32/ISCSI follows a plan chosen per CPU model: the
   plain CRC32 instruction loop runs up to 384 bytes (320 on AMD family
   0x19, 288 on family 0x17, 240 on Haswell, 199 on Intel's E-core parts
-  and 159 there with the AVX2 build),
+  and 159 there with the AVX2 build, 111 from a 16-byte aligned start),
   where crc-fast hands over to its kernel at 257 on every CPU, and on AMD
   family 0x19 the `x86_64-avx2-vpclmulqdq` tier's 256-bit fold takes
   buffers from 4 KiB instead of the fusion kernel.
 - On Haswell, Zen 2, Zen 3, the AVX-512 PCLMULQDQ tier, Sapphire Rapids,
   Ice Lake, Zen 4 and Intel's E-core parts, a window of lengths past the
   CRC32 instruction's limit takes a kernel of carry-less folds alone
-  (fast-crc32's `v4`; on the E-core parts from a 16-byte boundary, called
-  straight from the inlined entry); on Zen 2 buffers from 32 KiB take three
+  (fast-crc32's `v4`; on the E-core parts from a 16-byte boundary, written
+  as inline assembly in the shape gcc gives fast-crc32's `v4`, from 112
+  bytes when the start is 16-byte aligned); on Zen 2 buffers from 32 KiB take three
   CRC32 streams alone (fast-crc32's `s3`). crc-fast has neither.
 - On Intel's E-core parts on the `x86_64-avx2-vpclmulqdq` tier,
   CRC-32/ISO-HDLC from 256 bytes to 4 KiB takes libdeflate's cascade of
@@ -1124,36 +1125,64 @@ own changelog up to the fork point continues below, unchanged.
   64-byte aligned start, where its loads do not split cache lines; from
   any other start `v4` was 1.17x to 1.5x faster at 320 and 384 bytes.
 - On Intel's E-core parts (family 6, models 0xaf, 0xb6, 0xdd and 0xbe)
-  with the AVX2 build, the `v4` window takes buffers from a 16-byte
-  boundary, the bytes before it with the CRC32 instruction, as fast-crc32's
-  generated `v4` does, and the inlined entry calls it directly for the
-  window's lengths, one call where the plan's path was a call, an indirect
-  call through the plan and a jump; past the window the plan's kernel is
-  the tier's default. Every other CPU pays one relaxed load and compare
-  more on lengths past its direct limit. Measured on a Xeon 6731E only
-  (model 0xaf; the other three models are planned as it is, unmeasured),
-  GB/s, median of three interleaved rounds over four link layouts on two
-  cores, checksums compared first, against 1.11.0 and the fastest of
-  fast-crc32's generated kernels (the kit's and 49 generated `sse_` and
-  `avx2_` shapes), aligned and three bytes off:
+  with the AVX2 build, the `v4` window is inline assembly in the shape gcc
+  gives fast-crc32's VEX `v4`: 18 instructions a 64-byte step (eight
+  carry-less multiplies, four register XORs, four XORs folding the next
+  loads, one pointer compare), where the intrinsics compiled to 21 with
+  three counters, and the last bytes as one straight chain of CRC32
+  instructions in place of a ladder out of line. Its keys come from the
+  generated table; Miri and the other architectures keep the intrinsic
+  version; a forced test checks it against the software path at every
+  length through four windows and eight starts, and swapping its loop
+  coefficient, skipping a tail word or keeping the head's length each
+  fail it. It takes buffers from a 16-byte boundary, the bytes before it
+  with the CRC32 instruction, from 112 bytes when the start is already
+  aligned and from 160 from any other start; below 160 an unaligned start
+  keeps the CRC32 instruction alone. The entry still loads one value: on
+  these parts it holds 112, and the lengths past it reach an out-of-line
+  function whose first test is the window's, so the kernel's call is its
+  fall-through, and the unaligned arm and the plan are tail jumps; every
+  other CPU pays one register compare more on lengths past its direct
+  limit and no load. Measured on a Xeon 6731E only (model 0xaf; the other
+  three models are planned as it is, unmeasured), GB/s, median of three
+  interleaved rounds over four link layouts on two cores, checksums
+  compared first, against 1.11.0, the build before this round, and the
+  fastest of fast-crc32's generated kernels (the kit's and 49 generated
+  `sse_` and `avx2_` shapes):
 
-  | bytes | 1.11.0 | without | with | fastest other | with / other |
-  |---:|---:|---:|---:|---:|---:|
-  | 160 | 9.6 | 13.4 | 16.9 | 19.6 | 0.87 |
-  | 192 | 10.2 | 12.9 | 18.6 | 21.7 | 0.86 |
-  | 256 | 9.4 | 13.2 | 21.2 | 22.6 | 0.94 |
-  | 384 | 6.3 | 16.3 | 22.4 | 23.5 | 0.95 |
-  | 512 | 7.6 | 20.2 | 23.0 | 24.4 | 0.94 |
-  | 160, off | 7.3 | 13.4 | 15.7 | 13.9 | 1.13 |
-  | 256, off | 7.4 | 11.8 | 17.7 | 17.4 | 1.02 |
-  | 512, off | 7.3 | 18.7 | 21.9 | 20.4 | 1.07 |
+  | bytes | 1.11.0 | before | with | fastest other | with / other |
+  |---:|---:|---:|---:|---|---:|
+  | 96 | 8.5 | 14.1 | 14.1 | `avx2_v6` 16.5 | 0.86 |
+  | 112 | 7.2 | 14.4 | 14.6 | `avx2_v6` 16.5 | 0.88 |
+  | 128 | 10.0 | 13.4 | 17.2 | `avx2_v8` 20.2 | 0.85 |
+  | 144 | – | 13.9 | 18.6 | `sse_v4` 18.6 | 1.00 |
+  | 160 | 9.6 | 13.4 | 19.0 | `avx2_v4x2` 19.8 | 0.96 |
+  | 192 | 10.2 | 12.9 | 20.8 | `avx2_v4` 21.8 | 0.96 |
+  | 224 | 9.3 | 12.0 | 21.0 | `avx2_v4` 23.4 | 0.90 |
+  | 256 | 9.4 | 13.2 | 22.2 | `avx2_v8x2` 22.8 | 0.97 |
+  | 320 | 6.1 | 14.6 | 22.8 | `avx2_v4x2` 24.2 | 0.94 |
+  | 384 | 6.4 | 16.3 | 23.0 | `avx2_v8` 23.5 | 0.98 |
+  | 512 | 7.7 | 20.2 | 23.3 | `avx2_v6` 24.5 | 0.95 |
+  | 112, off | 6.5 | 14.4 | 13.3 | `avx2_v6` 11.9 | 1.12 |
+  | 144, off | – | 13.1 | 13.1 | `avx2_v4x2` 14.9 | 0.88 |
+  | 160, off | 7.3 | 13.4 | 15.7 | `avx2_v4x2` 14.6 | 1.08 |
+  | 256, off | 7.5 | 11.6 | 17.5 | `avx2_v4` 16.2 | 1.08 |
+  | 512, off | 7.3 | 18.7 | 22.9 | `avx2_v4` 21.1 | 1.08 |
 
-  From an aligned start fast-crc32's VEX-encoded `v4`, `v6` and `v8`
-  stay ahead from 96 to 512 bytes (0.65x at 128, where the CRC32
-  instruction alone still runs). From 704 bytes to 16 KiB, past the window,
-  this build measured 0.95x to 1.00x the build without the change: about
-  two runs in five, in every link layout, were 9% slower at 4 KiB, which
-  the build without it never was; the cause is not known.
+  "Before" is the build with the window behind a second relaxed load. That
+  load cost lengths past the window: an A/A run of 48 runs a build showed
+  the build with it slow in 24 at 4 KiB (38.7 against 40.9 GB/s median)
+  and two identical builds without it slow in 0 and 1; with the single
+  load, 4 to 16 KiB measure 0.99x to 1.00x the build without the window
+  and 768 bytes to 2 KiB 0.98x to 0.99x, the compare and the jump. Inlined,
+  the unaligned arm put the jump to the plan ahead of the window and the
+  window lost up to 15% at 128 to 256 bytes, so it is kept out of line.
+  A one-pass six- and eight-lane kernel for 96 to 143 bytes aligned,
+  fast-crc32's `v6` and `v8` shapes in the same assembly, measured no
+  faster than `v4` there through the out-of-line hop and was dropped. Open:
+  the lane counts fast-crc32's `v6` and `v8` pick at 96, 112, 128, 320
+  and 512 bytes aligned, and gcc's `v4` at 192 and 224 bytes, which runs
+  the same instructions from inside one function.
 - On Intel's E-core parts on the `x86_64-avx2-vpclmulqdq` tier,
   CRC-32/ISO-HDLC from 256 bytes to 4 KiB takes the shape of libdeflate's
   `crc32_x86_vpclmulqdq_avx2` (`crc32_pclmul_template.h`, reimplemented

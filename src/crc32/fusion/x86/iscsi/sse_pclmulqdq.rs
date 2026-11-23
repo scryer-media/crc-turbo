@@ -440,10 +440,177 @@ v4!(
     ///
     /// `buf` must be valid for reads of `len` bytes, and the CPU must have AVX2, SSE4.2 and
     /// PCLMULQDQ.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", any(test, miri)))]
     #[target_feature(enable = "avx2,sse4.2,pclmulqdq")]
     crc32_iscsi_avx2_v4_aligned
 );
+
+/// [`crc32_iscsi_avx2_v4_aligned`] written as inline assembly, in the shape gcc gives
+/// fast-crc32's `v4`: the bytes up to a 16-byte boundary by their address bits, the four
+/// accumulators' eight multiplies ahead of their sums with the loads folded into the XORs, one
+/// pointer compare closing the loop, and the last 63 bytes or fewer as one straight run of CRC32
+/// instructions whose branches all go forward. On a Xeon 6731E, with no micro-op cache, the
+/// compiled intrinsics' extra loop counters, out-of-line tail ladder and set-up for the head cost
+/// it up to a fifth of the reference's speed from 160 to 512 bytes. Written out, its hot path no
+/// longer depends on the compiler's choices.
+///
+/// # Safety
+///
+/// `buf` must be valid for reads of `len` bytes, and the CPU must have AVX2, SSE4.2 and
+/// PCLMULQDQ.
+#[cfg(all(target_arch = "x86_64", not(miri)))]
+#[inline(never)]
+#[target_feature(enable = "avx2,sse4.2,pclmulqdq")]
+pub unsafe fn crc32_iscsi_avx2_v4_asm(crc0: u32, buf: *const u8, len: usize) -> u32 {
+    let k64 = fold_keys(16, 15);
+    let k16 = fold_keys(2, 1);
+    let k32 = fold_keys(20, 19);
+    let mut crc = crc0 as u64;
+    core::arch::asm!(
+        // The head, by address bits, when the buffer is long enough to fold after it
+        "test {buf:l}, 15",
+        "jz 3f",
+        "cmp {len}, 79",
+        "jb 3f",
+        "test {buf:l}, 1",
+        "jz 4f",
+        "crc32 {crc:e}, byte ptr [{buf}]",
+        "add {buf}, 1",
+        "sub {len}, 1",
+        "4:",
+        "test {buf:l}, 2",
+        "jz 5f",
+        "crc32 {crc:e}, word ptr [{buf}]",
+        "add {buf}, 2",
+        "sub {len}, 2",
+        "5:",
+        "test {buf:l}, 4",
+        "jz 6f",
+        "crc32 {crc:e}, dword ptr [{buf}]",
+        "add {buf}, 4",
+        "sub {len}, 4",
+        "6:",
+        "test {buf:l}, 8",
+        "jz 3f",
+        "crc32 {crc}, qword ptr [{buf}]",
+        "add {buf}, 8",
+        "sub {len}, 8",
+        "3:",
+        "cmp {len}, 64",
+        "jb 7f",
+        // The first 64 bytes seed the accumulators, the CRC in the low 32 bits
+        "vmovd {x0}, {crc:e}",
+        "vpxor {x0}, {x0}, xmmword ptr [{buf}]",
+        "vmovdqu {x1}, xmmword ptr [{buf} + 16]",
+        "vmovdqu {x2}, xmmword ptr [{buf} + 32]",
+        "vmovdqu {x3}, xmmword ptr [{buf} + 48]",
+        "add {buf}, 64",
+        "sub {len}, 64",
+        "mov {end}, {len}",
+        "and {len}, 63",
+        "and {end}, -64",
+        "jz 8f",
+        "add {end}, {buf}",
+        "2:",
+        "add {buf}, 64",
+        "vpclmulqdq {y0}, {x0}, {k64}, 0x00",
+        "vpclmulqdq {y1}, {x1}, {k64}, 0x00",
+        "vpclmulqdq {x0}, {x0}, {k64}, 0x11",
+        "vpclmulqdq {x1}, {x1}, {k64}, 0x11",
+        "vpclmulqdq {y2}, {x2}, {k64}, 0x00",
+        "vpclmulqdq {y3}, {x3}, {k64}, 0x00",
+        "vpclmulqdq {x2}, {x2}, {k64}, 0x11",
+        "vpclmulqdq {x3}, {x3}, {k64}, 0x11",
+        "vpxor {y0}, {y0}, {x0}",
+        "vpxor {y1}, {y1}, {x1}",
+        "vpxor {y2}, {y2}, {x2}",
+        "vpxor {y3}, {y3}, {x3}",
+        "vpxor {x0}, {y0}, xmmword ptr [{buf} - 64]",
+        "vpxor {x1}, {y1}, xmmword ptr [{buf} - 48]",
+        "vpxor {x2}, {y2}, xmmword ptr [{buf} - 32]",
+        "vpxor {x3}, {y3}, xmmword ptr [{buf} - 16]",
+        "cmp {buf}, {end}",
+        "jne 2b",
+        // Four accumulators to one: 16 bytes forward twice, then 32 bytes
+        "8:",
+        "vpclmulqdq {y0}, {x0}, {k16}, 0x00",
+        "vpclmulqdq {x0}, {x0}, {k16}, 0x11",
+        "vpclmulqdq {y2}, {x2}, {k16}, 0x00",
+        "vpclmulqdq {x2}, {x2}, {k16}, 0x11",
+        "vpxor {x0}, {x0}, {y0}",
+        "vpxor {x2}, {x2}, {y2}",
+        "vpxor {x0}, {x0}, {x1}",
+        "vpxor {x2}, {x2}, {x3}",
+        "vpclmulqdq {y0}, {x0}, {k32}, 0x00",
+        "vpclmulqdq {x0}, {x0}, {k32}, 0x11",
+        "vpxor {x0}, {x0}, {y0}",
+        "vpxor {x0}, {x0}, {x2}",
+        // And that one to 32 bits with the CRC32 instruction
+        "vmovq {end}, {x0}",
+        "xor {crc:e}, {crc:e}",
+        "crc32 {crc}, {end}",
+        "vpextrq {end}, {x0}, 1",
+        "crc32 {crc}, {end}",
+        // The last 63 bytes or fewer: the words in one forward run, then 4, 2 and 1 bytes
+        "7:",
+        "cmp {len}, 8",
+        "jb 9f",
+        "crc32 {crc}, qword ptr [{buf}]",
+        "cmp {len}, 16",
+        "jb 9f",
+        "crc32 {crc}, qword ptr [{buf} + 8]",
+        "cmp {len}, 24",
+        "jb 9f",
+        "crc32 {crc}, qword ptr [{buf} + 16]",
+        "cmp {len}, 32",
+        "jb 9f",
+        "crc32 {crc}, qword ptr [{buf} + 24]",
+        "cmp {len}, 40",
+        "jb 9f",
+        "crc32 {crc}, qword ptr [{buf} + 32]",
+        "cmp {len}, 48",
+        "jb 9f",
+        "crc32 {crc}, qword ptr [{buf} + 40]",
+        "cmp {len}, 56",
+        "jb 9f",
+        "crc32 {crc}, qword ptr [{buf} + 48]",
+        "9:",
+        "mov {end}, {len}",
+        "and {end}, -8",
+        "add {buf}, {end}",
+        "test {len:l}, 4",
+        "jz 22f",
+        "crc32 {crc:e}, dword ptr [{buf}]",
+        "add {buf}, 4",
+        "22:",
+        "test {len:l}, 2",
+        "jz 23f",
+        "crc32 {crc:e}, word ptr [{buf}]",
+        "add {buf}, 2",
+        "23:",
+        "test {len:l}, 1",
+        "jz 24f",
+        "crc32 {crc:e}, byte ptr [{buf}]",
+        "24:",
+        crc = inout(reg) crc,
+        buf = inout(reg) buf => _,
+        len = inout(reg) len => _,
+        end = out(reg) _,
+        k64 = in(xmm_reg) k64,
+        k16 = in(xmm_reg) k16,
+        k32 = in(xmm_reg) k32,
+        x0 = out(xmm_reg) _,
+        x1 = out(xmm_reg) _,
+        x2 = out(xmm_reg) _,
+        x3 = out(xmm_reg) _,
+        y0 = out(xmm_reg) _,
+        y1 = out(xmm_reg) _,
+        y2 = out(xmm_reg) _,
+        y3 = out(xmm_reg) _,
+        options(nostack, readonly, pure),
+    );
+    crc as u32
+}
 
 /// The shortest aligned length [`s3!`] splits into streams.
 #[cfg(target_arch = "x86_64")]
