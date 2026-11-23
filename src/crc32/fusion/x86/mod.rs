@@ -855,8 +855,15 @@ pub(crate) unsafe fn crc32_iscsi_direct(crc: u32, data: &[u8]) -> u32 {
 /// takes a short buffer with no call, no frame and no register saves of its own.
 ///
 /// The same steps as the intrinsic version, a word at a time from wherever the buffer starts:
-/// 64 bytes at a time, then at most one each of 32, 16, 8, 4, 2 and 1 bytes. The CRC32
-/// instruction reads its operand from memory and touches no flags.
+/// 64 bytes at a time, then at most one each of 32, 16, 8, 4, 2 and 1 bytes. Each of those is
+/// a rung that falls through when its step is not needed, with the step out of line: one branch
+/// not taken per rung, as LLVM laid out the intrinsic version. Testing the length's bits
+/// instead, a taken branch over every absent step, ran at 0.85x to 0.9x of that at 64 and 128
+/// bytes on a Xeon Platinum 8488C (Sapphire Rapids). It is one block, the loop and its branches
+/// included, so that its
+/// instructions and their order are fixed: the compiler places it but does not choose its code,
+/// and a later compiler cannot reshape it. It needs three registers, the ones its operands are
+/// already in.
 ///
 /// # Safety
 ///
@@ -868,108 +875,89 @@ pub(crate) unsafe fn crc32_iscsi_short_inline(crc: u32, data: &[u8]) -> u32 {
     use core::arch::asm;
 
     let mut crc = crc as u64;
-    let mut p = data.as_ptr();
-    let mut n = data.len();
 
-    while n >= 64 {
-        // SAFETY: the 64 bytes from `p` are in the buffer
-        unsafe {
-            asm!(
-                "crc32 {c}, qword ptr [{p}]",
-                "crc32 {c}, qword ptr [{p} + 8]",
-                "crc32 {c}, qword ptr [{p} + 16]",
-                "crc32 {c}, qword ptr [{p} + 24]",
-                "crc32 {c}, qword ptr [{p} + 32]",
-                "crc32 {c}, qword ptr [{p} + 40]",
-                "crc32 {c}, qword ptr [{p} + 48]",
-                "crc32 {c}, qword ptr [{p} + 56]",
-                c = inout(reg) crc,
-                p = in(reg) p,
-                options(pure, readonly, nostack, preserves_flags),
-            );
-            p = p.add(64);
-        }
-        n -= 64;
-    }
-    if n >= 32 {
-        // SAFETY: the 32 bytes from `p` are in the buffer
-        unsafe {
-            asm!(
-                "crc32 {c}, qword ptr [{p}]",
-                "crc32 {c}, qword ptr [{p} + 8]",
-                "crc32 {c}, qword ptr [{p} + 16]",
-                "crc32 {c}, qword ptr [{p} + 24]",
-                c = inout(reg) crc,
-                p = in(reg) p,
-                options(pure, readonly, nostack, preserves_flags),
-            );
-            p = p.add(32);
-        }
-        n -= 32;
-    }
-    if n >= 16 {
-        // SAFETY: the 16 bytes from `p` are in the buffer
-        unsafe {
-            asm!(
-                "crc32 {c}, qword ptr [{p}]",
-                "crc32 {c}, qword ptr [{p} + 8]",
-                c = inout(reg) crc,
-                p = in(reg) p,
-                options(pure, readonly, nostack, preserves_flags),
-            );
-            p = p.add(16);
-        }
-        n -= 16;
-    }
-    if n >= 8 {
-        // SAFETY: the 8 bytes from `p` are in the buffer
-        unsafe {
-            asm!(
-                "crc32 {c}, qword ptr [{p}]",
-                c = inout(reg) crc,
-                p = in(reg) p,
-                options(pure, readonly, nostack, preserves_flags),
-            );
-            p = p.add(8);
-        }
-        n -= 8;
-    }
-    if n >= 4 {
-        // SAFETY: the 4 bytes from `p` are in the buffer
-        unsafe {
-            asm!(
-                "crc32 {c:e}, dword ptr [{p}]",
-                c = inout(reg) crc,
-                p = in(reg) p,
-                options(pure, readonly, nostack, preserves_flags),
-            );
-            p = p.add(4);
-        }
-        n -= 4;
-    }
-    if n >= 2 {
-        // SAFETY: the 2 bytes from `p` are in the buffer
-        unsafe {
-            asm!(
-                "crc32 {c:e}, word ptr [{p}]",
-                c = inout(reg) crc,
-                p = in(reg) p,
-                options(pure, readonly, nostack, preserves_flags),
-            );
-            p = p.add(2);
-        }
-        n -= 2;
-    }
-    if n != 0 {
-        // SAFETY: the byte at `p` is in the buffer
-        unsafe {
-            asm!(
-                "crc32 {c:e}, byte ptr [{p}]",
-                c = inout(reg) crc,
-                p = in(reg) p,
-                options(pure, readonly, nostack, preserves_flags),
-            );
-        }
+    // SAFETY: every load is of bytes from `p` to `p + n`, the buffer: the loop takes 64 while at
+    // least 64 are left, and each rung after it takes its step only when `n` is at least that
+    unsafe {
+        asm!(
+            "cmp {n}, 64",
+            "jb 3f",
+            "2:",
+            "crc32 {c}, qword ptr [{p}]",
+            "crc32 {c}, qword ptr [{p} + 8]",
+            "crc32 {c}, qword ptr [{p} + 16]",
+            "crc32 {c}, qword ptr [{p} + 24]",
+            "crc32 {c}, qword ptr [{p} + 32]",
+            "crc32 {c}, qword ptr [{p} + 40]",
+            "crc32 {c}, qword ptr [{p} + 48]",
+            "crc32 {c}, qword ptr [{p} + 56]",
+            "add {p}, 64",
+            "sub {n}, 64",
+            "cmp {n}, 64",
+            "jae 2b",
+            // The ladder: a step that is not needed costs one branch not taken, and the steps
+            // sit out of line after it, each going on to the next rung.
+            "3:",
+            "cmp {n}, 32",
+            "jae 13f",
+            "4:",
+            "cmp {n}, 16",
+            "jae 14f",
+            "5:",
+            "cmp {n}, 8",
+            "jae 15f",
+            "6:",
+            "cmp {n}, 4",
+            "jae 16f",
+            "7:",
+            "cmp {n}, 2",
+            "jae 17f",
+            "8:",
+            "test {n}, {n}",
+            "jz 9f",
+            "18:",
+            "crc32 {c:e}, byte ptr [{p}]",
+            "jmp 9f",
+            "13:",
+            "crc32 {c}, qword ptr [{p}]",
+            "crc32 {c}, qword ptr [{p} + 8]",
+            "crc32 {c}, qword ptr [{p} + 16]",
+            "crc32 {c}, qword ptr [{p} + 24]",
+            "add {p}, 32",
+            "sub {n}, 32",
+            "cmp {n}, 16",
+            "jb 5b",
+            "14:",
+            "crc32 {c}, qword ptr [{p}]",
+            "crc32 {c}, qword ptr [{p} + 8]",
+            "add {p}, 16",
+            "sub {n}, 16",
+            "cmp {n}, 8",
+            "jb 6b",
+            "15:",
+            "crc32 {c}, qword ptr [{p}]",
+            "add {p}, 8",
+            "sub {n}, 8",
+            "cmp {n}, 4",
+            "jb 7b",
+            "16:",
+            "crc32 {c:e}, dword ptr [{p}]",
+            "add {p}, 4",
+            "sub {n}, 4",
+            "cmp {n}, 2",
+            "jb 8b",
+            "17:",
+            "crc32 {c:e}, word ptr [{p}]",
+            "add {p}, 2",
+            "sub {n}, 2",
+            "test {n}, {n}",
+            "jnz 18b",
+            "9:",
+            c = inout(reg) crc,
+            p = inout(reg) data.as_ptr() => _,
+            n = inout(reg) data.len() => _,
+            options(pure, readonly, nostack),
+        );
     }
 
     crc as u32

@@ -187,7 +187,10 @@ own changelog up to the fork point continues below, unchanged.
   tiers) are checksummed with the CRC32 instruction over unaligned words,
   written as inline assembly inside the caller on x86_64, ahead of the
   fusion kernel; crc-fast aligns first, a byte at a time, and so does this
-  crate through 1.11.0.
+  crate through 1.11.0. The entry is frame-free and tail-jumps to the
+  plan, and the `x86_64-avx512-vpclmulqdq` `v3x2` kernel aligns and
+  finishes in inline assembly, so their shape does not depend on the
+  compiler version; crc-fast's are compiler-chosen.
 - The fusion kernel for CRC-32/ISCSI, and on aarch64 for CRC-32/ISO-HDLC,
   is chosen once per process: on x86 kept as a function pointer, on aarch64
   as one byte ahead of direct calls. crc-fast, and this crate through
@@ -806,6 +809,30 @@ own changelog up to the fork point continues below, unchanged.
   plan and fold. Those paths are now out of line, the kernel's call is
   inline, and the entry is never `None` on x86. Miri and 32-bit x86 keep the
   intrinsic loop.
+- CRC-32/ISCSI's x86 hot paths now have a fixed shape whatever the compiler
+  version decides, so a later LLVM cannot slow them by reshaping them:
+  - the short path is a single inline assembly block: a 64-byte loop of
+    eight CRC32 instructions, then a ladder of 32, 16, 8, 4, 2 and 1 byte
+    steps in which a step not needed costs one branch not taken. A first
+    version that tested the length's bits, a taken branch over each absent
+    step, ran at 0.85x to 0.9x of the intrinsic loop at 64 and 128 bytes on
+    a Xeon Platinum 8488C;
+  - the entry takes the final XOR as a const parameter, so every arm ends
+    in its own XOR and the long arm is a tail jump to an out-of-line plan
+    function. Inlined into a caller that keeps the 32-bit result, the entry
+    saves no registers and keeps no stack frame; widened to `u64`, as
+    `checksum` returns it, only the long arm sets up a frame. The plan function's first-call and fold arms are tail
+    jumps to their own out-of-line functions;
+  - the AVX-512 VPCLMULQDQ kernel's `v3x2` shape aligns its start and
+    finishes its last bytes in inline assembly. A change in the caller had
+    let LLVM drop a range fact it had inferred, which grew the kernel from
+    195 to 211 instructions. It is now 134 instructions, and a last fold of
+    64-byte blocks at one 512-bit fold key replaces the 8-byte CRC32 loop
+    over the remainder.
+
+  Miri runs the intrinsic versions. Each assembly block has a test against
+  the software path over every alignment within 16 bytes and lengths
+  through three blocks, and a changed instruction in the block fails it.
 - Past the CRC32 instruction's limit, a kernel of carry-less folds alone,
   fast-crc32's `v4` shape (four 128-bit accumulators, no CRC32 streams to
   shift back together), takes a window of lengths on the CPUs where it

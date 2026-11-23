@@ -56,15 +56,15 @@ fn aarch64_kernel() -> Option<aarch64::FusionKernel> {
     }
 }
 
-/// CRC-32/ISCSI through this CPU's fusion kernel, or `None` when it has to take the folding path.
-/// Both AArch64 and x86 have native CRC-32/ISCSI instructions.
+/// CRC-32/ISCSI through this CPU's fusion kernel, with `XOROUT` applied, or `None` when it has to
+/// take the folding path. Both AArch64 and x86 have native CRC-32/ISCSI instructions.
 #[inline(always)]
 #[cfg(all(feature = "std", target_arch = "aarch64"))]
-pub(crate) fn crc32_iscsi(state: u32, data: &[u8]) -> Option<u32> {
+pub(crate) fn crc32_iscsi<const XOROUT: u32>(state: u32, data: &[u8]) -> Option<u32> {
     let kernel = aarch64_kernel()?;
 
     // SAFETY: the kernel was selected for the tier this CPU runs
-    Some(unsafe { aarch64::crc32_iscsi_with(kernel, state, data) })
+    Some(unsafe { aarch64::crc32_iscsi_with(kernel, state, data) } ^ XOROUT)
 }
 
 /// One more than the longest buffer x86's CRC-32/ISCSI takes with the CRC32 instruction alone,
@@ -79,42 +79,67 @@ static ISCSI_DIRECT_END: core::sync::atomic::AtomicUsize = core::sync::atomic::A
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
 static ISCSI_PLAN: std::sync::OnceLock<Option<x86::IscsiPlan>> = std::sync::OnceLock::new();
 
-/// CRC-32/ISCSI through this CPU's plan: the CRC32 instruction alone for a short buffer, the
-/// fusion kernel after that, or the folding path where the plan has it take that.
+/// CRC-32/ISCSI through this CPU's plan, with `XOROUT` applied to the result: the CRC32
+/// instruction alone for a short buffer, the fusion kernel after that, or the folding path where
+/// the plan has it take that.
 ///
 /// It is never `None` on x86. What the caller inlines is the short arm, written so that it
-/// inlines, and the call to the kernel; making the plan and the folding path are behind
-/// [`crc32_iscsi_planned`]. So the call site carries no fold of its own, keeps nothing live
-/// across a call, and saves no registers before looking at the length.
+/// inlines, and a jump to [`crc32_iscsi_planned`] for everything else: looking up the plan,
+/// making it on the first call, the kernel and the folding path. Applying `XOROUT` on both arms,
+/// rather than in the caller after them, leaves the caller nothing to do after that call, so it
+/// is a tail call: the call site carries no fold of its own, keeps nothing live across a call,
+/// and sets up no frame, on the short arm or the other.
 #[inline(always)]
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
-pub(crate) fn crc32_iscsi(state: u32, data: &[u8]) -> Option<u32> {
+pub(crate) fn crc32_iscsi<const XOROUT: u32>(state: u32, data: &[u8]) -> Option<u32> {
     use core::sync::atomic::Ordering;
 
     if data.len() < ISCSI_DIRECT_END.load(Ordering::Relaxed) {
         // SAFETY: the limit is nonzero only once a kernel was selected, after detecting SSE4.2
-        return Some(unsafe { x86::crc32_iscsi_direct(state, data) });
+        return Some(unsafe { x86::crc32_iscsi_direct(state, data) } ^ XOROUT);
     }
 
-    if let Some(Some(plan)) = ISCSI_PLAN.get() {
+    Some(crc32_iscsi_planned::<XOROUT>(state, data))
+}
+
+/// [`crc32_iscsi`] past its short arm, with `XOROUT` applied: the plan's kernel, or the folding
+/// path for the lengths the plan folds. Before the plan is made it goes to
+/// [`iscsi_first_call`]; that and the folding path are jumps out of here, so the only call it
+/// makes on its way to the kernel is the kernel.
+#[inline(never)]
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+fn crc32_iscsi_planned<const XOROUT: u32>(state: u32, data: &[u8]) -> u32 {
+    let Some(plan) = ISCSI_PLAN.get() else {
+        return iscsi_first_call::<XOROUT>(state, data);
+    };
+
+    if let Some(plan) = plan {
+        if data.len() <= plan.direct_max {
+            // Only on calls that loaded `ISCSI_DIRECT_END` before the plan published it
+            // SAFETY: a kernel is only selected after detecting SSE4.2
+            return unsafe { x86::crc32_iscsi_small_unaligned(state, data) } ^ XOROUT;
+        }
+
         if data.len() < plan.fold_min || data.len() >= plan.fold_end {
             // SAFETY: the kernel was selected for the tier this CPU runs, which has the
             // carry-less multiply it needs, after detecting the CRC32 instructions (and AVX2 for
             // its AVX2 build)
-            return Some(unsafe { (plan.kernel)(state, data) });
+            return unsafe { (plan.kernel)(state, data) } ^ XOROUT;
         }
     }
 
-    Some(crc32_iscsi_planned(state, data))
+    iscsi_fold::<XOROUT>(state, data)
 }
 
-/// [`crc32_iscsi`] for the first call, which makes the plan, and for the lengths the plan folds.
+/// [`crc32_iscsi_planned`] before the plan is made: makes it, once, publishes its direct limit,
+/// and goes back.
+#[cold]
 #[inline(never)]
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
-fn crc32_iscsi_planned(state: u32, data: &[u8]) -> u32 {
+fn iscsi_first_call<const XOROUT: u32>(state: u32, data: &[u8]) -> u32 {
     use core::sync::atomic::Ordering;
 
-    let plan = ISCSI_PLAN.get_or_init(|| {
+    ISCSI_PLAN.get_or_init(|| {
         let tier = crate::feature_detection::get_arch_ops().get_tier();
         let kernel = x86::select_iscsi_kernel(
             tier,
@@ -127,20 +152,19 @@ fn crc32_iscsi_planned(state: u32, data: &[u8]) -> u32 {
         Some(plan)
     });
 
-    if let Some(plan) = plan {
-        if data.len() <= plan.direct_max {
-            // SAFETY: a kernel is only selected after detecting SSE4.2
-            return unsafe { x86::crc32_iscsi_small_unaligned(state, data) };
-        }
+    crc32_iscsi_planned::<XOROUT>(state, data)
+}
 
-        if data.len() < plan.fold_min || data.len() >= plan.fold_end {
-            // SAFETY: as in `crc32_iscsi`
-            return unsafe { (plan.kernel)(state, data) };
-        }
-    }
-
+/// [`crc32_iscsi_planned`]'s folding path, out of line: inlined, the tier's dispatch it carries
+/// would have every call to the kernel save registers first.
+#[inline(never)]
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+fn iscsi_fold<const XOROUT: u32>(state: u32, data: &[u8]) -> u32 {
     // SAFETY: the tier's entry is the one detection selected
-    unsafe { crate::arch::update(state as u64, data, &crate::crc32::consts::CRC32_ISCSI) as u32 }
+    let crc = unsafe {
+        crate::arch::update(state as u64, data, &crate::crc32::consts::CRC32_ISCSI) as u32
+    };
+    crc ^ XOROUT
 }
 
 /// CRC-32/ISO-HDLC through this CPU's fusion kernel, or `None` when it has to take the folding

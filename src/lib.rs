@@ -1036,7 +1036,8 @@ fn checksum_by_table(algorithm: CrcAlgorithm, buf: &[u8]) -> u64 {
         }
         CrcAlgorithm::Crc32Custom => missing_params(algorithm),
         CrcAlgorithm::Crc32Iscsi => {
-            crc32_iscsi_calculator(CRC32_ISCSI.init, buf, &CRC32_ISCSI) ^ CRC32_ISCSI.xorout
+            crc32_iscsi_xorout::<{ CRC32_ISCSI.xorout as u32 }>(CRC32_ISCSI.init, buf, &CRC32_ISCSI)
+                as u64
         }
         CrcAlgorithm::Crc32IsoHdlc => {
             crc32_iso_hdlc_calculator(CRC32_ISO_HDLC.init, buf, &CRC32_ISO_HDLC)
@@ -1373,7 +1374,7 @@ pub fn get_calculator_target(_algorithm: CrcAlgorithm) -> String {
 /// ```
 #[inline(always)]
 pub fn crc32_iscsi(data: &[u8]) -> u32 {
-    crc32_iscsi_calculator(CRC32_ISCSI.init, data, &CRC32_ISCSI) as u32 ^ CRC32_ISCSI.xorout as u32
+    crc32_iscsi_xorout::<{ CRC32_ISCSI.xorout as u32 }>(CRC32_ISCSI.init, data, &CRC32_ISCSI)
 }
 
 /// Calculates the CRC-32/ISO-HDLC checksum (commonly called "crc32" in many, but not all,
@@ -1531,18 +1532,27 @@ fn get_calculator_params(algorithm: CrcAlgorithm) -> (CalculatorFn, CrcParams) {
 /// Because both aarch64 and x86 have native hardware support for CRC-32/ISCSI, we can use
 /// fusion techniques to accelerate the calculation beyond what SIMD can do alone.
 #[inline(always)]
-fn crc32_iscsi_calculator(state: u64, data: &[u8], _params: &CrcParams) -> u64 {
+fn crc32_iscsi_calculator(state: u64, data: &[u8], params: &CrcParams) -> u64 {
+    crc32_iscsi_xorout::<0>(state, data, params) as u64
+}
+
+/// [`crc32_iscsi_calculator`] with `XOROUT` applied to the result: 0 for the calculator, which
+/// returns the state, and the algorithm's for [`crc32_iscsi`]. The fusion entry applies it on
+/// each of its arms, so that its call to the kernel is the last thing it does and needs no frame
+/// in the caller.
+#[inline(always)]
+fn crc32_iscsi_xorout<const XOROUT: u32>(state: u64, data: &[u8], _params: &CrcParams) -> u32 {
     // The kernel was chosen once, from the tier and the CPU's CRC32 instructions; a pinned
     // `CRC_TURBO_TIER` holds it to that tier's width.
     #[cfg(all(
         any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "x86"),
         feature = "std"
     ))]
-    if let Some(crc) = fusion::crc32_iscsi(state as u32, data) {
-        return crc as u64;
+    if let Some(crc) = fusion::crc32_iscsi::<XOROUT>(state as u32, data) {
+        return crc;
     }
 
-    calculate!(Crc32Iscsi, state, data, _params)
+    calculate!(Crc32Iscsi, state, data, _params) as u32 ^ XOROUT
 }
 
 /// Calculates the CRC-32/ISO-HDLC (commonly called "crc32" in many, but not all, implementations)
