@@ -139,15 +139,22 @@ own changelog up to the fork point continues below, unchanged.
   about 270 of a 4 KiB one's 602. The SSE kernel is also a different shape,
   `v4x2s4x4` in fast-crc32's naming where crc-fast has `v4s3x3`, with its
   two halves sized in 32-byte units so that no more than 31 bytes of a
-  pass are left to the CRC32 instruction alone, and it takes over from the
-  plain CRC32 instruction loop at 200 bytes rather than 257; `v4s3x3`
-  is kept for buffers over 3 MiB, where reading one place fewer at a time
-  is worth more. The AVX-512 and aarch64 fusion kernels still compute
-  their shifts per buffer.
-- CRC-32/ISCSI buffers under 200 bytes are checksummed with the CRC32
-  instruction over unaligned words, by a direct call ahead of the fusion
-  kernel; crc-fast aligns first, a byte at a time, and so does this crate
-  through 1.11.1.
+  pass are left to the CRC32 instruction alone; `v4s3x3` is kept for
+  buffers over 3 MiB (128 KiB on Alder Lake's AVX2 build), where reading
+  one place fewer at a time is worth more. Both are built twice, and on x86_64 CPUs with AVX2 the build with
+  AVX2 enabled runs, whose VEX encoding was measured faster on every CPU
+  timed. The AVX-512 and aarch64 fusion kernels still compute their shifts
+  per buffer.
+- Below AVX-512, CRC-32/ISCSI follows a plan chosen per CPU model: the
+  plain CRC32 instruction loop runs up to 384 bytes (288 on AMD family
+  0x17, 199 on Intel's E-core parts), where crc-fast hands over to its
+  kernel at 257 on every CPU, and on AMD family 0x19 the
+  `x86_64-avx2-vpclmulqdq` tier's 256-bit fold takes buffers from 4 KiB
+  instead of the fusion kernel.
+- CRC-32/ISCSI buffers up to the plan's limit (256 bytes on the AVX-512
+  tiers) are checksummed with the CRC32 instruction over unaligned words,
+  by a direct call ahead of the fusion kernel; crc-fast aligns first, a
+  byte at a time, and so does this crate through 1.11.1.
 - The fusion kernel for CRC-32/ISCSI, and on aarch64 for CRC-32/ISO-HDLC,
   is chosen once per process and kept as a function pointer. crc-fast, and
   this crate through 1.11.1, ran feature detection on every checksum call:
@@ -289,7 +296,7 @@ own changelog up to the fork point continues below, unchanged.
 - New `checksum_zeros` and `checksum_zeros_with_params`: the CRC of `len`
   zero bytes in O(log len), without touching memory.
 
-## 1.11.2 - 2026-11-21
+## 1.11.2 - 2026-11-22
 
 - CRC-32/ISCSI is faster on x86 CPUs without AVX-512: the
   `x86_64-avx2-vpclmulqdq`, `x86_64-sse-pclmulqdq` and `x86-sse-pclmulqdq`
@@ -325,21 +332,87 @@ own changelog up to the fork point continues below, unchanged.
   23.0. From 4 MiB to 128 MiB the two releases run the same kernel and
   measured within 1%. CRC-32/ISO-HDLC and CRC-64/NVME, which do not use this
   kernel, measured the same in both releases, and the same held with the
-  tier pinned to `x86_64-sse-pclmulqdq`. Those figures are from a build in
-  which the kernel took over at 200 bytes; it now takes over at 257 (below),
-  and 200 to 256 bytes run the CRC32 instruction loop, as in 1.11.1, which
-  was not timed again on this CPU.
+  tier pinned to `x86_64-sse-pclmulqdq`. Those figures are from the SSE
+  build of the kernel taking over at 200 bytes. This release runs the
+  kernel's AVX2 build and the per-CPU plan below, neither of which was
+  timed on this CPU; the plan keeps the 200-byte handover for it.
+- Below AVX-512 the kernels are built twice, once for SSE4.2 and once with
+  AVX2 enabled as well, and an x86_64 CPU with AVX2 runs the second. The
+  instructions are the same 128-bit ones; with AVX2 enabled they take the
+  VEX encoding, three operands and no register copies. Against the SSE
+  build, median of interleaved rounds on EC2: an EPYC 7R13 (Zen 3) 4% to
+  27% faster, an EPYC 7R32 (Zen 2) 2% to 14% from 512 bytes and 27% to 36%
+  from 4 MiB, a Xeon E5-2666 v3 (Haswell) 12% to 27% from 257 bytes to
+  1 KiB, and a Xeon Platinum 8375C pinned to `x86_64-avx2-vpclmulqdq` 0% to
+  5%. Built from fast-crc32's own generated C (commit `13f5289`), the same
+  shapes give the same checksums; with AVX2 flags clang's build of them
+  ran as fast as this crate's, and gcc's up to 1.40x faster on the EPYC
+  7R13 from 1 MiB.
+- Below AVX-512, CRC-32/ISCSI follows a plan chosen once per process from
+  the CPU's vendor, family and model, measured on each CPU it names:
+  - the CRC32 instruction loop runs up to 384 bytes: against the kernel's
+    AVX2 build it was faster through 320 bytes on the EPYC 7R13 and the
+    8375C and level at 384, and on the Haswell part faster through 320
+    bytes from an aligned start and 384 from an unaligned one;
+  - up to 288 bytes on AMD family 0x17 (Zen to Zen 2), through which the
+    loop was faster on the 7R32;
+  - up to 199 bytes on Intel's E-core parts (family 6, models 0xaf Sierra
+    Forest, 0xb6 Grand Ridge, 0xdd Clearwater Forest and 0xbe Alder
+    Lake-N), where the Xeon 6731E's kernel won from 200;
+  - on AMD family 0x19 (Zen 3, and Zen 4 pinned below AVX-512) on the
+    `x86_64-avx2-vpclmulqdq` tier, buffers from 4 KiB go to that tier's
+    256-bit fold instead of the fusion kernel: on the 7R13 it was 1.05x
+    at 4 KiB to 1.14x from 1 MiB faster than the fusion kernel's AVX2
+    build. On the 8375C, the 7R32 and the Haswell part the fold ran at
+    about 0.6x the fusion kernel's speed, so they keep the kernel;
+  - on Alder Lake's hybrid parts (Intel family 6, models 0x97 and 0x9a)
+    the AVX2 build hands over to `v4s3x3` from 128 KiB instead of 3 MiB,
+    and the loop keeps 384 bytes. Measured on a Core i5-1240P, P-core and
+    E-core apart, in nanoseconds: on the P-cores the four-stream kernel
+    was 1% to 2% behind 1.11.1's `v4s3x3` from 256 KiB to 2 MiB, and a
+    200-byte handover up to 12% behind the loop from 200 to 256 bytes; on
+    the E-cores the kernel overtook the loop at 200 bytes and the
+    four-stream shape was 4% to 10% ahead. The fold was 1.02x to 1.07x
+    on the P-cores from 64 KiB to 4 MiB but about 0.75x from 8 MiB and
+    about 0.6x on the E-cores, so Alder Lake keeps the kernel. Against
+    1.11.1, median of nine or fifteen interleaved rounds: P-cores 1.38x at
+    64 bytes (3.15x unaligned), 2.0x to 2.6x from 257 bytes to 1 KiB,
+    1.40x at 4 KiB, 1.04x at 64 KiB and 1.00x to 1.02x from 128 KiB to
+    32 MiB; E-cores 1.26x to 3.0x up to 4 KiB, 1.18x to 1.30x from 64 KiB
+    to 2 MiB and 1.03x to 1.16x from 3 MiB.
 
-  On an EPYC 7R13 (Zen 3, a c6a.xlarge on EC2, which also selects
-  `x86_64-avx2-vpclmulqdq`), nanoseconds per call, median of nine
-  interleaved rounds, checksums compared first and the test suite run on
-  it: 64 bytes 7.50 to 6.11 (11.96 to 6.11 unaligned), 256 bytes 18.33 to
-  17.50, 257 bytes 37.59 to 24.75, 4 KiB 253 to 196, 1 MiB 1.05x, and the
-  same from 4 MiB up. None of 22 lengths from 1 to 512 bytes, aligned or
-  unaligned, was slower. Alder Lake through Arrow Lake and the other x86
-  CPUs with SSE4.2 and PCLMULQDQ but no AVX-512 were not measured. The
-  AVX-512 tiers and aarch64 keep their kernels and still compute their
-  shifts per buffer.
+  Measured on EC2 spot instances against 1.11.1, nanoseconds per call,
+  median of nine interleaved rounds pinned to one core, from an aligned
+  start unless marked. Checksums of CRC-32/ISCSI, the fold with the same
+  parameters, CRC-32/ISO-HDLC and CRC-64/NVME matched 1.11.1 first, over
+  every length from 0 to 1,100 bytes and larger ones around 4 KiB and
+  3 MiB, aligned and unaligned, with the tier pinned to each target string
+  in turn; the full test suite passed on each CPU, natively and pinned to
+  `x86-sse-pclmulqdq`:
+
+  | bytes | 7R13 1.11.1 | 7R13 1.11.2 | 7R32 1.11.1 | 7R32 1.11.2 | E5-2666 v3 1.11.1 | E5-2666 v3 1.11.2 |
+  |---:|---:|---:|---:|---:|---:|---:|
+  | 64 | 6.4 | 4.7 | 7.9 | 5.2 | 8.7 | 5.9 |
+  | 64, unaligned | 10.6 | 4.7 | 12.8 | 5.2 | 14.5 | 5.8 |
+  | 256 | 18.6 | 16.2 | 25.1 | 22.1 | 17.4 | 13.6 |
+  | 257 | 37.3 | 16.4 | 43.4 | 22.1 | 42.0 | 13.7 |
+  | 384 | 47.4 | 28.9 | 61.1 | 32.7 | 51.8 | 22.8 |
+  | 1024 | 87.3 | 53.4 | 105.2 | 58.5 | 77.6 | 36.2 |
+  | 4096 | 252.9 | 159.9 | 276.8 | 182.1 | 167.1 | 101.6 |
+  | 1048576 | 51664 | 38495 | 51892 | 43091 | 24946 | 24620 |
+  | 4194304 | 206486 | 153751 | 208078 | 152591 | 157265 | 157143 |
+
+  The 7R13 selects `x86_64-avx2-vpclmulqdq`, the other two
+  `x86-sse-pclmulqdq`. Of the 21 lengths from 16 bytes to 4 MiB, aligned
+  and from a start 3 bytes in, none was slower on any of the three; the
+  closest were 1 MiB and 4 MiB on the Haswell part, 1.00x to 1.01x, where
+  the same kernel runs, and 200 bytes on the 7R32, 1.10x. The 8375C pinned to `x86_64-avx2-vpclmulqdq` was 1.15x to 3.37x
+  faster up to 1 KiB and 1.00x to 1.03x from 1 MiB. CRC-32/ISO-HDLC and
+  CRC-64/NVME, which share none of this code, measured 0.95x to 1.08x
+  across the same runs. Sierra Forest and the other E-core parts, Zen 4
+  and Zen 5 without AVX-512, Alder Lake through Arrow Lake and Hygon were
+  not measured with this build. The AVX-512 tiers and aarch64 keep their
+  kernels and still compute their shifts per buffer.
 - The SSE kernel itself is now the `v4x2s4x4` shape of
   [fast-crc32](https://github.com/corsix/fast-crc32/): two 64-byte vector
   steps beside four CRC32 instruction streams, in place of `v4s3x3`. On the
@@ -348,17 +421,17 @@ own changelog up to the fork point continues below, unchanged.
   ones (keys 16 and 15, 20 and 19, 2 and 1), its halves are sized in
   32-byte units so no more than 31 bytes of a pass fall to the CRC32
   instruction alone, and it takes over from the plain CRC32 instruction
-  loop at 257 bytes, as `v4s3x3` did. On the Xeon 6731E it overtook the
-  loop at 200 bytes, but on the EPYC 7R13 a build that took over there was
-  up to 1.5x slower than 1.11.1 from 200 to 256 bytes (200 bytes 14.72 to
-  22.56 ns).
+  loop where the plan above says. On the Xeon 6731E it overtook the loop
+  at 200 bytes, but on the EPYC 7R13 a build that took over there was up
+  to 1.5x slower than 1.11.1 from 200 to 256 bytes (200 bytes 14.72 to
+  22.56 ns), which is why the handover is per CPU.
 - `v4s3x3` stays for buffers over 3 MiB. `v4x2s4x4` reads five places in a
   buffer at once, and on the Xeon 6731E, whose cores share 4 MiB of L2
   cache, it was 2% behind `v4s3x3` at 4 MiB and 12% to 15% behind from
   8 MiB to 128 MiB, whatever the pass size; software prefetch recovered
   part of that and cost the lengths that fit in the cache.
-- CRC-32/ISCSI buffers up to 256 bytes no longer align before the CRC32
-  instruction loop. The loop takes unaligned 8-byte words from the start
+- CRC-32/ISCSI buffers up to the plan's limit, and up to 256 bytes on the
+  AVX-512 tiers, no longer align before the CRC32 instruction loop. The loop takes unaligned 8-byte words from the start
   of the buffer and finishes with at most one each of four, two and one
   bytes, where it took up to seven single bytes at each end. On the Xeon
   6731E 64 bytes takes 18.5 cycles from any start; 1.11.1 took 22.4 to
@@ -393,7 +466,14 @@ own changelog up to the fork point continues below, unchanged.
   call stop at 199 bytes. With it at 256 the 8375C was timed again, and
   200 to 256 bytes ran 1.16x to 1.27x faster than 1.11.1 (256 bytes 12.79
   to 10.09 ns, 19.00 to 10.11 unaligned), with no length from 1 to 512
-  bytes slower; the 8124M was not timed again.
+  bytes slower; the 8124M was not timed again. With the final source the
+  8375C and a c5.large (Xeon Platinum 8275CL, Cascade Lake,
+  `x86_64-avx512-pclmulqdq`) were timed once more over 21 lengths from
+  16 bytes to 4 MiB, aligned and unaligned, with the checks and suite
+  above: 64 bytes 5.8 to 4.0 and 7.2 to 5.8 ns (12.9 to 4.0 and 13.7 to
+  5.8 unaligned), 256 bytes 12.6 to 9.5 and 17.3 to 13.6, and 1.00x to
+  1.21x from 257 bytes up; the closest, 512 bytes unaligned on the 8375C,
+  was 0.99x.
 - The fusion kernel is chosen once per process, from the tier and the CRC32
   instructions, and kept as a function pointer; a checksum call loads the
   pointer and calls it. Before, every CRC-32/ISCSI call on x86 and every

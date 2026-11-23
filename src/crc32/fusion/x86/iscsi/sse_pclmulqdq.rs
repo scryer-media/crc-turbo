@@ -162,172 +162,196 @@ unsafe fn scalar_round(crc: &mut [u32; SCALAR_STREAMS], data: *const u8, klen: u
     crc[3] = mm_crc32_u64(crc[3], *(data.add(klen * 3) as *const u64));
 }
 
-/// CRC-32/ISCSI over `len` bytes at `buf`, continuing from `crc0`.
-///
-/// The aligned buffer is laid out as a vector part, four scalar streams of equal length and a
-/// last 8-byte word. The vector part folds through four 128-bit accumulators while the CRC32
-/// instruction runs down the four streams; the main loop pairs two vector steps (128 bytes) with
-/// four scalar rounds (128 bytes), the `v4x2s4x4` shape. The five partial CRCs are then shifted
-/// to the end of the streams and folded into that last word.
-///
-/// The two parts are sized in 32-byte units rather than whole 256-byte loop iterations, about
-/// half the bytes to each, and what the main loop leaves of either is finished on its own. So
-/// all but the last 31 bytes of a pass take the fused path, where a fixed block would leave up
-/// to 255 of them to the CRC32 instruction alone.
-///
-/// The shift multipliers come from tables built at compile time, never from repeated squaring
-/// at run time. On a Xeon 6731E (Sierra Forest) that squaring cost about 90 cycles for a
-/// 264-byte buffer and about 270 for a 4 KiB one, as much as the checksum itself. The exact
-/// table reaches passes of `MAX_UNITS` units (32 KiB); a longer buffer is taken in passes of
-/// that size doubled as often as fits, largest first, so a megabyte is one pass and no length
-/// needs more than a few.
-///
-/// # Safety
-///
-/// `buf` must be valid for reads of `len` bytes, and the CPU must have SSE4.2 and PCLMULQDQ.
-// Out of line: inlined into its entry point, the registers it saves are saved for the short
-// buffers that return before reaching it
-#[inline(never)]
-#[target_feature(enable = "sse4.2,pclmulqdq")]
-pub unsafe fn crc32_iscsi_sse_v4x2s4x4(mut crc0: u32, mut buf: *const u8, mut len: usize) -> u32 {
-    // Align to an 8-byte boundary with the CRC32 instruction
-    while len > 0 && (buf as usize & 7) != 0 {
-        crc0 = _mm_crc32_u8(crc0, *buf);
-        buf = buf.add(1);
-        len -= 1;
-    }
-
-    while len >= FUSION_MIN + 8 {
-        // On to a 16-byte boundary
-        if (buf as usize & 8) != 0 {
-            crc0 = mm_crc32_u64(crc0, *(buf as *const u64));
-            buf = buf.add(8);
-            len -= 8;
-        }
-
-        // In 32-byte units: a vector step is two, a scalar round is one. A pass takes all of a
-        // buffer the exact table reaches; of a longer one it takes the largest doubling of that.
-        let mut units = (len - 8) / SCALAR_ROUND;
-        let long_pass = if units > MAX_UNITS {
-            let mut e = (units / MAX_UNITS).ilog2() as usize;
-            if e >= LONG_PASSES {
-                e = LONG_PASSES - 1;
+/// Defines the kernel under the given name and attributes, so the same code is compiled once for
+/// SSE4.2 and PCLMULQDQ and once more for AVX2, where the VEX encoding saves a register copy
+/// before most vector instructions.
+macro_rules! v4x2s4x4 {
+    ($(#[$attr:meta])* $name:ident) => {
+        $(#[$attr])*
+        // Out of line: inlined into its entry point, the registers it saves are saved for the short
+        // buffers that return before reaching it
+        #[inline(never)]
+        pub unsafe fn $name(mut crc0: u32, mut buf: *const u8, mut len: usize) -> u32 {
+            // Align to an 8-byte boundary with the CRC32 instruction
+            while len > 0 && (buf as usize & 7) != 0 {
+                crc0 = _mm_crc32_u8(crc0, *buf);
+                buf = buf.add(1);
+                len -= 1;
             }
-            units = MAX_UNITS << e;
-            Some(e)
-        } else {
-            None
-        };
-        let vector_steps = (units + 2) / 4;
-        let scalar_rounds = units - vector_steps * 2;
-        let vector_len = vector_steps * VECTOR_STEP;
-        let klen = scalar_rounds * 8;
 
-        // What each partial CRC is multiplied by to move it to the end of the streams
-        let [shift_2, shift_1, shift_0, shift_vector] = match long_pass {
-            Some(e) => LONG_SHIFTS[e],
-            None => [
-                SHIFTS[scalar_rounds],
-                SHIFTS[scalar_rounds * 2],
-                SHIFTS[scalar_rounds * 3],
-                SHIFTS[scalar_rounds * 4],
-            ],
-        };
+            while len >= FUSION_MIN + 8 {
+                // On to a 16-byte boundary
+                if (buf as usize & 8) != 0 {
+                    crc0 = mm_crc32_u64(crc0, *(buf as *const u64));
+                    buf = buf.add(8);
+                    len -= 8;
+                }
 
-        let mut vector = buf;
-        let mut scalar = buf.add(vector_len);
+                // In 32-byte units: a vector step is two, a scalar round is one. A pass takes all of a
+                // buffer the exact table reaches; of a longer one it takes the largest doubling of that.
+                let mut units = (len - 8) / SCALAR_ROUND;
+                let long_pass = if units > MAX_UNITS {
+                    let mut e = (units / MAX_UNITS).ilog2() as usize;
+                    if e >= LONG_PASSES {
+                        e = LONG_PASSES - 1;
+                    }
+                    units = MAX_UNITS << e;
+                    Some(e)
+                } else {
+                    None
+                };
+                let vector_steps = (units + 2) / 4;
+                let scalar_rounds = units - vector_steps * 2;
+                let vector_len = vector_steps * VECTOR_STEP;
+                let klen = scalar_rounds * 8;
 
-        // The first 64 bytes seed the accumulators, with the incoming CRC in the low 32 bits
-        let mut x = [
-            _mm_xor_si128(
-                _mm_cvtsi32_si128(crc0 as i32),
-                _mm_loadu_si128(vector as *const __m128i),
-            ),
-            _mm_loadu_si128(vector.add(16) as *const __m128i),
-            _mm_loadu_si128(vector.add(32) as *const __m128i),
-            _mm_loadu_si128(vector.add(48) as *const __m128i),
-        ];
-        vector = vector.add(VECTOR_STEP);
+                // What each partial CRC is multiplied by to move it to the end of the streams
+                let [shift_2, shift_1, shift_0, shift_vector] = match long_pass {
+                    Some(e) => LONG_SHIFTS[e],
+                    None => [
+                        SHIFTS[scalar_rounds],
+                        SHIFTS[scalar_rounds * 2],
+                        SHIFTS[scalar_rounds * 3],
+                        SHIFTS[scalar_rounds * 4],
+                    ],
+                };
 
-        // The scalar streams start from zero: the incoming CRC went into the vector part
-        let mut crc = [0u32; SCALAR_STREAMS];
+                let mut vector = buf;
+                let mut scalar = buf.add(vector_len);
 
-        let k = fold_keys(16, 15);
-        let mut vector_left = vector_steps - 1;
-        let mut scalar_left = scalar_rounds;
+                // The first 64 bytes seed the accumulators, with the incoming CRC in the low 32 bits
+                let mut x = [
+                    _mm_xor_si128(
+                        _mm_cvtsi32_si128(crc0 as i32),
+                        _mm_loadu_si128(vector as *const __m128i),
+                    ),
+                    _mm_loadu_si128(vector.add(16) as *const __m128i),
+                    _mm_loadu_si128(vector.add(32) as *const __m128i),
+                    _mm_loadu_si128(vector.add(48) as *const __m128i),
+                ];
+                vector = vector.add(VECTOR_STEP);
 
-        // The main loop: two vector steps beside four scalar rounds
-        while vector_left >= 2 && scalar_left >= 4 {
-            vector_step(&mut x, k, vector);
-            vector_step(&mut x, k, vector.add(VECTOR_STEP));
-            scalar_round(&mut crc, scalar, klen);
-            scalar_round(&mut crc, scalar.add(8), klen);
-            scalar_round(&mut crc, scalar.add(16), klen);
-            scalar_round(&mut crc, scalar.add(24), klen);
+                // The scalar streams start from zero: the incoming CRC went into the vector part
+                let mut crc = [0u32; SCALAR_STREAMS];
 
-            vector = vector.add(VECTOR_STEP * 2);
-            scalar = scalar.add(32);
-            vector_left -= 2;
-            scalar_left -= 4;
+                let k = fold_keys(16, 15);
+                let mut vector_left = vector_steps - 1;
+                let mut scalar_left = scalar_rounds;
+
+                // The main loop: two vector steps beside four scalar rounds
+                while vector_left >= 2 && scalar_left >= 4 {
+                    vector_step(&mut x, k, vector);
+                    vector_step(&mut x, k, vector.add(VECTOR_STEP));
+                    scalar_round(&mut crc, scalar, klen);
+                    scalar_round(&mut crc, scalar.add(8), klen);
+                    scalar_round(&mut crc, scalar.add(16), klen);
+                    scalar_round(&mut crc, scalar.add(24), klen);
+
+                    vector = vector.add(VECTOR_STEP * 2);
+                    scalar = scalar.add(32);
+                    vector_left -= 2;
+                    scalar_left -= 4;
+                }
+
+                // What the main loop left of each part
+                while vector_left > 0 {
+                    vector_step(&mut x, k, vector);
+                    vector = vector.add(VECTOR_STEP);
+                    vector_left -= 1;
+                }
+                while scalar_left > 0 {
+                    scalar_round(&mut crc, scalar, klen);
+                    scalar = scalar.add(8);
+                    scalar_left -= 1;
+                }
+
+                // Reduce the four accumulators to one: 16 bytes forward twice, then 32 bytes
+                let k = fold_keys(2, 1);
+                let x01 = fold_onto(x[0], k, x[1]);
+                let x23 = fold_onto(x[2], k, x[3]);
+                let x0 = fold_onto(x01, fold_keys(20, 19), x23);
+
+                // And that one to 32 bits
+                let vector_crc = mm_crc32_u64(
+                    mm_crc32_u64(0, mm_extract_epi64(x0, 0)),
+                    mm_extract_epi64(x0, 1),
+                );
+
+                // Shift the vector part and the first three streams to the end of the fourth, and fold
+                // them into the word that follows it
+                let shifted = _mm_xor_si128(
+                    _mm_xor_si128(
+                        clmul_scalar_sse(vector_crc, shift_vector),
+                        clmul_scalar_sse(crc[0], shift_0),
+                    ),
+                    _mm_xor_si128(
+                        clmul_scalar_sse(crc[1], shift_1),
+                        clmul_scalar_sse(crc[2], shift_2),
+                    ),
+                );
+
+                let fused = vector_len + klen * SCALAR_STREAMS;
+                buf = buf.add(fused);
+                crc0 = mm_crc32_u64(crc[3], *(buf as *const u64) ^ mm_extract_epi64(shifted, 0));
+                buf = buf.add(8);
+                len -= fused + 8;
+            }
+
+            // The remaining whole words
+            while len >= 8 {
+                crc0 = mm_crc32_u64(crc0, *(buf as *const u64));
+                buf = buf.add(8);
+                len -= 8;
+            }
+
+            // And the remaining bytes
+            while len > 0 {
+                crc0 = _mm_crc32_u8(crc0, *buf);
+                buf = buf.add(1);
+                len -= 1;
+            }
+
+            crc0
         }
-
-        // What the main loop left of each part
-        while vector_left > 0 {
-            vector_step(&mut x, k, vector);
-            vector = vector.add(VECTOR_STEP);
-            vector_left -= 1;
-        }
-        while scalar_left > 0 {
-            scalar_round(&mut crc, scalar, klen);
-            scalar = scalar.add(8);
-            scalar_left -= 1;
-        }
-
-        // Reduce the four accumulators to one: 16 bytes forward twice, then 32 bytes
-        let k = fold_keys(2, 1);
-        let x01 = fold_onto(x[0], k, x[1]);
-        let x23 = fold_onto(x[2], k, x[3]);
-        let x0 = fold_onto(x01, fold_keys(20, 19), x23);
-
-        // And that one to 32 bits
-        let vector_crc = mm_crc32_u64(
-            mm_crc32_u64(0, mm_extract_epi64(x0, 0)),
-            mm_extract_epi64(x0, 1),
-        );
-
-        // Shift the vector part and the first three streams to the end of the fourth, and fold
-        // them into the word that follows it
-        let shifted = _mm_xor_si128(
-            _mm_xor_si128(
-                clmul_scalar_sse(vector_crc, shift_vector),
-                clmul_scalar_sse(crc[0], shift_0),
-            ),
-            _mm_xor_si128(
-                clmul_scalar_sse(crc[1], shift_1),
-                clmul_scalar_sse(crc[2], shift_2),
-            ),
-        );
-
-        let fused = vector_len + klen * SCALAR_STREAMS;
-        buf = buf.add(fused);
-        crc0 = mm_crc32_u64(crc[3], *(buf as *const u64) ^ mm_extract_epi64(shifted, 0));
-        buf = buf.add(8);
-        len -= fused + 8;
-    }
-
-    // The remaining whole words
-    while len >= 8 {
-        crc0 = mm_crc32_u64(crc0, *(buf as *const u64));
-        buf = buf.add(8);
-        len -= 8;
-    }
-
-    // And the remaining bytes
-    while len > 0 {
-        crc0 = _mm_crc32_u8(crc0, *buf);
-        buf = buf.add(1);
-        len -= 1;
-    }
-
-    crc0
+    };
 }
+
+v4x2s4x4!(
+    /// CRC-32/ISCSI over `len` bytes at `buf`, continuing from `crc0`.
+    ///
+    /// The aligned buffer is laid out as a vector part, four scalar streams of equal length and a
+    /// last 8-byte word. The vector part folds through four 128-bit accumulators while the CRC32
+    /// instruction runs down the four streams; the main loop pairs two vector steps (128 bytes) with
+    /// four scalar rounds (128 bytes), the `v4x2s4x4` shape. The five partial CRCs are then shifted
+    /// to the end of the streams and folded into that last word.
+    ///
+    /// The two parts are sized in 32-byte units rather than whole 256-byte loop iterations, about
+    /// half the bytes to each, and what the main loop leaves of either is finished on its own. So
+    /// all but the last 31 bytes of a pass take the fused path, where a fixed block would leave up
+    /// to 255 of them to the CRC32 instruction alone.
+    ///
+    /// The shift multipliers come from tables built at compile time, never from repeated squaring
+    /// at run time. On a Xeon 6731E (Sierra Forest) that squaring cost about 90 cycles for a
+    /// 264-byte buffer and about 270 for a 4 KiB one, as much as the checksum itself. The exact
+    /// table reaches passes of `MAX_UNITS` units (32 KiB); a longer buffer is taken in passes of
+    /// that size doubled as often as fits, largest first, so a megabyte is one pass and no length
+    /// needs more than a few.
+    ///
+    /// # Safety
+    ///
+    /// `buf` must be valid for reads of `len` bytes, and the CPU must have SSE4.2 and PCLMULQDQ.
+    #[target_feature(enable = "sse4.2,pclmulqdq")]
+    crc32_iscsi_sse_v4x2s4x4
+);
+
+v4x2s4x4!(
+    /// [`crc32_iscsi_sse_v4x2s4x4`] for CPUs with AVX2.
+    ///
+    /// # Safety
+    ///
+    /// `buf` must be valid for reads of `len` bytes, and the CPU must have AVX2, SSE4.2 and
+    /// PCLMULQDQ.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,sse4.2,pclmulqdq")]
+    crc32_iscsi_avx2_v4x2s4x4
+);
