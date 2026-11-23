@@ -110,14 +110,24 @@ aarch64_tier!(
 /// every 16-byte step branched on it and rebuilt its key pair.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 macro_rules! x86_by_order {
-    ($state:expr, $bytes:expr, $params:expr, $ops:expr) => {{
+    ($state:expr, $bytes:expr, $params:expr, $ops:expr, $head:literal) => {{
         let (state, bytes, params, ops) = ($state, $bytes, $params, $ops);
         macro_rules! by_width {
             () => {
                 match params.width {
-                    64 => algorithm::update::<_, Width64>(state, bytes, params, &ops),
-                    32 => algorithm::update::<_, Width32>(state as u32, bytes, params, &ops) as u64,
-                    16 => algorithm::update::<_, Width16>(state as u16, bytes, params, &ops) as u64,
+                    64 => algorithm::update_with::<_, Width64, $head>(state, bytes, params, &ops),
+                    32 => algorithm::update_with::<_, Width32, $head>(
+                        state as u32,
+                        bytes,
+                        params,
+                        &ops,
+                    ) as u64,
+                    16 => algorithm::update_with::<_, Width16, $head>(
+                        state as u16,
+                        bytes,
+                        params,
+                        &ops,
+                    ) as u64,
                     _ => panic!("Unsupported CRC width: {}", params.width),
                 }
             };
@@ -168,12 +178,17 @@ const MID_END: usize = 4096;
 /// entry point, longer ones through an out-of-line fold with the tier's features, each bit
 /// order compiled apart. With the folds inlined into the entry point, every call saved six
 /// general registers and set up a 280-byte frame before looking at the length.
+///
+/// `$short_features` are the entry's, `$features` the folds'; `$head` takes long buffers to a
+/// 64-byte boundary first (`algorithm::update_with`), and `$opaque_keys` has CRC-32/ISO-HDLC
+/// from 128 bytes load its keys (`algorithm::update_mid`).
 macro_rules! x86_tier {
     ($(#[$cfg:meta])* $update:ident, $fold:ident, $iso_hdlc:ident, $iso_hdlc_mid:ident,
-     $iso_hdlc_fold:ident, $features:literal, $ops:ty) => {
+     $iso_hdlc_fold:ident, $short_features:literal, $features:literal, $head:literal,
+     $opaque_keys:literal, $ops:ty) => {
         $(#[$cfg])*
         #[inline]
-        #[target_feature(enable = $features)]
+        #[target_feature(enable = $short_features)]
         unsafe fn $update(state: u64, bytes: &[u8], params: &CrcParams, ops: $ops) -> u64 {
             if bytes.len() >= 128 {
                 return $fold(state, bytes, params, ops);
@@ -194,7 +209,7 @@ macro_rules! x86_tier {
         #[inline(never)]
         #[target_feature(enable = $features)]
         unsafe fn $fold(state: u64, bytes: &[u8], params: &CrcParams, ops: $ops) -> u64 {
-            x86_by_order!(state, bytes, params, ops)
+            x86_by_order!(state, bytes, params, ops, $head)
         }
 
         /// CRC-32/ISO-HDLC with its parameters a constant, so that the width, the bit order
@@ -202,7 +217,7 @@ macro_rules! x86_tier {
         /// coefficient is one load rather than two moves into the vector unit and a pack.
         $(#[$cfg])*
         #[inline]
-        #[target_feature(enable = $features)]
+        #[target_feature(enable = $short_features)]
         unsafe fn $iso_hdlc(state: u32, bytes: &[u8], ops: $ops) -> u32 {
             if bytes.len() >= 128 {
                 if bytes.len() >= MID_END {
@@ -224,7 +239,7 @@ macro_rules! x86_tier {
         #[inline(never)]
         #[target_feature(enable = $features)]
         unsafe fn $iso_hdlc_mid(state: u32, bytes: &[u8], ops: $ops) -> u32 {
-            algorithm::update_mid::<_, Width32>(
+            algorithm::update_mid::<_, Width32, $opaque_keys>(
                 state,
                 bytes,
                 &crate::crc32::consts::CRC32_ISO_HDLC,
@@ -236,7 +251,7 @@ macro_rules! x86_tier {
         #[inline(never)]
         #[target_feature(enable = $features)]
         unsafe fn $iso_hdlc_fold(state: u32, bytes: &[u8], ops: $ops) -> u32 {
-            algorithm::update::<_, Width32>(
+            algorithm::update_with::<_, Width32, $head>(
                 state,
                 bytes,
                 &crate::crc32::consts::CRC32_ISO_HDLC,
@@ -290,6 +305,9 @@ x86_tier!(
     iso_hdlc_mid_x86_sse_pclmulqdq,
     iso_hdlc_fold_x86_sse_pclmulqdq,
     "sse4.1,pclmulqdq",
+    "sse4.1,pclmulqdq",
+    false,
+    true,
     crate::arch::x86::sse::X86SsePclmulqdqOps
 );
 x86_tier!(
@@ -299,7 +317,10 @@ x86_tier!(
     iso_hdlc_x86_64_avx512_pclmulqdq,
     iso_hdlc_mid_x86_64_avx512_pclmulqdq,
     iso_hdlc_fold_x86_64_avx512_pclmulqdq,
-    "avx512vl,avx512bw,pclmulqdq",
+    "avx512vl,pclmulqdq",
+    "avx512vl,pclmulqdq",
+    false,
+    true,
     crate::arch::x86_64::avx512::X86_64Avx512PclmulqdqOps
 );
 x86_tier!(
@@ -309,7 +330,10 @@ x86_tier!(
     iso_hdlc_x86_64_avx512_vpclmulqdq,
     iso_hdlc_mid_x86_64_avx512_vpclmulqdq,
     iso_hdlc_fold_x86_64_avx512_vpclmulqdq,
+    "avx512vl,vpclmulqdq",
     "avx512vl,avx512bw,vpclmulqdq",
+    true,
+    false,
     crate::arch::x86_64::avx512_vpclmulqdq::X86_64Avx512VpclmulqdqOps
 );
 x86_tier!(
@@ -320,6 +344,9 @@ x86_tier!(
     iso_hdlc_mid_x86_64_avx2_vpclmulqdq,
     iso_hdlc_fold_x86_64_avx2_vpclmulqdq,
     "avx2,vpclmulqdq,sse4.1,pclmulqdq",
+    "avx2,vpclmulqdq,sse4.1,pclmulqdq",
+    false,
+    false,
     crate::arch::x86_64::avx2_vpclmulqdq::X86_64Avx2VpclmulqdqOps
 );
 
