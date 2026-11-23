@@ -355,3 +355,144 @@ v4x2s4x4!(
     #[target_feature(enable = "avx2,sse4.2,pclmulqdq")]
     crc32_iscsi_avx2_v4x2s4x4
 );
+
+/// Defines the vector-only kernel under the given name and attributes.
+macro_rules! v4 {
+    ($(#[$attr:meta])* $name:ident) => {
+        $(#[$attr])*
+        #[inline(never)]
+        pub unsafe fn $name(crc0: u32, buf: *const u8, len: usize) -> u32 {
+            if len < VECTOR_STEP {
+                return crc32_iscsi_small_unaligned(crc0, core::slice::from_raw_parts(buf, len));
+            }
+
+            // The first 64 bytes seed the accumulators, with the incoming CRC in the low 32 bits
+            let mut x = [
+                _mm_xor_si128(
+                    _mm_cvtsi32_si128(crc0 as i32),
+                    _mm_loadu_si128(buf as *const __m128i),
+                ),
+                _mm_loadu_si128(buf.add(16) as *const __m128i),
+                _mm_loadu_si128(buf.add(32) as *const __m128i),
+                _mm_loadu_si128(buf.add(48) as *const __m128i),
+            ];
+            let mut vector = buf.add(VECTOR_STEP);
+            let mut left = len - VECTOR_STEP;
+
+            let k = fold_keys(16, 15);
+            while left >= VECTOR_STEP {
+                vector_step(&mut x, k, vector);
+                vector = vector.add(VECTOR_STEP);
+                left -= VECTOR_STEP;
+            }
+
+            // Reduce the four accumulators to one: 16 bytes forward twice, then 32 bytes
+            let k = fold_keys(2, 1);
+            let x01 = fold_onto(x[0], k, x[1]);
+            let x23 = fold_onto(x[2], k, x[3]);
+            let x0 = fold_onto(x01, fold_keys(20, 19), x23);
+
+            // And that one to 32 bits, then what is left with the CRC32 instruction
+            let crc = mm_crc32_u64(
+                mm_crc32_u64(0, mm_extract_epi64(x0, 0)),
+                mm_extract_epi64(x0, 1),
+            );
+
+            crc32_iscsi_small_unaligned(crc, core::slice::from_raw_parts(vector, left))
+        }
+    };
+}
+
+v4!(
+    /// CRC-32/ISCSI over `len` bytes at `buf`, continuing from `crc0`, by carry-less folds alone:
+    /// four 128-bit accumulators over the 64-byte steps from where the buffer starts, reduced to
+    /// 32 bits, and the CRC32 instruction over the last 63 bytes or fewer. With no CRC32 streams
+    /// to shift back together it has the least set-up of the kernels, for the lengths just past
+    /// where the CRC32 instruction alone falls behind, the fast-crc32 generator's `v4` shape.
+    ///
+    /// # Safety
+    ///
+    /// `buf` must be valid for reads of `len` bytes, and the CPU must have AVX2, SSE4.2 and
+    /// PCLMULQDQ.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,sse4.2,pclmulqdq")]
+    crc32_iscsi_avx2_v4
+);
+
+/// The shortest aligned length [`s3!`] splits into streams.
+#[cfg(target_arch = "x86_64")]
+const S3_MIN: usize = 3 * 8 * 4 + 8;
+
+/// Defines the CRC32-instruction-only kernel under the given name and attributes.
+macro_rules! s3 {
+    ($(#[$attr:meta])* $name:ident) => {
+        $(#[$attr])*
+        #[inline(never)]
+        pub unsafe fn $name(mut crc0: u32, mut buf: *const u8, mut len: usize) -> u32 {
+            // Align to an 8-byte boundary with the CRC32 instruction
+            while len > 0 && (buf as usize & 7) != 0 {
+                crc0 = _mm_crc32_u8(crc0, *buf);
+                buf = buf.add(1);
+                len -= 1;
+            }
+
+            while len >= S3_MIN {
+                // Three streams of `rounds` words each, then the word they are folded into. A
+                // pass takes all of a buffer the exact table reaches; of a longer one it takes the
+                // largest doubling of `MAX_SCALAR_ROUNDS` that fits.
+                let mut rounds = (len - 8) / 24;
+                let [shift_1, shift_0] = if rounds > 2 * MAX_SCALAR_ROUNDS {
+                    let mut e = (rounds / MAX_SCALAR_ROUNDS).ilog2() as usize;
+                    if e >= LONG_PASSES {
+                        e = LONG_PASSES - 1;
+                    }
+                    rounds = MAX_SCALAR_ROUNDS << e;
+                    [LONG_SHIFTS[e][0], LONG_SHIFTS[e][1]]
+                } else {
+                    [SHIFTS[rounds], SHIFTS[rounds * 2]]
+                };
+                let klen = rounds * 8;
+
+                let mut crc1 = 0u32;
+                let mut crc2 = 0u32;
+                let mut p = buf;
+                let end = buf.add(klen);
+                while p < end {
+                    crc0 = mm_crc32_u64(crc0, *(p as *const u64));
+                    crc1 = mm_crc32_u64(crc1, *(p.add(klen) as *const u64));
+                    crc2 = mm_crc32_u64(crc2, *(p.add(klen * 2) as *const u64));
+                    p = p.add(8);
+                }
+
+                // Shift the first two streams to the end of the third, and fold them into the
+                // word that follows it
+                let shifted = _mm_xor_si128(
+                    clmul_scalar_sse(crc0, shift_0),
+                    clmul_scalar_sse(crc1, shift_1),
+                );
+                buf = buf.add(klen * 3);
+                crc0 = mm_crc32_u64(crc2, *(buf as *const u64) ^ mm_extract_epi64(shifted, 0));
+                buf = buf.add(8);
+                len -= klen * 3 + 8;
+            }
+
+            crc32_iscsi_small_unaligned(crc0, core::slice::from_raw_parts(buf, len))
+        }
+    };
+}
+
+s3!(
+    /// CRC-32/ISCSI over `len` bytes at `buf`, continuing from `crc0`, by the CRC32 instruction
+    /// alone: the aligned buffer is laid out as three streams of equal length and a last 8-byte
+    /// word, the instruction runs down the three at once, and the first two partial CRCs are
+    /// shifted to the end of the third and folded into that word, the fast-crc32 generator's `s3`
+    /// shape. Where the CRC32 instruction issues once a cycle and the carry-less multiply is slow
+    /// beside it, three streams keep it busy and nothing else competes for the core.
+    ///
+    /// # Safety
+    ///
+    /// `buf` must be valid for reads of `len` bytes, and the CPU must have SSE4.2 and PCLMULQDQ.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,sse4.2,pclmulqdq")]
+    crc32_iscsi_avx2_s3
+);

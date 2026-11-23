@@ -173,15 +173,21 @@ own changelog up to the fork point continues below, unchanged.
   kernels for buffers from 2 KiB take theirs from tables too; the AVX-512
   fusion kernel still computes its shifts per buffer.
 - Below AVX-512, CRC-32/ISCSI follows a plan chosen per CPU model: the
-  plain CRC32 instruction loop runs up to 384 bytes (288 on AMD family
-  0x17, 199 on Intel's E-core parts), where crc-fast hands over to its
-  kernel at 257 on every CPU, and on AMD family 0x19 the
-  `x86_64-avx2-vpclmulqdq` tier's 256-bit fold takes buffers from 4 KiB
-  instead of the fusion kernel.
+  plain CRC32 instruction loop runs up to 384 bytes (320 on AMD family
+  0x19, 288 on family 0x17, 240 on Haswell, 199 on Intel's E-core parts),
+  where crc-fast hands over to its kernel at 257 on every CPU, and on AMD
+  family 0x19 the `x86_64-avx2-vpclmulqdq` tier's 256-bit fold takes
+  buffers from 4 KiB instead of the fusion kernel.
+- On Haswell, Zen 2, Zen 3, the AVX-512 PCLMULQDQ tier, Sapphire Rapids,
+  Ice Lake and Zen 4, a window of lengths past the CRC32 instruction's
+  limit takes a kernel of carry-less folds alone (fast-crc32's `v4`); on
+  Zen 2 buffers from 32 KiB take three CRC32 streams alone (fast-crc32's
+  `s3`). crc-fast has neither.
 - CRC-32/ISCSI buffers up to the plan's limit (256 bytes on the AVX-512
   tiers) are checksummed with the CRC32 instruction over unaligned words,
-  by a direct call ahead of the fusion kernel; crc-fast aligns first, a
-  byte at a time, and so does this crate through 1.11.0.
+  written as inline assembly inside the caller on x86_64, ahead of the
+  fusion kernel; crc-fast aligns first, a byte at a time, and so does this
+  crate through 1.11.0.
 - The fusion kernel for CRC-32/ISCSI, and on aarch64 for CRC-32/ISO-HDLC,
   is chosen once per process: on x86 kept as a function pointer, on aarch64
   as one byte ahead of direct calls. crc-fast, and this crate through
@@ -742,6 +748,62 @@ own changelog up to the fork point continues below, unchanged.
   on the M5 Max 4 KiB, 8 KiB and 128 KiB (0.94x to 0.96x), in both bit
   orders; those are not explained either.
 
+- On x86, CRC-32/ISCSI's short buffers are checksummed inside the caller.
+  The plan's direct limit is kept in a static the entry reads with one
+  relaxed load, and the CRC32 instruction over those buffers is written as
+  inline assembly: a `#[target_feature]` function cannot be inlined into a
+  caller built without SSE4.2, so the direct call above still cost a call,
+  and the entry around it saved four registers for the paths that make the
+  plan and fold. Those paths are now out of line, the kernel's call is
+  inline, and the entry is never `None` on x86. Miri and 32-bit x86 keep the
+  intrinsic loop.
+- Past the CRC32 instruction's limit, a kernel of carry-less folds alone,
+  fast-crc32's `v4` shape (four 128-bit accumulators, no CRC32 streams to
+  shift back together), takes a window of lengths on the CPUs where it
+  measured ahead of both the instruction and the plan's kernel, aligned and
+  three bytes off:
+
+  | CPU | CRC32 instruction through | `v4` through |
+  |---|---:|---:|
+  | Xeon E5-2666 v3 (Haswell) | 240 | 768 |
+  | Xeon Platinum 8124M (Skylake-SP) | 240 | 768 |
+  | EPYC 7R32 (Zen 2) | 288 | 447 |
+  | EPYC 7R13 (Zen 3), AVX2 build | 320 | 447 |
+  | Xeon Platinum 8488C (Sapphire Rapids) | 256 | 383; 447 off a 64-byte boundary |
+  | Xeon Platinum 8375C (Ice Lake) | 256 | 383; 447 off a 64-byte boundary |
+  | EPYC 9R14 (Zen 4) | 256 | 447 off a 64-byte boundary only |
+
+  On the AVX-512 VPCLMULQDQ tier the 512-bit kernel stays ahead from a
+  64-byte aligned start, where its loads do not split cache lines; from
+  any other start `v4` was 1.17x to 1.5x faster at 320 and 384 bytes.
+- On AMD family 0x17 (Zen 2), CRC-32/ISCSI from 32 KiB runs three CRC32
+  instruction streams alone, fast-crc32's `s3` shape, with the stream
+  shifts from the compile-time tables above. The EPYC 7R32 issues the CRC32
+  instruction once a cycle and its carry-less multiply is slow beside it;
+  the fused kernel was 0.94x to 0.98x of fast-crc32's `s3` there.
+  Against 1.11.0, CRC-32/ISCSI on the seven x86 CPUs above, aligned and
+  three bytes off, in two batches of seven interleaved rounds each:
+
+  | CPU | 16 to 256 bytes | 512 bytes to 1 MiB |
+  |---|---:|---:|
+  | Xeon E5-2666 v3 (Haswell) | 1.45x to 3.29x | 1.01x to 2.79x |
+  | Xeon Platinum 8124M (Skylake-SP) | 1.46x to 3.16x | 0.97x to 2.67x |
+  | EPYC 7R32 (Zen 2) | 1.25x to 3.53x | 1.29x to 1.92x |
+  | EPYC 7R13 (Zen 3) | 1.25x to 3.13x | 1.34x to 1.80x |
+  | Xeon Platinum 8375C (Ice Lake) | 1.44x to 4.91x | 1.05x to 1.44x |
+  | Xeon Platinum 8488C (Sapphire Rapids) | 1.25x to 4.67x | 0.88x to 1.41x |
+  | EPYC 9R14 (Zen 4) | 1.32x to 3.73x | 1.00x to 1.19x |
+
+  No cell was below 0.99x in both batches. The lows came in one batch
+  each: Sapphire Rapids three bytes off a boundary at 8 KiB to 32 KiB
+  (0.88x to 0.97x, 1.00x and above in the other batch, where fast-crc32's
+  AVX-512 kernels in the same binary moved as much), and Skylake-SP at
+  1 MiB three bytes off (0.97x). Below 0.99x of fast-crc32's best kernel
+  in both batches remain 16 to 48 bytes aligned on Haswell and Skylake-SP
+  (0.94x to 0.96x, the call through the algorithm's dispatch), 128 to 256
+  bytes aligned on Sapphire Rapids (0.96x to 0.98x, where the CRC32
+  instruction runs at its 8 bytes a cycle and fast-crc32's `v4` runs above
+  it), and 512 to 2048 bytes on Zen 4 (0.96x to 0.99x, the fold).
 - A `no_std` build for x86_64 chose the AVX-512 tiers from its compile-time
   target features on AVX512VL alone. Those kernels also use AVX512BW, so a
   target that enables AVX512VL without AVX512BW, as for a guest whose
