@@ -876,7 +876,7 @@ pub fn checksum(algorithm: CrcAlgorithm, buf: &[u8]) -> u64 {
     // timed the same peeled or not, so it stays in the table.
     match algorithm {
         CrcAlgorithm::Crc32Iscsi => crc32_iscsi(buf) as u64,
-        CrcAlgorithm::Crc32IsoHdlc => crc32_iso_hdlc(buf) as u64,
+        CrcAlgorithm::Crc32IsoHdlc => crc32_iso_hdlc_checksum(buf),
         _ => checksum_by_table(algorithm, buf),
     }
 }
@@ -1394,8 +1394,33 @@ pub fn crc32_iscsi(data: &[u8]) -> u32 {
 /// ```
 #[inline(always)]
 pub fn crc32_iso_hdlc(data: &[u8]) -> u32 {
-    crc32_iso_hdlc_calculator(CRC32_ISO_HDLC.init, data, &CRC32_ISO_HDLC) as u32
-        ^ CRC32_ISO_HDLC.xorout as u32
+    // x86 jumps to the tier's checksum entry, which applies the initial value and the final
+    // XOR itself.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        arch::crc32_iso_hdlc(data) as u32
+    }
+
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        crc32_iso_hdlc_calculator(CRC32_ISO_HDLC.init, data, &CRC32_ISO_HDLC) as u32
+            ^ CRC32_ISO_HDLC.xorout as u32
+    }
+}
+
+/// [`crc32_iso_hdlc`] as [`checksum`] returns it. On x86 the tier's entry returns it widened,
+/// so that `checksum` jumps to it rather than calling it and widening the result.
+#[inline(always)]
+fn crc32_iso_hdlc_checksum(data: &[u8]) -> u64 {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        arch::crc32_iso_hdlc(data)
+    }
+
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        crc32_iso_hdlc(data) as u64
+    }
 }
 
 /// Calculates the CRC-64/NVME checksum.
@@ -1571,8 +1596,7 @@ fn crc32_iso_hdlc_calculator(state: u64, data: &[u8], _params: &CrcParams) -> u6
     // x86 takes the tier's entry built for this algorithm's constants.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
-        // SAFETY: the entry is the one for the tier detection selected
-        unsafe { arch::update_iso_hdlc(state as u32, data) as u64 }
+        arch::update_iso_hdlc(state as u32, data) as u64
     }
 
     #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]

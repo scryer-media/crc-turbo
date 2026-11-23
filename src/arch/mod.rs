@@ -174,6 +174,34 @@ pub(crate) unsafe fn update(state: u64, bytes: &[u8], params: &CrcParams) -> u64
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const MID_END: usize = 4096;
 
+/// The body of a tier's CRC-32/ISO-HDLC update entry, in the published form: from 128 bytes a
+/// jump to the tier's folds, below that the short ladder in line. With `$short`, a ladder of
+/// [`crate::arch::x86::short_asm`], from 16 bytes up to `$short_end` it goes there first.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+macro_rules! x86_iso_hdlc_body {
+    ($crc:expr, $bytes:expr, $mid:ident, $fold:ident, $new_ops:expr
+     $(, $short:path, $short_end:expr)?) => {{
+        let (crc, bytes): (u32, &[u8]) = ($crc, $bytes);
+        $(
+            if bytes.len() >= 16 && bytes.len() < $short_end {
+                return $short(crc, bytes) as _;
+            }
+        )?
+        if bytes.len() >= 128 {
+            if bytes.len() >= MID_END {
+                return $fold(crc, bytes) as _;
+            }
+            return $mid(crc, bytes) as _;
+        }
+        !algorithm::update_short_ladder::<_, Width32>(
+            !crc,
+            bytes,
+            &crate::crc32::consts::CRC32_ISO_HDLC,
+            &$new_ops,
+        )
+    }};
+}
+
 /// One x86 tier, built as [`aarch64_tier!`] is: buffers shorter than 128 bytes inline in the
 /// entry point, longer ones through an out-of-line fold with the tier's features, each bit
 /// order compiled apart. With the folds inlined into the entry point, every call saved six
@@ -182,14 +210,25 @@ const MID_END: usize = 4096;
 /// `$short_features` are the entry's, `$features` the folds'; `$head` takes long buffers to a
 /// 64-byte boundary first (`algorithm::update_with`), and `$opaque_keys` has CRC-32/ISO-HDLC
 /// from 128 bytes load its keys (`algorithm::update_mid`).
+///
+/// CRC-32/ISO-HDLC's entries take and return the CRC in its published form, the register's
+/// complement, as zlib's `crc32` does: its initial value and its final XOR are both all ones,
+/// so a checksum is the entry from 0 with nothing to do after it returns, and the entry and
+/// each of its folds end in a tail call rather than a call and a complement.
 macro_rules! x86_tier {
-    ($(#[$cfg:meta])* $update:ident, $fold:ident, $iso_hdlc:ident, $iso_hdlc_mid:ident,
-     $iso_hdlc_fold:ident, $short_features:literal, $features:literal, $head:literal,
-     $opaque_keys:literal, $ops:ty) => {
+    ($(#[$cfg:meta])* $update:ident, $fold:ident, $iso_hdlc:ident, $iso_hdlc_checksum:ident,
+     $iso_hdlc_mid:ident, $iso_hdlc_fold:ident, $short_features:literal, $features:literal,
+     $head:literal, $opaque_keys:literal, $ops:ty, $new_ops:expr
+     $(, short: $short:path, $short_end:expr, $iso_short:path, $iso_checksum:ident)?) => {
         $(#[$cfg])*
         #[inline]
         #[target_feature(enable = $short_features)]
         unsafe fn $update(state: u64, bytes: &[u8], params: &CrcParams, ops: $ops) -> u64 {
+            $(
+                if bytes.len() >= 16 && bytes.len() < $short_end {
+                    return $short(state, bytes, params);
+                }
+            )?
             if bytes.len() >= 128 {
                 return $fold(state, bytes, params, ops);
             }
@@ -212,89 +251,233 @@ macro_rules! x86_tier {
             x86_by_order!(state, bytes, params, ops, $head)
         }
 
-        /// CRC-32/ISO-HDLC with its parameters a constant, so that the width, the bit order
-        /// and the keys are folded in rather than read and branched on, and each fold
-        /// coefficient is one load rather than two moves into the vector unit and a pack.
+        x86_iso_hdlc_tier!(
+            $(#[$cfg])* $iso_hdlc, $iso_hdlc_checksum, $iso_hdlc_mid, $iso_hdlc_fold,
+            $short_features, $features, $head, $opaque_keys, $new_ops
+            $(, $iso_short, $short_end, $iso_checksum)?
+        );
+    };
+}
+
+/// A tier's CRC-32/ISO-HDLC checksum entry: the one built with the tier's ladder in
+/// [`crate::arch::x86::short_asm`] when it has one, otherwise the update entry's body from no
+/// CRC, with the initial value a constant: written out again rather than called, which LLVM
+/// declined to inline.
+macro_rules! x86_iso_hdlc_checksum {
+    ($(#[$cfg:meta])* $iso_hdlc_checksum:ident, $iso_hdlc_mid:ident, $iso_hdlc_fold:ident,
+     $short_features:literal, $new_ops:expr, $checksum:ident) => {
         $(#[$cfg])*
-        #[inline]
+        use crate::arch::x86::short_asm::$checksum as $iso_hdlc_checksum;
+    };
+    ($(#[$cfg:meta])* $iso_hdlc_checksum:ident, $iso_hdlc_mid:ident, $iso_hdlc_fold:ident,
+     $short_features:literal, $new_ops:expr) => {
+        $(#[$cfg])*
         #[target_feature(enable = $short_features)]
-        unsafe fn $iso_hdlc(state: u32, bytes: &[u8], ops: $ops) -> u32 {
-            if bytes.len() >= 128 {
-                if bytes.len() >= MID_END {
-                    return $iso_hdlc_fold(state, bytes, ops);
-                }
-                return $iso_hdlc_mid(state, bytes, ops);
-            }
-            algorithm::update_short_ladder::<_, Width32>(
-                state,
-                bytes,
-                &crate::crc32::consts::CRC32_ISO_HDLC,
-                &ops,
-            )
-        }
-
-        /// 128 bytes up to `MID_END`, folded from where they start and nothing else, so that
-        /// they pay neither for the entry's short arms nor for the long fold's set-up.
-        $(#[$cfg])*
-        #[inline(never)]
-        #[target_feature(enable = $features)]
-        unsafe fn $iso_hdlc_mid(state: u32, bytes: &[u8], ops: $ops) -> u32 {
-            algorithm::update_mid::<_, Width32, $opaque_keys>(
-                state,
-                bytes,
-                &crate::crc32::consts::CRC32_ISO_HDLC,
-                &ops,
-            )
-        }
-
-        $(#[$cfg])*
-        #[inline(never)]
-        #[target_feature(enable = $features)]
-        unsafe fn $iso_hdlc_fold(state: u32, bytes: &[u8], ops: $ops) -> u32 {
-            algorithm::update_with::<_, Width32, $head>(
-                state,
-                bytes,
-                &crate::crc32::consts::CRC32_ISO_HDLC,
-                &ops,
-            )
+        unsafe fn $iso_hdlc_checksum(bytes: &[u8]) -> u64 {
+            x86_iso_hdlc_body!(0, bytes, $iso_hdlc_mid, $iso_hdlc_fold, $new_ops) as u64
         }
     };
 }
 
-/// [`update`] for CRC-32/ISO-HDLC.
+/// One x86 tier's CRC-32/ISO-HDLC entries, as [`x86_tier!`] describes them. Also built on its
+/// own for the SSE tier with AVX's encoding, see [`choose_iso_hdlc`].
+macro_rules! x86_iso_hdlc_tier {
+    ($(#[$cfg:meta])* $iso_hdlc:ident, $iso_hdlc_checksum:ident, $iso_hdlc_mid:ident,
+     $iso_hdlc_fold:ident, $short_features:literal, $features:literal, $head:literal,
+     $opaque_keys:literal, $new_ops:expr
+     $(, $short:path, $short_end:expr, $checksum:ident)?) => {
+        /// CRC-32/ISO-HDLC with its parameters a constant, so that the width, the bit order
+        /// and the keys are folded in rather than read and branched on, and each fold
+        /// coefficient is one load rather than two moves into the vector unit and a pack.
+        /// `crc` is the published CRC so far, 0 for none.
+        $(#[$cfg])*
+        #[inline]
+        #[target_feature(enable = $short_features)]
+        unsafe fn $iso_hdlc(crc: u32, bytes: &[u8]) -> u32 {
+            x86_iso_hdlc_body!(
+                crc,
+                bytes,
+                $iso_hdlc_mid,
+                $iso_hdlc_fold,
+                $new_ops
+                $(, $short, $short_end)?
+            )
+        }
+
+        x86_iso_hdlc_checksum!(
+            $(#[$cfg])* $iso_hdlc_checksum, $iso_hdlc_mid, $iso_hdlc_fold, $short_features,
+            $new_ops $(, $checksum)?
+        );
+
+        /// 128 bytes up to `MID_END`, folded from where they start and nothing else, so that
+        /// they pay neither for the entry's short arms nor for the long fold's set-up. The CRC
+        /// comes back widened, so that the checksum entry jumps here rather than calling.
+        $(#[$cfg])*
+        #[inline(never)]
+        #[target_feature(enable = $features)]
+        unsafe fn $iso_hdlc_mid(crc: u32, bytes: &[u8]) -> u64 {
+            !algorithm::update_mid::<_, Width32, $opaque_keys>(
+                !crc,
+                bytes,
+                &crate::crc32::consts::CRC32_ISO_HDLC,
+                &$new_ops,
+            ) as u64
+        }
+
+        $(#[$cfg])*
+        #[inline(never)]
+        #[target_feature(enable = $features)]
+        unsafe fn $iso_hdlc_fold(crc: u32, bytes: &[u8]) -> u64 {
+            !algorithm::update_with::<_, Width32, $head>(
+                !crc,
+                bytes,
+                &crate::crc32::consts::CRC32_ISO_HDLC,
+                &$new_ops,
+            ) as u64
+        }
+    };
+}
+
+/// A CRC-32/ISO-HDLC checksum entry: the published CRC of the bytes, widened as
+/// [`crate::checksum`] returns it, so that a caller returning it there has nothing to do after
+/// the entry returns.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+type IsoHdlcChecksum = unsafe fn(&[u8]) -> u64;
+
+/// A CRC-32/ISO-HDLC update entry: the published CRC so far and the bytes, to the published CRC.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+type IsoHdlcUpdate = unsafe fn(u32, &[u8]) -> u32;
+
+/// The published form the entries work in is the register's complement, which holds only while
+/// the initial value and the final XOR are both all ones and the bits are reflected.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+const _: () = {
+    let p = &crate::crc32::consts::CRC32_ISO_HDLC;
+    assert!(p.init_algorithm == 0xffff_ffff && p.xorout == 0xffff_ffff && p.refin);
+};
+
+/// The tier's CRC-32/ISO-HDLC checksum entry, null until the first call chooses it. Only ever
+/// set, with a relaxed store, to an entry of the tier detection selected, and every thread
+/// that sets it sets the same one; the pointer is all it publishes. A checksum is then a load,
+/// a test and a jump to the entry, with no frame and nothing to do after it returns.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+static ISO_HDLC_CHECKSUM: core::sync::atomic::AtomicPtr<()> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// [`ISO_HDLC_CHECKSUM`]'s update entry, chosen with it.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+static ISO_HDLC_UPDATE: core::sync::atomic::AtomicPtr<()> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// CRC-32/ISO-HDLC's entries for the tier detection selected, and records them.
+#[cold]
+#[inline(never)]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn choose_iso_hdlc() -> (IsoHdlcChecksum, IsoHdlcUpdate) {
+    use crate::feature_detection::{get_arch_ops, ArchOpsInstance};
+    use core::sync::atomic::Ordering;
+
+    let entries: (IsoHdlcChecksum, IsoHdlcUpdate) = match get_arch_ops() {
+        #[cfg(target_arch = "x86_64")]
+        ArchOpsInstance::X86_64Avx512Vpclmulqdq(_) => (
+            iso_hdlc_checksum_x86_64_avx512_vpclmulqdq,
+            iso_hdlc_x86_64_avx512_vpclmulqdq,
+        ),
+        #[cfg(target_arch = "x86_64")]
+        ArchOpsInstance::X86_64Avx512Pclmulqdq(_) => (
+            iso_hdlc_checksum_x86_64_avx512_pclmulqdq,
+            iso_hdlc_x86_64_avx512_pclmulqdq,
+        ),
+        #[cfg(target_arch = "x86_64")]
+        ArchOpsInstance::X86_64Avx2Vpclmulqdq(_) => (
+            iso_hdlc_checksum_x86_64_avx2_vpclmulqdq,
+            iso_hdlc_x86_64_avx2_vpclmulqdq,
+        ),
+        ArchOpsInstance::X86SsePclmulqdq(_) if sse_tier_has_avx() => {
+            (iso_hdlc_checksum_x86_sse_avx, iso_hdlc_x86_sse_avx)
+        }
+        ArchOpsInstance::X86SsePclmulqdq(_) => (
+            iso_hdlc_checksum_x86_sse_pclmulqdq,
+            iso_hdlc_x86_sse_pclmulqdq,
+        ),
+        ArchOpsInstance::SoftwareFallback => (iso_hdlc_checksum_software, iso_hdlc_software),
+    };
+    ISO_HDLC_UPDATE.store(entries.1 as *mut (), Ordering::Relaxed);
+    ISO_HDLC_CHECKSUM.store(entries.0 as *mut (), Ordering::Relaxed);
+
+    entries
+}
+
+/// Whether a CPU on the SSE tier has AVX, so that CRC-32/ISO-HDLC takes the SSE tier's entries
+/// built with AVX's three-operand encoding: the same 128-bit operations, without the register
+/// copies that the two-operand forms need before each multiply. The CPUs that land on the SSE
+/// tier with AVX are those with AVX2 or AVX but no VPCLMULQDQ, such as a Xeon E5-2666 v3 or an
+/// EPYC 7R32; libdeflate takes its AVX build of the same fold on them.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn sse_tier_has_avx() -> bool {
+    #[cfg(feature = "std")]
+    {
+        std::arch::is_x86_feature_detected!("avx")
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        cfg!(target_feature = "avx")
+    }
+}
+
+/// CRC-32/ISO-HDLC through the table-driven software path, in the entries' published form.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+unsafe fn iso_hdlc_software(crc: u32, bytes: &[u8]) -> u32 {
+    !(crate::arch::software::update((!crc) as u64, bytes, &crate::crc32::consts::CRC32_ISO_HDLC)
+        as u32)
+}
+
+/// [`iso_hdlc_software`] from no CRC.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+unsafe fn iso_hdlc_checksum_software(bytes: &[u8]) -> u64 {
+    iso_hdlc_software(0, bytes) as u64
+}
+
+/// The CRC-32/ISO-HDLC checksum of `bytes`, through the entry of the tier detection selected.
 ///
 /// x86 has no CRC32 instruction for this polynomial, so it folds like any other algorithm;
 /// through [`update`] each call reads the width, bit order and keys from the parameters and
-/// branches on them, which a short buffer pays for in full.
-///
-/// # Safety
-///
-/// The CPU must have the features of the tier that detection selected.
+/// branches on them, which a short buffer pays for in full. What a caller inlines is a load of
+/// the entry and a jump to it; the first call chooses it out of line.
 #[inline(always)]
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-pub(crate) unsafe fn update_iso_hdlc(state: u32, bytes: &[u8]) -> u32 {
-    use crate::feature_detection::{get_arch_ops, ArchOpsInstance};
-
-    match get_arch_ops() {
-        #[cfg(target_arch = "x86_64")]
-        ArchOpsInstance::X86_64Avx512Vpclmulqdq(ops) => {
-            iso_hdlc_x86_64_avx512_vpclmulqdq(state, bytes, *ops)
-        }
-        #[cfg(target_arch = "x86_64")]
-        ArchOpsInstance::X86_64Avx512Pclmulqdq(ops) => {
-            iso_hdlc_x86_64_avx512_pclmulqdq(state, bytes, *ops)
-        }
-        #[cfg(target_arch = "x86_64")]
-        ArchOpsInstance::X86_64Avx2Vpclmulqdq(ops) => {
-            iso_hdlc_x86_64_avx2_vpclmulqdq(state, bytes, *ops)
-        }
-        ArchOpsInstance::X86SsePclmulqdq(ops) => iso_hdlc_x86_sse_pclmulqdq(state, bytes, *ops),
-        ArchOpsInstance::SoftwareFallback => crate::arch::software::update(
-            state as u64,
-            bytes,
-            &crate::crc32::consts::CRC32_ISO_HDLC,
-        ) as u32,
+pub(crate) fn crc32_iso_hdlc(bytes: &[u8]) -> u64 {
+    let entry = ISO_HDLC_CHECKSUM.load(core::sync::atomic::Ordering::Relaxed);
+    if entry.is_null() {
+        return crc32_iso_hdlc_first(bytes);
     }
+    // SAFETY: a non-null value was stored by `choose_iso_hdlc` from an `IsoHdlcChecksum` of
+    // the tier detection selected, whose features this CPU has
+    unsafe { core::mem::transmute::<*mut (), IsoHdlcChecksum>(entry)(bytes) }
+}
+
+/// [`crc32_iso_hdlc`] for the first call.
+#[cold]
+#[inline(never)]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn crc32_iso_hdlc_first(bytes: &[u8]) -> u64 {
+    // SAFETY: the entry is the one for the tier detection selected
+    unsafe { choose_iso_hdlc().0(bytes) }
+}
+
+/// [`update`] for CRC-32/ISO-HDLC: `state` is the register, as [`update`] takes it.
+#[inline(always)]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+pub(crate) fn update_iso_hdlc(state: u32, bytes: &[u8]) -> u32 {
+    let entry = ISO_HDLC_UPDATE.load(core::sync::atomic::Ordering::Relaxed);
+    let entry = if entry.is_null() {
+        choose_iso_hdlc().1
+    } else {
+        // SAFETY: as in `crc32_iso_hdlc`, from an `IsoHdlcUpdate`
+        unsafe { core::mem::transmute::<*mut (), IsoHdlcUpdate>(entry) }
+    };
+    // SAFETY: the entry is the one for the tier detection selected
+    !unsafe { entry(!state, bytes) }
 }
 
 x86_tier!(
@@ -302,52 +485,91 @@ x86_tier!(
     update_x86_sse_pclmulqdq,
     fold_x86_sse_pclmulqdq,
     iso_hdlc_x86_sse_pclmulqdq,
+    iso_hdlc_checksum_x86_sse_pclmulqdq,
     iso_hdlc_mid_x86_sse_pclmulqdq,
     iso_hdlc_fold_x86_sse_pclmulqdq,
     "sse4.1,pclmulqdq",
     "sse4.1,pclmulqdq",
     false,
     true,
-    crate::arch::x86::sse::X86SsePclmulqdqOps
+    crate::arch::x86::sse::X86SsePclmulqdqOps,
+    crate::arch::x86::sse::X86SsePclmulqdqOps,
+    short: crate::arch::x86::short_asm::short_sse,
+    256,
+    crate::arch::x86::short_asm::iso_hdlc_short_sse,
+    iso_hdlc_checksum_sse
+);
+x86_iso_hdlc_tier!(
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    iso_hdlc_x86_sse_avx,
+    iso_hdlc_checksum_x86_sse_avx,
+    iso_hdlc_mid_x86_sse_avx,
+    iso_hdlc_fold_x86_sse_avx,
+    "sse4.1,pclmulqdq,avx",
+    "sse4.1,pclmulqdq,avx",
+    false,
+    true,
+    crate::arch::x86::sse::X86SsePclmulqdqOps,
+    crate::arch::x86::short_asm::iso_hdlc_short_avx,
+    256,
+    iso_hdlc_checksum_avx
 );
 x86_tier!(
     #[cfg(target_arch = "x86_64")]
     update_x86_64_avx512_pclmulqdq,
     fold_x86_64_avx512_pclmulqdq,
     iso_hdlc_x86_64_avx512_pclmulqdq,
+    iso_hdlc_checksum_x86_64_avx512_pclmulqdq,
     iso_hdlc_mid_x86_64_avx512_pclmulqdq,
     iso_hdlc_fold_x86_64_avx512_pclmulqdq,
     "avx512vl,pclmulqdq",
     "avx512vl,pclmulqdq",
     false,
     true,
-    crate::arch::x86_64::avx512::X86_64Avx512PclmulqdqOps
+    crate::arch::x86_64::avx512::X86_64Avx512PclmulqdqOps,
+    crate::arch::x86_64::avx512::X86_64Avx512PclmulqdqOps::new(),
+    short: crate::arch::x86::short_asm::short128_avx,
+    128,
+    crate::arch::x86::short_asm::iso_hdlc_short128_avx,
+    iso_hdlc_checksum_avx512_pclmulqdq
 );
 x86_tier!(
     #[cfg(target_arch = "x86_64")]
     update_x86_64_avx512_vpclmulqdq,
     fold_x86_64_avx512_vpclmulqdq,
     iso_hdlc_x86_64_avx512_vpclmulqdq,
+    iso_hdlc_checksum_x86_64_avx512_vpclmulqdq,
     iso_hdlc_mid_x86_64_avx512_vpclmulqdq,
     iso_hdlc_fold_x86_64_avx512_vpclmulqdq,
     "avx512vl,vpclmulqdq",
     "avx512vl,avx512bw,vpclmulqdq",
     true,
     false,
-    crate::arch::x86_64::avx512_vpclmulqdq::X86_64Avx512VpclmulqdqOps
+    crate::arch::x86_64::avx512_vpclmulqdq::X86_64Avx512VpclmulqdqOps,
+    crate::arch::x86_64::avx512_vpclmulqdq::X86_64Avx512VpclmulqdqOps::new(),
+    short: crate::arch::x86::short_asm::short128_avx,
+    128,
+    crate::arch::x86::short_asm::iso_hdlc_short128_avx,
+    iso_hdlc_checksum_avx512_vpclmulqdq
 );
 x86_tier!(
     #[cfg(target_arch = "x86_64")]
     update_x86_64_avx2_vpclmulqdq,
     fold_x86_64_avx2_vpclmulqdq,
     iso_hdlc_x86_64_avx2_vpclmulqdq,
+    iso_hdlc_checksum_x86_64_avx2_vpclmulqdq,
     iso_hdlc_mid_x86_64_avx2_vpclmulqdq,
     iso_hdlc_fold_x86_64_avx2_vpclmulqdq,
     "avx2,vpclmulqdq,sse4.1,pclmulqdq",
     "avx2,vpclmulqdq,sse4.1,pclmulqdq",
     false,
     false,
-    crate::arch::x86_64::avx2_vpclmulqdq::X86_64Avx2VpclmulqdqOps
+    crate::arch::x86_64::avx2_vpclmulqdq::X86_64Avx2VpclmulqdqOps,
+    crate::arch::x86_64::avx2_vpclmulqdq::X86_64Avx2VpclmulqdqOps::new(),
+    short: crate::arch::x86::short_asm::short128_avx,
+    128,
+    crate::arch::x86::short_asm::iso_hdlc_short128_avx,
+    iso_hdlc_checksum_avx2_vpclmulqdq
 );
 
 #[inline(always)]
@@ -657,8 +879,8 @@ mod tests {
     /// Each x86 tier, forced on any CPU that has its features, including those where dispatch
     /// prefers a wider tier.
     macro_rules! x86_tier_test {
-        ($(#[$cfg:meta])* $test:ident, $update:ident, $iso_hdlc:ident, $ops:expr,
-         [$($feature:tt),+]) => {
+        ($(#[$cfg:meta])* $test:ident, $update:ident, $iso_hdlc:ident, $iso_hdlc_checksum:ident,
+         $ops:expr, [$($feature:tt),+]) => {
             #[test]
             #[cfg(feature = "std")]
             $(#[$cfg])*
@@ -672,18 +894,22 @@ mod tests {
                 check_x86_tier_matches_software(|state, bytes, params| unsafe {
                     $update(state, bytes, params, ops)
                 });
-                check_iso_hdlc_matches_software(|state, bytes| unsafe {
-                    $iso_hdlc(state, bytes, ops)
-                });
+                check_iso_hdlc_matches_software(
+                    |state, bytes| unsafe { !$iso_hdlc(!state, bytes) },
+                    |bytes| unsafe { $iso_hdlc_checksum(bytes) },
+                );
             }
         };
     }
 
-    /// A tier's CRC-32/ISO-HDLC entry against the software path, at every length below the
-    /// fold and the fold's boundaries above it, from four starts, from the init state and a
-    /// carried state.
+    /// A tier's CRC-32/ISO-HDLC entries against the software path, at every length below the
+    /// fold and the fold's boundaries above it, from four starts: the update entry, taking and
+    /// returning the register, from the init state and a carried state, and the checksum entry.
     #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "std"))]
-    fn check_iso_hdlc_matches_software(tier: impl Fn(u32, &[u8]) -> u32) {
+    fn check_iso_hdlc_matches_software(
+        tier: impl Fn(u32, &[u8]) -> u32,
+        checksum: impl Fn(&[u8]) -> u64,
+    ) {
         let params = &crate::crc32::consts::CRC32_ISO_HDLC;
         let mut data = vec![0u8; 8192 + 64];
         rng().fill(&mut data[..]);
@@ -703,6 +929,12 @@ mod tests {
                         "offset {offset} len {len} state {state:#x}"
                     );
                 }
+                let expected = crate::arch::software::update(init, input, params) ^ params.xorout;
+                assert_eq!(
+                    checksum(input),
+                    expected,
+                    "checksum offset {offset} len {len}"
+                );
             }
         }
     }
@@ -712,14 +944,35 @@ mod tests {
         test_sse_pclmulqdq_tier_matches_software,
         update_x86_sse_pclmulqdq,
         iso_hdlc_x86_sse_pclmulqdq,
+        iso_hdlc_checksum_x86_sse_pclmulqdq,
         crate::arch::x86::sse::X86SsePclmulqdqOps,
         ["sse4.1", "pclmulqdq"]
     );
+    /// The SSE tier's CRC-32/ISO-HDLC entries built with AVX's encoding, forced on any CPU with
+    /// AVX.
+    #[test]
+    #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "std"))]
+    #[cfg_attr(miri, ignore)]
+    fn test_sse_avx_iso_hdlc_matches_software() {
+        if !(is_x86_feature_detected!("sse4.1")
+            && is_x86_feature_detected!("pclmulqdq")
+            && is_x86_feature_detected!("avx"))
+        {
+            eprintln!("skipping test_sse_avx_iso_hdlc_matches_software: the CPU lacks AVX");
+            return;
+        }
+        check_iso_hdlc_matches_software(
+            |state, bytes| unsafe { !iso_hdlc_x86_sse_avx(!state, bytes) },
+            |bytes| unsafe { iso_hdlc_checksum_x86_sse_avx(bytes) },
+        );
+    }
+
     x86_tier_test!(
         #[cfg(target_arch = "x86_64")]
         test_avx2_vpclmulqdq_tier_matches_software,
         update_x86_64_avx2_vpclmulqdq,
         iso_hdlc_x86_64_avx2_vpclmulqdq,
+        iso_hdlc_checksum_x86_64_avx2_vpclmulqdq,
         crate::arch::x86_64::avx2_vpclmulqdq::X86_64Avx2VpclmulqdqOps::default(),
         ["avx2", "vpclmulqdq", "sse4.1", "pclmulqdq"]
     );
@@ -728,6 +981,7 @@ mod tests {
         test_avx512_pclmulqdq_tier_matches_software,
         update_x86_64_avx512_pclmulqdq,
         iso_hdlc_x86_64_avx512_pclmulqdq,
+        iso_hdlc_checksum_x86_64_avx512_pclmulqdq,
         crate::arch::x86_64::avx512::X86_64Avx512PclmulqdqOps::default(),
         ["avx512vl", "pclmulqdq"]
     );
@@ -736,6 +990,7 @@ mod tests {
         test_avx512_vpclmulqdq_tier_matches_software,
         update_x86_64_avx512_vpclmulqdq,
         iso_hdlc_x86_64_avx512_vpclmulqdq,
+        iso_hdlc_checksum_x86_64_avx512_vpclmulqdq,
         crate::arch::x86_64::avx512_vpclmulqdq::X86_64Avx512VpclmulqdqOps::default(),
         ["avx512vl", "vpclmulqdq"]
     );
