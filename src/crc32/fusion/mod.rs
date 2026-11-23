@@ -13,7 +13,7 @@
 //! detection of its own.
 
 mod aarch64;
-mod powers;
+pub(crate) mod powers;
 mod x86;
 
 /// The aarch64 fusion kernel this CPU runs, for CRC-32/ISCSI and CRC-32/ISO-HDLC alike, or

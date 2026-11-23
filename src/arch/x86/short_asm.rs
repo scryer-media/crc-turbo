@@ -42,6 +42,120 @@ struct Aligned16([u8; 16]);
 #[cfg(all(target_arch = "x86_64", not(miri)))]
 static FLIP: Aligned16 = Aligned16([0x80; 16]);
 
+/// CRC-32/ISO-HDLC's tail byte-shuffle table, 32 bytes on a 32-byte boundary, so that the
+/// 16-byte control read from anywhere in it never straddles a cache line. The constant it
+/// copies is in a mergeable section aligned to 8 only, where a link can put it across a line.
+#[cfg(all(target_arch = "x86_64", not(miri)))]
+#[repr(C, align(32))]
+struct Aligned32([[u64; 2]; 2]);
+
+#[cfg(all(target_arch = "x86_64", not(miri)))]
+static SHUFFLE_REFLECTED: Aligned32 = Aligned32(crate::crc32::consts::PSHUFB_SHF_TABLE_REVERSE);
+
+/// CRC-32/ISO-HDLC's fold keys on a 64-byte boundary, after one word of padding, so that every
+/// coefficient pair the ladder reads (a pair's low key at an odd index) is one 16-byte load
+/// within a cache line. The parameters' own keys are in a constant aligned to 8 only: a link
+/// that put it 8 bytes off a 16-byte boundary split some pairs across lines, and which ones
+/// moved with the layout.
+#[cfg(all(target_arch = "x86_64", not(miri)))]
+#[repr(C, align(64))]
+struct KeyBlock([u64; 24]);
+
+#[cfg(all(target_arch = "x86_64", not(miri)))]
+static ISO_HDLC_KEYS: KeyBlock = KeyBlock({
+    let keys = match crate::crc32::consts::CRC32_ISO_HDLC.keys {
+        crate::CrcKeysStorage::KeysFold256(keys) => keys,
+        crate::CrcKeysStorage::KeysFutureTest(_) => panic!("CRC-32/ISO-HDLC has 23 keys"),
+    };
+    let mut block = [0u64; 24];
+    let mut i = 0;
+    while i < 23 {
+        block[i + 1] = keys[i];
+        i += 1;
+    }
+    block
+});
+
+/// [`ISO_HDLC_KEYS`] as the 23 keys the parameters hold.
+#[cfg(all(target_arch = "x86_64", not(miri)))]
+#[inline(always)]
+fn iso_hdlc_keys() -> &'static [u64; 23] {
+    // SAFETY: words 1 to 23 of the 24 are in bounds, and `[u64; 23]` has `u64`'s alignment.
+    unsafe { &*(ISO_HDLC_KEYS.0.as_ptr().add(1) as *const [u64; 23]) }
+}
+
+/// CRC-32/ISO-HDLC's coefficient pair for folding a block `distance` blocks forward, low key
+/// first, as the 23-key table holds its pairs: `x^(128 * distance - 32)` and
+/// `x^(128 * distance + 32)` mod P, reflected and shifted left by one. Zero at distance zero, so
+/// that a lane of the last block multiplies to nothing.
+#[cfg(all(target_arch = "x86_64", not(miri)))]
+const fn iso_hdlc_pair(distance: usize) -> [u64; 2] {
+    use crate::crc32::fusion::powers::x_to_the;
+    if distance == 0 {
+        return [0, 0];
+    }
+    let poly = (crate::crc32::consts::CRC32_ISO_HDLC.poly as u32).reverse_bits();
+    let bits = 128 * distance as u64;
+    [
+        (x_to_the(bits - 32, poly) as u64) << 1,
+        (x_to_the(bits + 32, poly) as u64) << 1,
+    ]
+}
+
+/// The pairs [`iso_hdlc_pair`] works out are the generated keys' wherever the table has them.
+#[cfg(all(target_arch = "x86_64", not(miri)))]
+const _: () = {
+    let keys = match crate::crc32::consts::CRC32_ISO_HDLC.keys {
+        crate::CrcKeysStorage::KeysFold256(keys) => keys,
+        crate::CrcKeysStorage::KeysFutureTest(_) => panic!("CRC-32/ISO-HDLC has 23 keys"),
+    };
+    let mut d = 1;
+    while d <= DISTANCE_KEY_LOW.len() {
+        let pair = iso_hdlc_pair(d);
+        let low = DISTANCE_KEY_LOW[d - 1];
+        assert!(pair[0] == keys[low] && pair[1] == keys[low + 1]);
+        d += 1;
+    }
+};
+
+/// CRC-32/ISO-HDLC's keys for the wide folds, laid out so that one 64-byte or 32-byte aligned
+/// load holds the pairs of consecutive blocks: the four pairs of blocks `d`, `d - 1`, `d - 2`
+/// and `d - 3` blocks from the last, at `64 * d`, and the two pairs of blocks `d` and `d - 1`
+/// from it at `WIDE_PAIRS + 32 * d`. Every pair is [`iso_hdlc_pair`].
+#[cfg(all(target_arch = "x86_64", not(miri)))]
+#[repr(C, align(64))]
+struct WideKeys {
+    quads: [[[u64; 2]; 4]; 16],
+    pairs: [[[u64; 2]; 2]; 16],
+}
+
+/// The offset of [`WideKeys`]'s two-pair rows.
+#[cfg(all(target_arch = "x86_64", not(miri)))]
+const WIDE_PAIRS: usize = core::mem::offset_of!(WideKeys, pairs);
+
+#[cfg(all(target_arch = "x86_64", not(miri)))]
+static ISO_HDLC_WIDE: WideKeys = {
+    let mut keys = WideKeys {
+        quads: [[[0; 2]; 4]; 16],
+        pairs: [[[0; 2]; 2]; 16],
+    };
+    let mut d = 0;
+    while d < 16 {
+        let mut lane = 0;
+        while lane < 4 {
+            if lane <= d {
+                keys.quads[d][lane] = iso_hdlc_pair(d - lane);
+            }
+            if lane < 2 && lane <= d {
+                keys.pairs[d][lane] = iso_hdlc_pair(d - lane);
+            }
+            lane += 1;
+        }
+        d += 1;
+    }
+    keys
+};
+
 /// The two carry-less multiply selectors of a 16-byte fold against a coefficient pair loaded
 /// low key first: reflected, the low half by the high key and the high half by the low key.
 #[cfg(all(target_arch = "x86_64", not(miri)))]
@@ -111,14 +225,13 @@ macro_rules! fold_s {
     };
     (avx, $o:ident, $key:literal) => {
         concat!(
-            "vpclmulqdq {x}, {s}, xmmword ptr [{k} + {",
+            "vmovdqu {kk}, xmmword ptr [{k} + {",
             $key,
-            "}], ",
+            "}]\n",
+            "vpclmulqdq {x}, {s}, {kk}, ",
             sel!($o, hi),
             "\n",
-            "vpclmulqdq {s}, {s}, xmmword ptr [{k} + {",
-            $key,
-            "}], ",
+            "vpclmulqdq {s}, {s}, {kk}, ",
             sel!($o, lo),
             "\n",
             "vpxor {s}, {s}, {x}\n",
@@ -160,14 +273,13 @@ macro_rules! fold_b {
             $off,
             "]\n",
             shuf!(avx, $o, "{x}"),
-            "vpclmulqdq {y}, {x}, xmmword ptr [{k} + {",
+            "vmovdqu {kk}, xmmword ptr [{k} + {",
             $key,
-            "}], ",
+            "}]\n",
+            "vpclmulqdq {y}, {x}, {kk}, ",
             sel!($o, hi),
             "\n",
-            "vpclmulqdq {x}, {x}, xmmword ptr [{k} + {",
-            $key,
-            "}], ",
+            "vpclmulqdq {x}, {x}, {kk}, ",
             sel!($o, lo),
             "\n",
             "vpxor {s}, {s}, {y}\n",
@@ -404,6 +516,434 @@ macro_rules! tail_merge {
     };
 }
 
+/// The wide arms of [`fold_asm`]'s `w512` ladder, generated: see the ladder.
+#[cfg(all(target_arch = "x86_64", not(miri)))]
+macro_rules! zarm {
+    (4) => {
+        concat!(
+            "vmovdqa64 xmm16, {s}\n",
+            "vpxorq zmm16, zmm16, zmmword ptr [{p}]\n",
+            "vpclmulqdq zmm17, zmm16, zmmword ptr [rip + {kz} + 192], 0x10\n",
+            "vpclmulqdq zmm16, zmm16, zmmword ptr [rip + {kz} + 192], 0x01\n",
+            "vpxorq zmm16, zmm16, zmm17\n",
+            "vextracti64x4 ymm17, zmm16, 1\n",
+            "vpxorq ymm16, ymm16, ymm17\n",
+            "vextracti32x4 xmm17, ymm16, 1\n",
+            "vpternlogq xmm16, xmm17, xmmword ptr [{p} + 48], 0x96\n",
+            "vmovdqa64 {s}, xmm16\n",
+        )
+    };
+    (5) => {
+        concat!(
+            "vmovdqa64 xmm16, {s}\n",
+            "vpxorq zmm16, zmm16, zmmword ptr [{p}]\n",
+            "vpclmulqdq zmm17, zmm16, zmmword ptr [rip + {kz} + 256], 0x10\n",
+            "vpclmulqdq zmm16, zmm16, zmmword ptr [rip + {kz} + 256], 0x01\n",
+            "vpxorq zmm16, zmm16, zmm17\n",
+            "vextracti64x4 ymm17, zmm16, 1\n",
+            "vpxorq ymm16, ymm16, ymm17\n",
+            "vextracti32x4 xmm17, ymm16, 1\n",
+            "vpternlogq xmm16, xmm17, xmmword ptr [{p} + 64], 0x96\n",
+            "vmovdqa64 {s}, xmm16\n",
+        )
+    };
+    (6) => {
+        concat!(
+            "vmovdqa64 xmm16, {s}\n",
+            "vpxorq zmm16, zmm16, zmmword ptr [{p}]\n",
+            "vpclmulqdq zmm17, zmm16, zmmword ptr [rip + {kz} + 320], 0x10\n",
+            "vpclmulqdq zmm16, zmm16, zmmword ptr [rip + {kz} + 320], 0x01\n",
+            "vmovdqu64 xmm18, xmmword ptr [{p} + 64]\n",
+            "vpclmulqdq xmm19, xmm18, xmmword ptr [rip + {kz} + {wp} + 32], 0x10\n",
+            "vpclmulqdq xmm18, xmm18, xmmword ptr [rip + {kz} + {wp} + 32], 0x01\n",
+            "vpxorq zmm16, zmm16, zmm17\n",
+            "vextracti64x4 ymm17, zmm16, 1\n",
+            "vpxorq ymm16, ymm16, ymm17\n",
+            "vextracti32x4 xmm17, ymm16, 1\n",
+            "vpternlogq xmm16, xmm17, xmmword ptr [{p} + 80], 0x96\n",
+            "vpternlogq xmm16, xmm18, xmm19, 0x96\n",
+            "vmovdqa64 {s}, xmm16\n",
+        )
+    };
+    (7) => {
+        concat!(
+            "vmovdqa64 xmm16, {s}\n",
+            "vpxorq zmm16, zmm16, zmmword ptr [{p}]\n",
+            "vpclmulqdq zmm17, zmm16, zmmword ptr [rip + {kz} + 384], 0x10\n",
+            "vpclmulqdq zmm16, zmm16, zmmword ptr [rip + {kz} + 384], 0x01\n",
+            "vmovdqu64 ymm18, ymmword ptr [{p} + 64]\n",
+            "vpclmulqdq ymm19, ymm18, ymmword ptr [rip + {kz} + {wp} + 64], 0x10\n",
+            "vpclmulqdq ymm18, ymm18, ymmword ptr [rip + {kz} + {wp} + 64], 0x01\n",
+            "vpxorq zmm16, zmm16, zmm17\n",
+            "vextracti64x4 ymm17, zmm16, 1\n",
+            "vpternlogq ymm16, ymm17, ymm18, 0x96\n",
+            "vpxorq ymm16, ymm16, ymm19\n",
+            "vextracti32x4 xmm17, ymm16, 1\n",
+            "vpternlogq xmm16, xmm17, xmmword ptr [{p} + 96], 0x96\n",
+            "vmovdqa64 {s}, xmm16\n",
+        )
+    };
+}
+
+/// The wide arms of [`fold_asm`]'s `w256` ladder, generated: see the ladder.
+#[cfg(all(target_arch = "x86_64", not(miri)))]
+macro_rules! yarm {
+    (4) => {
+        concat!(
+            "vmovdqa {c}, {s}\n",
+            "vpxor {a:y}, {c:y}, ymmword ptr [{p}]\n",
+            "vpclmulqdq {b:y}, {a:y}, ymmword ptr [rip + {kz} + {wp} + 96], 0x10\n",
+            "vpclmulqdq {a:y}, {a:y}, ymmword ptr [rip + {kz} + {wp} + 96], 0x01\n",
+            "vpxor {a:y}, {a:y}, {b:y}\n",
+            "vmovdqu {x}, xmmword ptr [{p} + 32]\n",
+            "vpclmulqdq {y}, {x}, xmmword ptr [rip + {kz} + {wp} + 32], 0x10\n",
+            "vpclmulqdq {x}, {x}, xmmword ptr [rip + {kz} + {wp} + 32], 0x01\n",
+            "vpxor {x}, {x}, {y}\n",
+            "vextracti128 {b}, {a:y}, 1\n",
+            "vpxor {s}, {a}, {b}\n",
+            "vpxor {s}, {s}, {x}\n",
+            "vpxor {s}, {s}, xmmword ptr [{p} + 48]\n",
+        )
+    };
+    (5) => {
+        concat!(
+            "vmovdqa {c}, {s}\n",
+            "vpxor {a:y}, {c:y}, ymmword ptr [{p}]\n",
+            "vpclmulqdq {b:y}, {a:y}, ymmword ptr [rip + {kz} + {wp} + 128], 0x10\n",
+            "vpclmulqdq {a:y}, {a:y}, ymmword ptr [rip + {kz} + {wp} + 128], 0x01\n",
+            "vpxor {a:y}, {a:y}, {b:y}\n",
+            "vmovdqu {x:y}, ymmword ptr [{p} + 32]\n",
+            "vpclmulqdq {y:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 64], 0x10\n",
+            "vpclmulqdq {x:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 64], 0x01\n",
+            "vpxor {x:y}, {x:y}, {y:y}\n",
+            "vpxor {a:y}, {a:y}, {x:y}\n",
+            "vextracti128 {b}, {a:y}, 1\n",
+            "vpxor {s}, {a}, {b}\n",
+            "vpxor {s}, {s}, xmmword ptr [{p} + 64]\n",
+        )
+    };
+    (6) => {
+        concat!(
+            "vmovdqa {c}, {s}\n",
+            "vpxor {a:y}, {c:y}, ymmword ptr [{p}]\n",
+            "vpclmulqdq {b:y}, {a:y}, ymmword ptr [rip + {kz} + {wp} + 160], 0x10\n",
+            "vpclmulqdq {a:y}, {a:y}, ymmword ptr [rip + {kz} + {wp} + 160], 0x01\n",
+            "vpxor {a:y}, {a:y}, {b:y}\n",
+            "vmovdqu {x:y}, ymmword ptr [{p} + 32]\n",
+            "vpclmulqdq {y:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 96], 0x10\n",
+            "vpclmulqdq {x:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 96], 0x01\n",
+            "vpxor {x:y}, {x:y}, {y:y}\n",
+            "vpxor {a:y}, {a:y}, {x:y}\n",
+            "vmovdqu {x}, xmmword ptr [{p} + 64]\n",
+            "vpclmulqdq {y}, {x}, xmmword ptr [rip + {kz} + {wp} + 32], 0x10\n",
+            "vpclmulqdq {x}, {x}, xmmword ptr [rip + {kz} + {wp} + 32], 0x01\n",
+            "vpxor {x}, {x}, {y}\n",
+            "vextracti128 {b}, {a:y}, 1\n",
+            "vpxor {s}, {a}, {b}\n",
+            "vpxor {s}, {s}, {x}\n",
+            "vpxor {s}, {s}, xmmword ptr [{p} + 80]\n",
+        )
+    };
+    (7) => {
+        concat!(
+            "vmovdqa {c}, {s}\n",
+            "vpxor {a:y}, {c:y}, ymmword ptr [{p}]\n",
+            "vpclmulqdq {b:y}, {a:y}, ymmword ptr [rip + {kz} + {wp} + 192], 0x10\n",
+            "vpclmulqdq {a:y}, {a:y}, ymmword ptr [rip + {kz} + {wp} + 192], 0x01\n",
+            "vpxor {a:y}, {a:y}, {b:y}\n",
+            "vmovdqu {x:y}, ymmword ptr [{p} + 32]\n",
+            "vpclmulqdq {y:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 128], 0x10\n",
+            "vpclmulqdq {x:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 128], 0x01\n",
+            "vpxor {x:y}, {x:y}, {y:y}\n",
+            "vpxor {a:y}, {a:y}, {x:y}\n",
+            "vmovdqu {x:y}, ymmword ptr [{p} + 64]\n",
+            "vpclmulqdq {y:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 64], 0x10\n",
+            "vpclmulqdq {x:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 64], 0x01\n",
+            "vpxor {x:y}, {x:y}, {y:y}\n",
+            "vpxor {a:y}, {a:y}, {x:y}\n",
+            "vextracti128 {b}, {a:y}, 1\n",
+            "vpxor {s}, {a}, {b}\n",
+            "vpxor {s}, {s}, xmmword ptr [{p} + 96]\n",
+        )
+    };
+    (8) => {
+        concat!(
+            "vmovdqa {c}, {s}\n",
+            "vpxor {a:y}, {c:y}, ymmword ptr [{p}]\n",
+            "vpclmulqdq {b:y}, {a:y}, ymmword ptr [rip + {kz} + {wp} + 224], 0x10\n",
+            "vpclmulqdq {a:y}, {a:y}, ymmword ptr [rip + {kz} + {wp} + 224], 0x01\n",
+            "vpxor {a:y}, {a:y}, {b:y}\n",
+            "vmovdqu {x:y}, ymmword ptr [{p} + 32]\n",
+            "vpclmulqdq {y:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 160], 0x10\n",
+            "vpclmulqdq {x:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 160], 0x01\n",
+            "vpxor {x:y}, {x:y}, {y:y}\n",
+            "vpxor {a:y}, {a:y}, {x:y}\n",
+            "vmovdqu {x:y}, ymmword ptr [{p} + 64]\n",
+            "vpclmulqdq {y:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 96], 0x10\n",
+            "vpclmulqdq {x:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 96], 0x01\n",
+            "vpxor {x:y}, {x:y}, {y:y}\n",
+            "vpxor {a:y}, {a:y}, {x:y}\n",
+            "vmovdqu {x}, xmmword ptr [{p} + 96]\n",
+            "vpclmulqdq {y}, {x}, xmmword ptr [rip + {kz} + {wp} + 32], 0x10\n",
+            "vpclmulqdq {x}, {x}, xmmword ptr [rip + {kz} + {wp} + 32], 0x01\n",
+            "vpxor {x}, {x}, {y}\n",
+            "vextracti128 {b}, {a:y}, 1\n",
+            "vpxor {s}, {a}, {b}\n",
+            "vpxor {s}, {s}, {x}\n",
+            "vpxor {s}, {s}, xmmword ptr [{p} + 112]\n",
+        )
+    };
+    (9) => {
+        concat!(
+            "vmovdqa {c}, {s}\n",
+            "vpxor {a:y}, {c:y}, ymmword ptr [{p}]\n",
+            "vpclmulqdq {b:y}, {a:y}, ymmword ptr [rip + {kz} + {wp} + 256], 0x10\n",
+            "vpclmulqdq {a:y}, {a:y}, ymmword ptr [rip + {kz} + {wp} + 256], 0x01\n",
+            "vpxor {a:y}, {a:y}, {b:y}\n",
+            "vmovdqu {x:y}, ymmword ptr [{p} + 32]\n",
+            "vpclmulqdq {y:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 192], 0x10\n",
+            "vpclmulqdq {x:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 192], 0x01\n",
+            "vpxor {x:y}, {x:y}, {y:y}\n",
+            "vpxor {a:y}, {a:y}, {x:y}\n",
+            "vmovdqu {x:y}, ymmword ptr [{p} + 64]\n",
+            "vpclmulqdq {y:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 128], 0x10\n",
+            "vpclmulqdq {x:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 128], 0x01\n",
+            "vpxor {x:y}, {x:y}, {y:y}\n",
+            "vpxor {a:y}, {a:y}, {x:y}\n",
+            "vmovdqu {x:y}, ymmword ptr [{p} + 96]\n",
+            "vpclmulqdq {y:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 64], 0x10\n",
+            "vpclmulqdq {x:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 64], 0x01\n",
+            "vpxor {x:y}, {x:y}, {y:y}\n",
+            "vpxor {a:y}, {a:y}, {x:y}\n",
+            "vextracti128 {b}, {a:y}, 1\n",
+            "vpxor {s}, {a}, {b}\n",
+            "vpxor {s}, {s}, xmmword ptr [{p} + 128]\n",
+        )
+    };
+    (10) => {
+        concat!(
+            "vmovdqa {c}, {s}\n",
+            "vpxor {a:y}, {c:y}, ymmword ptr [{p}]\n",
+            "vpclmulqdq {b:y}, {a:y}, ymmword ptr [rip + {kz} + {wp} + 288], 0x10\n",
+            "vpclmulqdq {a:y}, {a:y}, ymmword ptr [rip + {kz} + {wp} + 288], 0x01\n",
+            "vpxor {a:y}, {a:y}, {b:y}\n",
+            "vmovdqu {x:y}, ymmword ptr [{p} + 32]\n",
+            "vpclmulqdq {y:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 224], 0x10\n",
+            "vpclmulqdq {x:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 224], 0x01\n",
+            "vpxor {x:y}, {x:y}, {y:y}\n",
+            "vpxor {a:y}, {a:y}, {x:y}\n",
+            "vmovdqu {x:y}, ymmword ptr [{p} + 64]\n",
+            "vpclmulqdq {y:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 160], 0x10\n",
+            "vpclmulqdq {x:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 160], 0x01\n",
+            "vpxor {x:y}, {x:y}, {y:y}\n",
+            "vpxor {a:y}, {a:y}, {x:y}\n",
+            "vmovdqu {x:y}, ymmword ptr [{p} + 96]\n",
+            "vpclmulqdq {y:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 96], 0x10\n",
+            "vpclmulqdq {x:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 96], 0x01\n",
+            "vpxor {x:y}, {x:y}, {y:y}\n",
+            "vpxor {a:y}, {a:y}, {x:y}\n",
+            "vmovdqu {x}, xmmword ptr [{p} + 128]\n",
+            "vpclmulqdq {y}, {x}, xmmword ptr [rip + {kz} + {wp} + 32], 0x10\n",
+            "vpclmulqdq {x}, {x}, xmmword ptr [rip + {kz} + {wp} + 32], 0x01\n",
+            "vpxor {x}, {x}, {y}\n",
+            "vextracti128 {b}, {a:y}, 1\n",
+            "vpxor {s}, {a}, {b}\n",
+            "vpxor {s}, {s}, {x}\n",
+            "vpxor {s}, {s}, xmmword ptr [{p} + 144]\n",
+        )
+    };
+    (11) => {
+        concat!(
+            "vmovdqa {c}, {s}\n",
+            "vpxor {a:y}, {c:y}, ymmword ptr [{p}]\n",
+            "vpclmulqdq {b:y}, {a:y}, ymmword ptr [rip + {kz} + {wp} + 320], 0x10\n",
+            "vpclmulqdq {a:y}, {a:y}, ymmword ptr [rip + {kz} + {wp} + 320], 0x01\n",
+            "vpxor {a:y}, {a:y}, {b:y}\n",
+            "vmovdqu {x:y}, ymmword ptr [{p} + 32]\n",
+            "vpclmulqdq {y:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 256], 0x10\n",
+            "vpclmulqdq {x:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 256], 0x01\n",
+            "vpxor {x:y}, {x:y}, {y:y}\n",
+            "vpxor {a:y}, {a:y}, {x:y}\n",
+            "vmovdqu {x:y}, ymmword ptr [{p} + 64]\n",
+            "vpclmulqdq {y:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 192], 0x10\n",
+            "vpclmulqdq {x:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 192], 0x01\n",
+            "vpxor {x:y}, {x:y}, {y:y}\n",
+            "vpxor {a:y}, {a:y}, {x:y}\n",
+            "vmovdqu {x:y}, ymmword ptr [{p} + 96]\n",
+            "vpclmulqdq {y:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 128], 0x10\n",
+            "vpclmulqdq {x:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 128], 0x01\n",
+            "vpxor {x:y}, {x:y}, {y:y}\n",
+            "vpxor {a:y}, {a:y}, {x:y}\n",
+            "vmovdqu {x:y}, ymmword ptr [{p} + 128]\n",
+            "vpclmulqdq {y:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 64], 0x10\n",
+            "vpclmulqdq {x:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 64], 0x01\n",
+            "vpxor {x:y}, {x:y}, {y:y}\n",
+            "vpxor {a:y}, {a:y}, {x:y}\n",
+            "vextracti128 {b}, {a:y}, 1\n",
+            "vpxor {s}, {a}, {b}\n",
+            "vpxor {s}, {s}, xmmword ptr [{p} + 160]\n",
+        )
+    };
+    (12) => {
+        concat!(
+            "vmovdqa {c}, {s}\n",
+            "vpxor {a:y}, {c:y}, ymmword ptr [{p}]\n",
+            "vpclmulqdq {b:y}, {a:y}, ymmword ptr [rip + {kz} + {wp} + 352], 0x10\n",
+            "vpclmulqdq {a:y}, {a:y}, ymmword ptr [rip + {kz} + {wp} + 352], 0x01\n",
+            "vpxor {a:y}, {a:y}, {b:y}\n",
+            "vmovdqu {x:y}, ymmword ptr [{p} + 32]\n",
+            "vpclmulqdq {y:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 288], 0x10\n",
+            "vpclmulqdq {x:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 288], 0x01\n",
+            "vpxor {x:y}, {x:y}, {y:y}\n",
+            "vpxor {a:y}, {a:y}, {x:y}\n",
+            "vmovdqu {x:y}, ymmword ptr [{p} + 64]\n",
+            "vpclmulqdq {y:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 224], 0x10\n",
+            "vpclmulqdq {x:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 224], 0x01\n",
+            "vpxor {x:y}, {x:y}, {y:y}\n",
+            "vpxor {a:y}, {a:y}, {x:y}\n",
+            "vmovdqu {x:y}, ymmword ptr [{p} + 96]\n",
+            "vpclmulqdq {y:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 160], 0x10\n",
+            "vpclmulqdq {x:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 160], 0x01\n",
+            "vpxor {x:y}, {x:y}, {y:y}\n",
+            "vpxor {a:y}, {a:y}, {x:y}\n",
+            "vmovdqu {x:y}, ymmword ptr [{p} + 128]\n",
+            "vpclmulqdq {y:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 96], 0x10\n",
+            "vpclmulqdq {x:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 96], 0x01\n",
+            "vpxor {x:y}, {x:y}, {y:y}\n",
+            "vpxor {a:y}, {a:y}, {x:y}\n",
+            "vmovdqu {x}, xmmword ptr [{p} + 160]\n",
+            "vpclmulqdq {y}, {x}, xmmword ptr [rip + {kz} + {wp} + 32], 0x10\n",
+            "vpclmulqdq {x}, {x}, xmmword ptr [rip + {kz} + {wp} + 32], 0x01\n",
+            "vpxor {x}, {x}, {y}\n",
+            "vextracti128 {b}, {a:y}, 1\n",
+            "vpxor {s}, {a}, {b}\n",
+            "vpxor {s}, {s}, {x}\n",
+            "vpxor {s}, {s}, xmmword ptr [{p} + 176]\n",
+        )
+    };
+    (13) => {
+        concat!(
+            "vmovdqa {c}, {s}\n",
+            "vpxor {a:y}, {c:y}, ymmword ptr [{p}]\n",
+            "vpclmulqdq {b:y}, {a:y}, ymmword ptr [rip + {kz} + {wp} + 384], 0x10\n",
+            "vpclmulqdq {a:y}, {a:y}, ymmword ptr [rip + {kz} + {wp} + 384], 0x01\n",
+            "vpxor {a:y}, {a:y}, {b:y}\n",
+            "vmovdqu {x:y}, ymmword ptr [{p} + 32]\n",
+            "vpclmulqdq {y:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 320], 0x10\n",
+            "vpclmulqdq {x:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 320], 0x01\n",
+            "vpxor {x:y}, {x:y}, {y:y}\n",
+            "vpxor {a:y}, {a:y}, {x:y}\n",
+            "vmovdqu {x:y}, ymmword ptr [{p} + 64]\n",
+            "vpclmulqdq {y:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 256], 0x10\n",
+            "vpclmulqdq {x:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 256], 0x01\n",
+            "vpxor {x:y}, {x:y}, {y:y}\n",
+            "vpxor {a:y}, {a:y}, {x:y}\n",
+            "vmovdqu {x:y}, ymmword ptr [{p} + 96]\n",
+            "vpclmulqdq {y:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 192], 0x10\n",
+            "vpclmulqdq {x:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 192], 0x01\n",
+            "vpxor {x:y}, {x:y}, {y:y}\n",
+            "vpxor {a:y}, {a:y}, {x:y}\n",
+            "vmovdqu {x:y}, ymmword ptr [{p} + 128]\n",
+            "vpclmulqdq {y:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 128], 0x10\n",
+            "vpclmulqdq {x:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 128], 0x01\n",
+            "vpxor {x:y}, {x:y}, {y:y}\n",
+            "vpxor {a:y}, {a:y}, {x:y}\n",
+            "vmovdqu {x:y}, ymmword ptr [{p} + 160]\n",
+            "vpclmulqdq {y:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 64], 0x10\n",
+            "vpclmulqdq {x:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 64], 0x01\n",
+            "vpxor {x:y}, {x:y}, {y:y}\n",
+            "vpxor {a:y}, {a:y}, {x:y}\n",
+            "vextracti128 {b}, {a:y}, 1\n",
+            "vpxor {s}, {a}, {b}\n",
+            "vpxor {s}, {s}, xmmword ptr [{p} + 192]\n",
+        )
+    };
+    (14) => {
+        concat!(
+            "vmovdqa {c}, {s}\n",
+            "vpxor {a:y}, {c:y}, ymmword ptr [{p}]\n",
+            "vpclmulqdq {b:y}, {a:y}, ymmword ptr [rip + {kz} + {wp} + 416], 0x10\n",
+            "vpclmulqdq {a:y}, {a:y}, ymmword ptr [rip + {kz} + {wp} + 416], 0x01\n",
+            "vpxor {a:y}, {a:y}, {b:y}\n",
+            "vmovdqu {x:y}, ymmword ptr [{p} + 32]\n",
+            "vpclmulqdq {y:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 352], 0x10\n",
+            "vpclmulqdq {x:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 352], 0x01\n",
+            "vpxor {x:y}, {x:y}, {y:y}\n",
+            "vpxor {a:y}, {a:y}, {x:y}\n",
+            "vmovdqu {x:y}, ymmword ptr [{p} + 64]\n",
+            "vpclmulqdq {y:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 288], 0x10\n",
+            "vpclmulqdq {x:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 288], 0x01\n",
+            "vpxor {x:y}, {x:y}, {y:y}\n",
+            "vpxor {a:y}, {a:y}, {x:y}\n",
+            "vmovdqu {x:y}, ymmword ptr [{p} + 96]\n",
+            "vpclmulqdq {y:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 224], 0x10\n",
+            "vpclmulqdq {x:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 224], 0x01\n",
+            "vpxor {x:y}, {x:y}, {y:y}\n",
+            "vpxor {a:y}, {a:y}, {x:y}\n",
+            "vmovdqu {x:y}, ymmword ptr [{p} + 128]\n",
+            "vpclmulqdq {y:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 160], 0x10\n",
+            "vpclmulqdq {x:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 160], 0x01\n",
+            "vpxor {x:y}, {x:y}, {y:y}\n",
+            "vpxor {a:y}, {a:y}, {x:y}\n",
+            "vmovdqu {x:y}, ymmword ptr [{p} + 160]\n",
+            "vpclmulqdq {y:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 96], 0x10\n",
+            "vpclmulqdq {x:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 96], 0x01\n",
+            "vpxor {x:y}, {x:y}, {y:y}\n",
+            "vpxor {a:y}, {a:y}, {x:y}\n",
+            "vmovdqu {x}, xmmword ptr [{p} + 192]\n",
+            "vpclmulqdq {y}, {x}, xmmword ptr [rip + {kz} + {wp} + 32], 0x10\n",
+            "vpclmulqdq {x}, {x}, xmmword ptr [rip + {kz} + {wp} + 32], 0x01\n",
+            "vpxor {x}, {x}, {y}\n",
+            "vextracti128 {b}, {a:y}, 1\n",
+            "vpxor {s}, {a}, {b}\n",
+            "vpxor {s}, {s}, {x}\n",
+            "vpxor {s}, {s}, xmmword ptr [{p} + 208]\n",
+        )
+    };
+    (15) => {
+        concat!(
+            "vmovdqa {c}, {s}\n",
+            "vpxor {a:y}, {c:y}, ymmword ptr [{p}]\n",
+            "vpclmulqdq {b:y}, {a:y}, ymmword ptr [rip + {kz} + {wp} + 448], 0x10\n",
+            "vpclmulqdq {a:y}, {a:y}, ymmword ptr [rip + {kz} + {wp} + 448], 0x01\n",
+            "vpxor {a:y}, {a:y}, {b:y}\n",
+            "vmovdqu {x:y}, ymmword ptr [{p} + 32]\n",
+            "vpclmulqdq {y:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 384], 0x10\n",
+            "vpclmulqdq {x:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 384], 0x01\n",
+            "vpxor {x:y}, {x:y}, {y:y}\n",
+            "vpxor {a:y}, {a:y}, {x:y}\n",
+            "vmovdqu {x:y}, ymmword ptr [{p} + 64]\n",
+            "vpclmulqdq {y:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 320], 0x10\n",
+            "vpclmulqdq {x:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 320], 0x01\n",
+            "vpxor {x:y}, {x:y}, {y:y}\n",
+            "vpxor {a:y}, {a:y}, {x:y}\n",
+            "vmovdqu {x:y}, ymmword ptr [{p} + 96]\n",
+            "vpclmulqdq {y:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 256], 0x10\n",
+            "vpclmulqdq {x:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 256], 0x01\n",
+            "vpxor {x:y}, {x:y}, {y:y}\n",
+            "vpxor {a:y}, {a:y}, {x:y}\n",
+            "vmovdqu {x:y}, ymmword ptr [{p} + 128]\n",
+            "vpclmulqdq {y:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 192], 0x10\n",
+            "vpclmulqdq {x:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 192], 0x01\n",
+            "vpxor {x:y}, {x:y}, {y:y}\n",
+            "vpxor {a:y}, {a:y}, {x:y}\n",
+            "vmovdqu {x:y}, ymmword ptr [{p} + 160]\n",
+            "vpclmulqdq {y:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 128], 0x10\n",
+            "vpclmulqdq {x:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 128], 0x01\n",
+            "vpxor {x:y}, {x:y}, {y:y}\n",
+            "vpxor {a:y}, {a:y}, {x:y}\n",
+            "vmovdqu {x:y}, ymmword ptr [{p} + 192]\n",
+            "vpclmulqdq {y:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 64], 0x10\n",
+            "vpclmulqdq {x:y}, {x:y}, ymmword ptr [rip + {kz} + {wp} + 64], 0x01\n",
+            "vpxor {x:y}, {x:y}, {y:y}\n",
+            "vpxor {a:y}, {a:y}, {x:y}\n",
+            "vextracti128 {b}, {a:y}, 1\n",
+            "vpxor {s}, {a}, {b}\n",
+            "vpxor {s}, {s}, xmmword ptr [{p} + 224]\n",
+        )
+    };
+}
+
 /// The fold of the bytes at `{p}`, `{n}` of them, 16 to 255 (`full`) or 16 to 127 (`h128`), onto
 /// the state `{s}`, left in `{s}`.
 ///
@@ -413,6 +953,131 @@ macro_rules! tail_merge {
 /// folds its result onto the last from `{r}`.
 #[cfg(all(target_arch = "x86_64", not(miri)))]
 macro_rules! fold_asm {
+    (avx, w512, r32) => {
+        concat!(
+            "cmp {n}, 64\n",
+            "jae 60f\n",
+            op!(avx, loadu, "{x}", "[{p}]"),
+            "vpxor {s}, {s}, {x}\n",
+            "cmp {n}, 32\n",
+            "jb 30f\n",
+            "test {n}, 16\n",
+            "jnz 23f\n",
+            arm!(avx, r32, "{p}", 2),
+            "jmp 30f\n",
+            "23:\n",
+            arm!(avx, r32, "{p}", 3),
+            "jmp 30f\n",
+            "38:\n",
+            tail!(avx, r32),
+            "jmp 39f\n",
+            "60:\n",
+            "test {n}, 32\n",
+            "jnz 62f\n",
+            "test {n}, 16\n",
+            "jnz 601f\n",
+            zarm!(4),
+            "jmp 30f\n",
+            "601:\n",
+            zarm!(5),
+            "jmp 30f\n",
+            "62:\n",
+            "test {n}, 16\n",
+            "jnz 611f\n",
+            zarm!(6),
+            "jmp 30f\n",
+            "611:\n",
+            zarm!(7),
+            "jmp 30f\n",
+            "30:\n",
+            "test {n}, 15\n",
+            "jnz 38b\n",
+            "39:\n",
+        )
+    };
+    (avx, w256, r32) => {
+        concat!(
+            "cmp {n}, 64\n",
+            "jae 60f\n",
+            op!(avx, loadu, "{x}", "[{p}]"),
+            "vpxor {s}, {s}, {x}\n",
+            "cmp {n}, 32\n",
+            "jb 30f\n",
+            "test {n}, 16\n",
+            "jnz 23f\n",
+            arm!(avx, r32, "{p}", 2),
+            "jmp 30f\n",
+            "23:\n",
+            arm!(avx, r32, "{p}", 3),
+            "jmp 30f\n",
+            "38:\n",
+            tail!(avx, r32),
+            "jmp 39f\n",
+            "60:\n",
+            "test {n}, 128\n",
+            "jnz 70f\n",
+            "test {n}, 32\n",
+            "jnz 62f\n",
+            "test {n}, 16\n",
+            "jnz 601f\n",
+            yarm!(4),
+            "jmp 30f\n",
+            "601:\n",
+            yarm!(5),
+            "jmp 30f\n",
+            "62:\n",
+            "test {n}, 16\n",
+            "jnz 611f\n",
+            yarm!(6),
+            "jmp 30f\n",
+            "611:\n",
+            yarm!(7),
+            "jmp 30f\n",
+            "70:\n",
+            "test {n}, 64\n",
+            "jnz 73f\n",
+            "test {n}, 32\n",
+            "jnz 702f\n",
+            "test {n}, 16\n",
+            "jnz 7001f\n",
+            yarm!(8),
+            "jmp 30f\n",
+            "7001:\n",
+            yarm!(9),
+            "jmp 30f\n",
+            "702:\n",
+            "test {n}, 16\n",
+            "jnz 7011f\n",
+            yarm!(10),
+            "jmp 30f\n",
+            "7011:\n",
+            yarm!(11),
+            "jmp 30f\n",
+            "73:\n",
+            "test {n}, 32\n",
+            "jnz 712f\n",
+            "test {n}, 16\n",
+            "jnz 7101f\n",
+            yarm!(12),
+            "jmp 30f\n",
+            "7101:\n",
+            yarm!(13),
+            "jmp 30f\n",
+            "712:\n",
+            "test {n}, 16\n",
+            "jnz 7111f\n",
+            yarm!(14),
+            "jmp 30f\n",
+            "7111:\n",
+            yarm!(15),
+            "jmp 30f\n",
+            "30:\n",
+            "test {n}, 15\n",
+            "jnz 38b\n",
+            "39:\n",
+            "vzeroupper\n",
+        )
+    };
     ($e:ident, full, $o:ident) => {
         concat!(
             op!($e, loadu, "{x}", "[{p}]"),
@@ -598,11 +1263,67 @@ macro_rules! fold_call {
             options(readonly, nostack),
         )
     };
+    (avx, w512, r32, $s:ident, $p:expr, $n:expr, $k:expr, $t:expr, $sm:expr) => {
+        // SAFETY: as below, and the wide keys are read from `ISO_HDLC_WIDE` within it. The
+        // wide registers are 16 to 19, which leave the upper state of 0 to 15 clean, so the
+        // SSE code after it pays no transition.
+        core::arch::asm!(
+            fold_asm!(avx, w512, r32),
+            s = inout(xmm_reg) $s,
+            p = in(reg) $p,
+            n = in(reg) $n,
+            k = in(reg) $k,
+            t = in(reg) $t,
+            flip = sym FLIP,
+            kz = sym ISO_HDLC_WIDE,
+            wp = const WIDE_PAIRS,
+            kk = out(xmm_reg) _,
+            k1 = const 8 * DISTANCE_KEY_LOW[0],
+            k2 = const 8 * DISTANCE_KEY_LOW[1],
+            a = out(xmm_reg) _,
+            x = out(xmm_reg) _,
+            y = out(xmm_reg) _,
+            out("xmm0") _,
+            out("zmm16") _,
+            out("zmm17") _,
+            out("zmm18") _,
+            out("zmm19") _,
+            m = out(reg) _,
+            options(readonly, nostack),
+        )
+    };
+    (avx, w256, r32, $s:ident, $p:expr, $n:expr, $k:expr, $t:expr, $sm:expr) => {
+        // SAFETY: as below, and the wide keys are read from `ISO_HDLC_WIDE` within it. The
+        // `vzeroupper` at the end leaves every operand's low 128 bits as they are, and the
+        // functions this is built into hold no 256-bit value of their own across it.
+        core::arch::asm!(
+            fold_asm!(avx, w256, r32),
+            s = inout(xmm_reg) $s,
+            p = in(reg) $p,
+            n = in(reg) $n,
+            k = in(reg) $k,
+            t = in(reg) $t,
+            flip = sym FLIP,
+            kz = sym ISO_HDLC_WIDE,
+            wp = const WIDE_PAIRS,
+            kk = out(xmm_reg) _,
+            k1 = const 8 * DISTANCE_KEY_LOW[0],
+            k2 = const 8 * DISTANCE_KEY_LOW[1],
+            a = out(xmm_reg) _,
+            b = out(xmm_reg) _,
+            c = out(xmm_reg) _,
+            x = out(xmm_reg) _,
+            y = out(xmm_reg) _,
+            out("xmm0") _,
+            m = out(reg) _,
+            options(readonly, nostack),
+        )
+    };
     (sse, $v:ident, $o:ident, $($rest:tt)*) => {
         fold_call!(@o sse, $v, $o, [kk = out(xmm_reg) _,] $($rest)*)
     };
     (avx, $v:ident, $o:ident, $($rest:tt)*) => {
-        fold_call!(@o avx, $v, $o, [] $($rest)*)
+        fold_call!(@o avx, $v, $o, [kk = out(xmm_reg) _,] $($rest)*)
     };
 }
 
@@ -610,7 +1331,21 @@ macro_rules! fold_call {
 /// (`h128`), with the parameters `$params` of bit order `$o` (`r32` reflected up to 32 bits,
 /// `r64` reflected 64-bit, `f` forward), folded with encoding `$e` and reduced.
 macro_rules! short_body {
-    ($e:ident, $v:ident, $o:ident, $w:ty, $state:expr, $bytes:expr, $params:expr) => {{
+    ($e:ident, $v:ident, $o:ident, $w:ty, $state:expr, $bytes:expr, $params:expr) => {
+        short_body!(
+            $e,
+            $v,
+            $o,
+            $w,
+            $state,
+            $bytes,
+            $params,
+            $params.keys.fold_keys(),
+            <$w>::get_last_bytes_table_ptr(reflected!($o), 0).0
+        )
+    };
+    ($e:ident, $v:ident, $o:ident, $w:ty, $state:expr, $bytes:expr, $params:expr,
+     $fold_keys:expr, $table:expr) => {{
         let (state, bytes, params): (_, &[u8], &CrcParams) = ($state, $bytes, $params);
         let len = bytes.len();
         debug_assert!((16..short_end!($v)).contains(&len));
@@ -624,8 +1359,8 @@ macro_rules! short_body {
             // as they are: hidden behind `opaque_keys`, a constant table's test of its Barrett
             // key became a load and a branch after the fold, and its keys came from memory.
             let keys = params.keys.fold_keys();
+            let fold_keys: &[u64; 23] = $fold_keys;
             let mut s = <$w>::create_state(state, reflected, &ops).value;
-            let (table, _) = <$w>::get_last_bytes_table_ptr(reflected, 0);
             fold_call!(
                 $e,
                 $v,
@@ -633,8 +1368,8 @@ macro_rules! short_body {
                 s,
                 bytes.as_ptr(),
                 len,
-                keys.as_ptr(),
-                table,
+                fold_keys.as_ptr(),
+                $table,
                 <X86SsePclmulqdqOps as crate::traits::ArchOps>::load_aligned(
                     &ops,
                     &<$w>::load_constants(false)[0] as *const [u64; 2]
@@ -657,6 +1392,12 @@ macro_rules! short_body {
 macro_rules! short_end {
     (full) => {
         256
+    };
+    (w256) => {
+        256
+    };
+    (w512) => {
+        128
     };
     (h128) => {
         128
@@ -739,7 +1480,9 @@ macro_rules! iso_hdlc_update {
                 Width32,
                 !crc,
                 bytes,
-                &crate::crc32::consts::CRC32_ISO_HDLC
+                &crate::crc32::consts::CRC32_ISO_HDLC,
+                iso_hdlc_keys(),
+                SHUFFLE_REFLECTED.0.as_ptr() as *const u8
             ) as u64
         }
     };
@@ -764,7 +1507,17 @@ macro_rules! iso_hdlc_checksum {
             let len = bytes.len();
             if len >= 16 {
                 if len < short_end!($v) {
-                    return !short_body!($e, $v, r32, Width32, !0u32, bytes, params) as u64;
+                    return !short_body!(
+                        $e,
+                        $v,
+                        r32,
+                        Width32,
+                        !0u32,
+                        bytes,
+                        params,
+                        iso_hdlc_keys(),
+                        SHUFFLE_REFLECTED.0.as_ptr() as *const u8
+                    ) as u64;
                 }
                 if len >= 128 {
                     if len >= crate::arch::MID_END {
@@ -834,7 +1587,7 @@ iso_hdlc_update!("sse4.1,pclmulqdq,avx", avx, h128, iso_hdlc_short128_avx);
 iso_hdlc_checksum!(
     "avx512vl,vpclmulqdq",
     avx,
-    h128,
+    w512,
     iso_hdlc_checksum_avx512_vpclmulqdq,
     iso_hdlc_mid_x86_64_avx512_vpclmulqdq,
     iso_hdlc_fold_x86_64_avx512_vpclmulqdq,
@@ -854,12 +1607,27 @@ iso_hdlc_checksum!(
 iso_hdlc_checksum!(
     "avx2,vpclmulqdq,sse4.1,pclmulqdq",
     avx,
-    h128,
+    w256,
     iso_hdlc_checksum_avx2_vpclmulqdq,
     iso_hdlc_mid_x86_64_avx2_vpclmulqdq,
     iso_hdlc_fold_x86_64_avx2_vpclmulqdq,
     crate::arch::x86_64::avx2_vpclmulqdq::X86_64Avx2VpclmulqdqOps::new()
 );
+
+/// The wide ladders' bodies from a carried CRC, for the tests: the checksum entries are the
+/// only callers in the library, and they start from no CRC.
+#[cfg(all(test, feature = "std", target_arch = "x86_64"))]
+mod wide_updates {
+    use super::*;
+
+    iso_hdlc_update!(
+        "avx2,vpclmulqdq,sse4.1,pclmulqdq",
+        avx,
+        w256,
+        iso_hdlc_short_w256
+    );
+    iso_hdlc_update!("avx512vl,vpclmulqdq", avx, w512, iso_hdlc_short_w512);
+}
 
 #[cfg(all(test, feature = "std"))]
 mod tests {
@@ -904,6 +1672,14 @@ mod tests {
                 }
             }
         }
+        check_iso_hdlc(end, iso_hdlc);
+    }
+
+    /// Every length of a ladder from four starts, from no CRC and a carried one, through
+    /// CRC-32/ISO-HDLC's update entry over the ladder, against the software path.
+    fn check_iso_hdlc(end: usize, iso_hdlc: unsafe fn(u32, &[u8]) -> u64) {
+        let mut data = vec![0u8; 512];
+        rng().fill(&mut data[..]);
         let params = &crate::crc32::consts::CRC32_ISO_HDLC;
         for offset in [0usize, 1, 15, 33] {
             for len in 16..end {
@@ -979,5 +1755,78 @@ mod tests {
             ],
             iso_hdlc_short128_avx,
         );
+    }
+
+    /// A checksum entry over every length up to past its ladder and into its folds, from four
+    /// starts, against the software path.
+    fn check_checksum(checksum: unsafe fn(&[u8]) -> u64) {
+        let mut data = vec![0u8; 700];
+        rng().fill(&mut data[..]);
+        let params = &crate::crc32::consts::CRC32_ISO_HDLC;
+        for offset in [0usize, 1, 15, 33] {
+            for len in 0..600 {
+                let input = &data[offset..offset + len];
+                let expected = !crate::arch::software::update(!0, input, params) & 0xffff_ffff;
+                assert_eq!(
+                    unsafe { checksum(input) },
+                    expected,
+                    "CRC-32/ISO-HDLC checksum offset {offset} len {len}"
+                );
+            }
+        }
+    }
+
+    /// The SSE tier's checksum entries, both encodings, forced onto them.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_sse_checksums_match_software() {
+        if !(is_x86_feature_detected!("sse4.1") && is_x86_feature_detected!("pclmulqdq")) {
+            eprintln!("skipping: the CPU lacks SSE4.1 or PCLMULQDQ");
+            return;
+        }
+        check_checksum(iso_hdlc_checksum_sse);
+        if is_x86_feature_detected!("avx") {
+            check_checksum(iso_hdlc_checksum_avx);
+        }
+    }
+
+    /// The 256-bit ladder of the AVX2 tier with VPCLMULQDQ, through its update body and the
+    /// tier's checksum entry, forced onto them.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    #[cfg_attr(miri, ignore)]
+    fn test_w256_matches_software() {
+        if !(is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("vpclmulqdq")
+            && is_x86_feature_detected!("sse4.1")
+            && is_x86_feature_detected!("pclmulqdq"))
+        {
+            eprintln!("skipping: the CPU lacks AVX2 or VPCLMULQDQ");
+            return;
+        }
+        check_iso_hdlc(256, super::wide_updates::iso_hdlc_short_w256);
+        check_checksum(iso_hdlc_checksum_avx2_vpclmulqdq);
+    }
+
+    /// The 512-bit ladder of the AVX-512 tier with VPCLMULQDQ, through its update body and the
+    /// tier's checksum entry, forced onto them; and the AVX-512 tier without VPCLMULQDQ's
+    /// checksum entry.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    #[cfg_attr(miri, ignore)]
+    fn test_w512_matches_software() {
+        if !(is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512vl")) {
+            eprintln!("skipping: the CPU lacks AVX-512VL");
+            return;
+        }
+        if is_x86_feature_detected!("pclmulqdq") {
+            check_checksum(iso_hdlc_checksum_avx512_pclmulqdq);
+        }
+        if !is_x86_feature_detected!("vpclmulqdq") {
+            eprintln!("skipping the 512-bit ladder: the CPU lacks VPCLMULQDQ");
+            return;
+        }
+        check_iso_hdlc(128, super::wide_updates::iso_hdlc_short_w512);
+        check_checksum(iso_hdlc_checksum_avx512_vpclmulqdq);
     }
 }
