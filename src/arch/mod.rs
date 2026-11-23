@@ -159,13 +159,18 @@ pub(crate) unsafe fn update(state: u64, bytes: &[u8], params: &CrcParams) -> u64
     }
 }
 
+/// Where a tier's CRC-32/ISO-HDLC entry hands over from the fold that takes the buffer whole to
+/// the general one.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+const MID_END: usize = 4096;
+
 /// One x86 tier, built as [`aarch64_tier!`] is: buffers shorter than 128 bytes inline in the
 /// entry point, longer ones through an out-of-line fold with the tier's features, each bit
 /// order compiled apart. With the folds inlined into the entry point, every call saved six
 /// general registers and set up a 280-byte frame before looking at the length.
 macro_rules! x86_tier {
-    ($(#[$cfg:meta])* $update:ident, $fold:ident, $iso_hdlc:ident, $iso_hdlc_fold:ident,
-     $features:literal, $ops:ty) => {
+    ($(#[$cfg:meta])* $update:ident, $fold:ident, $iso_hdlc:ident, $iso_hdlc_mid:ident,
+     $iso_hdlc_fold:ident, $features:literal, $ops:ty) => {
         $(#[$cfg])*
         #[inline]
         #[target_feature(enable = $features)]
@@ -200,9 +205,26 @@ macro_rules! x86_tier {
         #[target_feature(enable = $features)]
         unsafe fn $iso_hdlc(state: u32, bytes: &[u8], ops: $ops) -> u32 {
             if bytes.len() >= 128 {
-                return $iso_hdlc_fold(state, bytes, ops);
+                if bytes.len() >= MID_END {
+                    return $iso_hdlc_fold(state, bytes, ops);
+                }
+                return $iso_hdlc_mid(state, bytes, ops);
             }
-            algorithm::update_short::<_, Width32>(
+            algorithm::update_short_ladder::<_, Width32>(
+                state,
+                bytes,
+                &crate::crc32::consts::CRC32_ISO_HDLC,
+                &ops,
+            )
+        }
+
+        /// 128 bytes up to `MID_END`, folded from where they start and nothing else, so that
+        /// they pay neither for the entry's short arms nor for the long fold's set-up.
+        $(#[$cfg])*
+        #[inline(never)]
+        #[target_feature(enable = $features)]
+        unsafe fn $iso_hdlc_mid(state: u32, bytes: &[u8], ops: $ops) -> u32 {
+            algorithm::update_mid::<_, Width32>(
                 state,
                 bytes,
                 &crate::crc32::consts::CRC32_ISO_HDLC,
@@ -265,6 +287,7 @@ x86_tier!(
     update_x86_sse_pclmulqdq,
     fold_x86_sse_pclmulqdq,
     iso_hdlc_x86_sse_pclmulqdq,
+    iso_hdlc_mid_x86_sse_pclmulqdq,
     iso_hdlc_fold_x86_sse_pclmulqdq,
     "sse4.1,pclmulqdq",
     crate::arch::x86::sse::X86SsePclmulqdqOps
@@ -274,8 +297,9 @@ x86_tier!(
     update_x86_64_avx512_pclmulqdq,
     fold_x86_64_avx512_pclmulqdq,
     iso_hdlc_x86_64_avx512_pclmulqdq,
+    iso_hdlc_mid_x86_64_avx512_pclmulqdq,
     iso_hdlc_fold_x86_64_avx512_pclmulqdq,
-    "avx512vl,pclmulqdq",
+    "avx512vl,avx512bw,pclmulqdq",
     crate::arch::x86_64::avx512::X86_64Avx512PclmulqdqOps
 );
 x86_tier!(
@@ -283,8 +307,9 @@ x86_tier!(
     update_x86_64_avx512_vpclmulqdq,
     fold_x86_64_avx512_vpclmulqdq,
     iso_hdlc_x86_64_avx512_vpclmulqdq,
+    iso_hdlc_mid_x86_64_avx512_vpclmulqdq,
     iso_hdlc_fold_x86_64_avx512_vpclmulqdq,
-    "avx512vl,vpclmulqdq",
+    "avx512vl,avx512bw,vpclmulqdq",
     crate::arch::x86_64::avx512_vpclmulqdq::X86_64Avx512VpclmulqdqOps
 );
 x86_tier!(
@@ -292,6 +317,7 @@ x86_tier!(
     update_x86_64_avx2_vpclmulqdq,
     fold_x86_64_avx2_vpclmulqdq,
     iso_hdlc_x86_64_avx2_vpclmulqdq,
+    iso_hdlc_mid_x86_64_avx2_vpclmulqdq,
     iso_hdlc_fold_x86_64_avx2_vpclmulqdq,
     "avx2,vpclmulqdq,sse4.1,pclmulqdq",
     crate::arch::x86_64::avx2_vpclmulqdq::X86_64Avx2VpclmulqdqOps
@@ -564,19 +590,22 @@ mod tests {
     /// and the unaligned head and tail, from the init state and a carried state.
     #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "std"))]
     fn check_x86_tier_matches_software(tier: impl Fn(u64, &[u8], &CrcParams) -> u64) {
-        let mut data = vec![0u8; 8192 + 64];
+        // Long enough for the buffers that are split at a 64-byte boundary first
+        const LONG: usize = 64 << 10;
+        let mut data = vec![0u8; LONG + 512];
         rng().fill(&mut data[..]);
 
         let mut lengths: Vec<usize> = (0..=64).collect();
         lengths.extend(120..=400);
         lengths.extend([511, 512, 513, 1023, 1024, 1025, 4095, 4096, 4097, 8192]);
+        lengths.extend([LONG - 1, LONG, LONG + 1, LONG + 63, LONG + 129, LONG + 300]);
 
         for config in TEST_ALL_CONFIGS {
             let params = config.get_params();
             let init = config.get_init_algorithm();
             let carried = crate::arch::software::update(init, &data[8192..8192 + 7], params);
 
-            for offset in [0usize, 1, 15, 33] {
+            for offset in [0usize, 1, 15, 33, 63, 64] {
                 for &len in &lengths {
                     let input = &data[offset..offset + len];
                     for state in [init, carried] {
@@ -758,7 +787,7 @@ mod tests {
             let init = config.get_init_algorithm();
             let carried = crate::arch::software::update(init, &data[8192..8192 + 7], params);
 
-            for offset in [0usize, 1, 15, 33] {
+            for offset in [0usize, 1, 15, 33, 63, 64] {
                 for &len in &lengths {
                     let input = &data[offset..offset + len];
                     for state in [init, carried] {

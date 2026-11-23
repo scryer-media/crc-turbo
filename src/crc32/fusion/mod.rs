@@ -13,6 +13,7 @@
 //! detection of its own.
 
 mod aarch64;
+mod powers;
 mod x86;
 
 /// The aarch64 fusion kernel this CPU runs, for CRC-32/ISCSI and CRC-32/ISO-HDLC alike, or
@@ -73,16 +74,19 @@ pub(crate) fn crc32_iscsi(state: u32, data: &[u8]) -> Option<u32> {
 pub(crate) fn crc32_iscsi(state: u32, data: &[u8]) -> Option<u32> {
     static PLAN: std::sync::OnceLock<Option<x86::IscsiPlan>> = std::sync::OnceLock::new();
 
-    let plan = (*PLAN.get_or_init(|| {
-        let tier = crate::feature_detection::get_arch_ops().get_tier();
-        let kernel = x86::select_iscsi_kernel(
-            tier,
-            std::arch::is_x86_feature_detected!("sse4.2"),
-            std::arch::is_x86_feature_detected!("avx2"),
-        )?;
+    // Borrowed: the short path reads one field of it and should not copy the rest.
+    let plan = PLAN
+        .get_or_init(|| {
+            let tier = crate::feature_detection::get_arch_ops().get_tier();
+            let kernel = x86::select_iscsi_kernel(
+                tier,
+                std::arch::is_x86_feature_detected!("sse4.2"),
+                std::arch::is_x86_feature_detected!("avx2"),
+            )?;
 
-        Some(x86::iscsi_plan(kernel, tier, x86::CpuId::detect()))
-    }))?;
+            Some(x86::iscsi_plan(kernel, tier, x86::CpuId::detect()))
+        })
+        .as_ref()?;
 
     if data.len() <= plan.direct_max {
         // A short buffer is a direct call, ahead of the kernel's pointer.
@@ -90,7 +94,7 @@ pub(crate) fn crc32_iscsi(state: u32, data: &[u8]) -> Option<u32> {
         return Some(unsafe { x86::crc32_iscsi_small_unaligned(state, data) });
     }
 
-    if data.len() >= plan.fold_min {
+    if data.len() >= plan.fold_min && data.len() < plan.fold_end {
         return None;
     }
 
