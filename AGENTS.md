@@ -51,7 +51,12 @@ major version and a reason, not convenience.
 - `unsafe` is confined to the architecture modules, the C library
   (`src/ffi.rs`) and the places upstream already has it. Every block calling
   an intrinsic is reached only through a function with the matching
-  `#[target_feature]`, after detection.
+  `#[target_feature]`, after detection. The one exception is inline asm that
+  has to inline into a caller built without the feature, where a
+  `#[target_feature]` function would force a call: it may stand outside one
+  when it is reached only through a value that is set after detection of the
+  feature, is compiled out under `cfg(miri)` in favour of an intrinsics path,
+  and has an oracle test that a mutation of the asm fails.
 - Miri runs the whole suite on x86_64. A change that makes a test
   Miri-incompatible ignores that one test under `cfg(miri)`, never the lane.
 
