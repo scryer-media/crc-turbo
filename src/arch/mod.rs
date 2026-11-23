@@ -780,10 +780,25 @@ mod tests {
         }
     }
 
+    /// The split-buffer cutoff is chosen per target: Apple's cores keep the unaligned fold to
+    /// 256 KiB, other aarch64 parts split a buffer from 64 KiB.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn test_aarch64_unaligned_fold_end_per_vendor() {
+        let want = if cfg!(target_vendor = "apple") {
+            256 << 10
+        } else {
+            64 << 10
+        };
+        assert_eq!(crate::algorithm::UNALIGNED_FOLD_END, want);
+    }
+
     /// Forces each aarch64 tier, the SHA3 one on any CPU that has it whatever dispatch picks, and
     /// checks every algorithm, both bit orders, against the table-driven software implementation
     /// across the 128-byte fold at every chunk count from two to nine and the unaligned head and
-    /// tail, from the init state and a carried state.
+    /// tail, from the init state and a carried state. Lengths either side of
+    /// `UNALIGNED_FOLD_END`, from an aligned and an unaligned start, take the unaligned fold and
+    /// the split buffer.
     #[test]
     #[cfg(all(target_arch = "aarch64", feature = "std"))]
     #[cfg_attr(miri, ignore)]
@@ -794,7 +809,9 @@ mod tests {
         }
         let sha3 = std::arch::is_aarch64_feature_detected!("sha3");
 
-        let mut data = vec![0u8; 8192 + 64];
+        let end = crate::algorithm::UNALIGNED_FOLD_END;
+        let long = [end - 1, end, end + 1, end + 77];
+        let mut data = vec![0u8; (end + 77).max(8192) + 64];
         rng().fill(&mut data[..]);
 
         let mut lengths: Vec<usize> = (0..=64).collect();
@@ -815,7 +832,9 @@ mod tests {
             let carried = crate::arch::software::update(init, &data[8192..8192 + 7], params);
 
             for offset in [0usize, 1, 15, 33, 63, 64] {
-                for &len in &lengths {
+                // The long lengths from an aligned and an unaligned start only, for time.
+                let long: &[usize] = if offset <= 1 { &long } else { &[] };
+                for &len in lengths.iter().chain(long) {
                     let input = &data[offset..offset + len];
                     for state in [init, carried] {
                         let expected = crate::arch::software::update(state, input, params);
