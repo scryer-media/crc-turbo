@@ -207,9 +207,8 @@ own changelog up to the fork point continues below, unchanged.
   written as inline assembly inside the caller on x86_64, ahead of the
   fusion kernel; crc-fast aligns first, a byte at a time, and so does this
   crate through 1.11.0. The entry is frame-free and tail-jumps to the
-  plan, and the `x86_64-avx512-vpclmulqdq` `v3x2` kernel aligns and
-  finishes in inline assembly, so their shape does not depend on the
-  compiler version; crc-fast's are compiler-chosen.
+  plan, so its shape does not depend on the compiler version; crc-fast's
+  is compiler-chosen.
 - The fusion kernel for CRC-32/ISCSI, and on aarch64 for CRC-32/ISO-HDLC,
   is chosen once per process: on x86 kept as a function pointer, on aarch64
   as one byte ahead of direct calls. crc-fast, and this crate through
@@ -1094,12 +1093,14 @@ own changelog up to the fork point continues below, unchanged.
     saves no registers and keeps no stack frame; widened to `u64`, as
     `checksum` returns it, only the long arm sets up a frame. The plan function's first-call and fold arms are tail
     jumps to their own out-of-line functions;
-  - the AVX-512 VPCLMULQDQ kernel's `v3x2` shape aligns its start and
-    finishes its last bytes in inline assembly. A change in the caller had
-    let LLVM drop a range fact it had inferred, which grew the kernel from
-    195 to 211 instructions. It is now 134 instructions, and a last fold of
-    64-byte blocks at one 512-bit fold key replaces the 8-byte CRC32 loop
-    over the remainder.
+  - the AVX-512 VPCLMULQDQ kernel's `v3x2` shape folds the 64-byte blocks
+    left after its 384-byte steps at one 512-bit fold key, where 1.11.0 ran
+    the 8-byte CRC32 loop over them. Its aligning head and its last bytes
+    stay the intrinsic loops 1.11.0 has: written as inline assembly they
+    measured 0.75x to 0.95x of 1.11.0 at 512 unaligned bytes on a Xeon
+    Platinum 8488C in twelve of twelve layout runs, and the intrinsic head
+    1.03x to 1.24x. The kernel's instruction count is pinned by the codegen
+    snapshot instead.
 
   Miri runs the intrinsic versions. Each assembly block has a test against
   the software path over every alignment within 16 bytes and lengths

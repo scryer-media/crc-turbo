@@ -6,7 +6,7 @@
 # `cargo xtask codegen bless --target x86_64-unknown-linux-gnu`.
 # `body=compiler` marks a function whose assembly covers only part of it: the
 # rest is intrinsics, exact on the pinned build and not bounded elsewhere.
-crc_turbo::crc32::fusion::x86::iscsi::avx512_vpclmulqdq::crc32_iscsi_avx512_vpclmulqdq_v3x2 asm=15a9874e82553ff4/30 glue=77 calls=0 body=compiler
+crc_turbo::crc32::fusion::x86::iscsi::avx512_vpclmulqdq::crc32_iscsi_avx512_vpclmulqdq_v3x2 asm=0000000000000000/0 glue=123 calls=0 body=compiler
 crc_turbo::crc32::fusion::x86::iscsi::sse_pclmulqdq::crc32_iscsi_avx2_v4_asm asm=e954a2e1abf2392d/109 glue=5 calls=0
 crc_turbo::arch::x86::short_asm::short_sse_r16 asm=dce057e8a8a243d1/456 glue=41 calls=0
 crc_turbo::arch::x86::short_asm::short_sse_r32 asm=dce057e8a8a243d1/456 glue=38 calls=0

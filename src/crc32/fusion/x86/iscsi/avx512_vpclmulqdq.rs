@@ -13,8 +13,6 @@
 /// Modified as necessary for this Rust implementation.
 ///
 /// Uses AVX-512 VPCLMULQDQ instructions
-// Out of line: inlined into its entry point, the registers it saves are saved for the short
-// buffers that return before reaching it
 #[inline(never)]
 #[target_feature(enable = "avx512vl,vpclmulqdq")]
 pub unsafe fn crc32_iscsi_avx512_vpclmulqdq_v3x2(
@@ -24,9 +22,19 @@ pub unsafe fn crc32_iscsi_avx512_vpclmulqdq_v3x2(
 ) -> u32 {
     use crate::fusion::x86::*;
 
-    // The head: to an 8-byte boundary a byte at a time, then to a 64-byte one a word at a time,
-    // as far as the buffer goes. Its instructions are fixed, see `head`.
-    (crc0, buf, len) = head(crc0, buf, len);
+    // Align to 8-byte boundary
+    while len > 0 && (buf as usize & 7) != 0 {
+        crc0 = _mm_crc32_u8(crc0, *buf);
+        buf = buf.add(1);
+        len -= 1;
+    }
+
+    // Align to 64-byte boundary (cache line)
+    while (buf as usize & 56) != 0 && len >= 8 {
+        crc0 = _mm_crc32_u64(crc0.into(), *(buf as *const u64)) as u32;
+        buf = buf.add(8);
+        len -= 8;
+    }
 
     if len >= 384 {
         // First vector chunk - load three 512-bit vectors (192 bytes total)
@@ -144,9 +152,7 @@ pub unsafe fn crc32_iscsi_avx512_vpclmulqdq_v3x2(
         x0 = _mm512_ternarylogic_epi64(x0, y0, x1, 0x96);
 
         // Fold each whole 64-byte block left into the one lane with the same 64-byte key the
-        // reduction above used, rather than leaving it to the CRC32 instruction: a fold step
-        // waits on one multiply, eight CRC32 instructions on each other. A 512-byte buffer
-        // has two such blocks after the 384-byte step, a 1 KiB one four.
+        // reduction above used, rather than leaving it to the CRC32 instruction.
         while len >= 64 {
             y0 = clmul_lo_avx512_vpclmulqdq(x0, k);
             x0 = clmul_hi_avx512_vpclmulqdq(x0, k);
@@ -195,143 +201,21 @@ pub unsafe fn crc32_iscsi_avx512_vpclmulqdq_v3x2(
         crc0 = _mm_crc32_u64(crc0.into(), _mm_extract_epi64(z0, 1) as u64) as u32;
     }
 
-    // The tail: what is left a word at a time, then a byte at a time. Its instructions are
-    // fixed, see `tail`.
-    tail(crc0, buf, len)
-}
-
-/// The kernel's head: CRC-32/ISCSI over the bytes from `buf` up to the first 64-byte boundary,
-/// or as far towards it as `len` allows, returning the state and what is left. A buffer shorter
-/// than 8 bytes is left whole for [`tail`].
-///
-/// Written as one block of inline assembly, so that its instructions, and the length checks
-/// among them, are the same whatever compiler builds the crate and whoever calls the kernel:
-/// built from intrinsics, its shape followed what the compiler could prove about the callers'
-/// lengths, and grew by a third when the stream kernel became a caller. The intrinsics build
-/// is kept for Miri, which runs no inline assembly.
-///
-/// # Safety
-///
-/// The CPU must have SSE4.2, and the `len` bytes from `buf` must be readable.
-#[inline(always)]
-unsafe fn head(crc: u32, buf: *const u8, len: usize) -> (u32, *const u8, usize) {
-    #[cfg(not(miri))]
-    {
-        let mut crc = crc as u64;
-        let (mut buf, mut len) = (buf, len);
-        // SAFETY: every load is of bytes within the `len` from `buf`: nothing is read when fewer
-        // than 8 are left; the byte loop stops at an 8-byte boundary, which is fewer than 8 bytes
-        // on; the word loop runs only while at least 8 are left
-        unsafe {
-            core::arch::asm!(
-                "cmp {n}, 8",
-                "jb 5f",
-                "test {p:l}, 7",
-                "jz 3f",
-                "2:",
-                "crc32 {c:e}, byte ptr [{p}]",
-                "add {p}, 1",
-                "sub {n}, 1",
-                "test {p:l}, 7",
-                "jnz 2b",
-                "3:",
-                "test {p:l}, 56",
-                "jz 5f",
-                "cmp {n}, 8",
-                "jb 5f",
-                "crc32 {c}, qword ptr [{p}]",
-                "add {p}, 8",
-                "sub {n}, 8",
-                "jmp 3b",
-                "5:",
-                c = inout(reg) crc,
-                p = inout(reg) buf,
-                n = inout(reg) len,
-                options(pure, readonly, nostack),
-            );
-        }
-        (crc as u32, buf, len)
+    // Process remaining 8-byte chunks
+    while len >= 8 {
+        crc0 = _mm_crc32_u64(crc0.into(), *(buf as *const u64)) as u32;
+        buf = buf.add(8);
+        len -= 8;
     }
 
-    #[cfg(miri)]
-    {
-        use crate::fusion::x86::*;
-
-        let (mut crc, mut buf, mut len) = (crc, buf, len);
-        if len >= 8 {
-            while (buf as usize & 7) != 0 {
-                crc = _mm_crc32_u8(crc, *buf);
-                buf = buf.add(1);
-                len -= 1;
-            }
-            while (buf as usize & 56) != 0 && len >= 8 {
-                crc = _mm_crc32_u64(crc.into(), *(buf as *const u64)) as u32;
-                buf = buf.add(8);
-                len -= 8;
-            }
-        }
-        (crc, buf, len)
-    }
-}
-
-/// The kernel's tail: CRC-32/ISCSI over the `len` bytes from `buf`, a word at a time and then a
-/// byte at a time. One block of inline assembly, as [`head`] is, with the intrinsics build kept
-/// for Miri.
-///
-/// # Safety
-///
-/// The CPU must have SSE4.2, and the `len` bytes from `buf` must be readable.
-#[inline(always)]
-unsafe fn tail(crc: u32, buf: *const u8, len: usize) -> u32 {
-    #[cfg(not(miri))]
-    {
-        let mut crc = crc as u64;
-        // SAFETY: the word loop runs while at least 8 bytes are left, the byte loop while any are
-        unsafe {
-            core::arch::asm!(
-                "cmp {n}, 8",
-                "jb 3f",
-                "2:",
-                "crc32 {c}, qword ptr [{p}]",
-                "add {p}, 8",
-                "sub {n}, 8",
-                "cmp {n}, 8",
-                "jae 2b",
-                "3:",
-                "test {n}, {n}",
-                "jz 5f",
-                "4:",
-                "crc32 {c:e}, byte ptr [{p}]",
-                "add {p}, 1",
-                "sub {n}, 1",
-                "jnz 4b",
-                "5:",
-                c = inout(reg) crc,
-                p = inout(reg) buf => _,
-                n = inout(reg) len => _,
-                options(pure, readonly, nostack),
-            );
-        }
-        crc as u32
+    // Process remaining bytes
+    while len > 0 {
+        crc0 = _mm_crc32_u8(crc0, *buf);
+        buf = buf.add(1);
+        len -= 1;
     }
 
-    #[cfg(miri)]
-    {
-        use crate::fusion::x86::*;
-
-        let (mut crc, mut buf, mut len) = (crc, buf, len);
-        while len >= 8 {
-            crc = _mm_crc32_u64(crc.into(), *(buf as *const u64)) as u32;
-            buf = buf.add(8);
-            len -= 8;
-        }
-        while len > 0 {
-            crc = _mm_crc32_u8(crc, *buf);
-            buf = buf.add(1);
-            len -= 1;
-        }
-        crc
-    }
+    crc0
 }
 
 #[cfg(test)]
@@ -341,7 +225,7 @@ mod tests {
 
     /// The kernel, called directly, against the software path, the oracle: every length through
     /// three of its 384-byte steps, which takes in the short buffers the stream kernel hands it
-    /// and the head's early return below 8 bytes, from every start within a cache line's first
+    /// and buffers shorter than a word, from every start within a cache line's first
     /// 16 bytes and a few later ones, from the init state, zero and a carried state.
     #[test]
     #[cfg_attr(miri, ignore)]
