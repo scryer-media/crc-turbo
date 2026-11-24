@@ -58,7 +58,11 @@ own changelog up to the fork point continues below, unchanged.
   mnemonic, and the count of instructions and calls the compiler generated
   around it. CI runs it on the pinned toolchain, on the MSRV and as a
   dependent crate builds the library (no LTO, default codegen units), on
-  x86_64 and aarch64; `codegen-watch.yml` runs it weekly on beta and nightly.
+  x86_64 and aarch64, for Linux and for Windows; `codegen-watch.yml` runs it
+  weekly on beta and nightly. It also refuses an `asm!` scratch operand
+  written `out(zmm_reg) _` anywhere in `src/`.
+- Miri runs the suite for aarch64 as well as x86_64, where upstream's lane
+  was x86_64 alone.
 
 ### Fixes taken from crc-fast's open pull requests
 
@@ -461,6 +465,49 @@ own changelog up to the fork point continues below, unchanged.
   of `A`. `zeros` returns the CRC of that many zero bytes.
 - New `checksum_zeros` and `checksum_zeros_with_params`: the CRC of `len`
   zero bytes in O(log len), without touching memory.
+
+## 1.11.2 - 2026-11-24
+
+No checksum, kernel or dispatch choice changes in this release: a build
+outside Miri compiles the same code as 1.11.1, and the code generation
+snapshots for both Linux targets are unchanged. It adds three checks.
+
+- `cargo xtask codegen check` refuses an `asm!` scratch operand of class
+  `zmm_reg` with no type (`out(zmm_reg) _` or `lateout(zmm_reg) _`) anywhere
+  in `src/`, before it builds anything. That form is what kept 1.11.1's
+  first tree from building for `x86_64-pc-windows-msvc`: rustc prints such
+  an operand as a register name that does not assemble when the allocator
+  places it in `zmm16` to `zmm31`, with or without a `:z` modifier, and the
+  same operand fails for Linux once the lower registers are taken. A build
+  that passes shows only where this compiler placed it, so the rule is on
+  the source. `xmm_reg` and `ymm_reg` operands are not placed above
+  register 15 and are not held to it.
+- The code generation snapshot covers `x86_64-pc-windows-msvc` and
+  `aarch64-pc-windows-msvc`, on the pinned toolchain, the minimum one and
+  as a dependent crate builds the library, and weekly on beta and nightly.
+  Both are cross-built on a Linux runner. On x86_64 the inline assembly of
+  every listed function is the same as on Linux, mnemonic for mnemonic, and
+  the compiler's code around it is up to 16 instructions longer where it
+  saves `xmm6` to `xmm15`. On aarch64 the whole-function assembly kernels
+  are built for Linux and Android only, so the Windows snapshot lists the
+  six lane kernels that target runs. The listing parser learned where a
+  COFF function ends (`.seh_endproc`, or the next symbol's `.def`).
+- Miri runs the suite for `aarch64-unknown-linux-gnu`. Until now nothing
+  interpreted the aarch64 kernels. Three things stood in the way, each
+  changed under `cfg(miri)` only:
+  - the aarch64 inline assembly had no compiled path for Miri. Under Miri
+    the Linux assembly kernels give way to the compiled lane kernels the
+    other aarch64 targets run and the tests check the assembly against,
+    and the adjacent multiply pair and the key load are intrinsics;
+  - Miri does not implement EOR3, so the SHA3 kernels take two EORs in its
+    place there;
+  - the CPU model is read from a file, which Miri's isolation refuses; under
+    Miri the model is unknown, as on a kernel without the file.
+
+  Miri's aarch64 CPU reports no features, so the lane enables `crc`, `aes`
+  and `sha3` at build time. One test of the held PMULL kernels takes its
+  long lengths around 64 KiB under Miri rather than a megabyte, which runs
+  the same stream loop; interpreted, the megabytes took most of an hour.
 
 ## 1.11.1 - 2026-11-24
 

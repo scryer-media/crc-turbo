@@ -665,7 +665,7 @@ PRs welcome!
 Given the heavy use of hardware intrinsics, this crate uses a decent amount of `unsafe` code.
 
 To help ensure memory safety and stability, this crate is validated using [Miri](https://github.com/rust-lang/miri) on
-`x86_64` as well as fuzz tested using [libFuzzer](https://github.com/rust-fuzz/libfuzzer) over millions of iterations.
+`x86_64` and `aarch64` as well as fuzz tested using [libFuzzer](https://github.com/rust-fuzz/libfuzzer) over millions of iterations.
 
 ## References
 

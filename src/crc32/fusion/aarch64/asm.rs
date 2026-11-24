@@ -23,6 +23,7 @@
 #![cfg(all(
     target_arch = "aarch64",
     target_endian = "little",
+    not(miri),
     any(target_os = "linux", target_os = "android")
 ))]
 

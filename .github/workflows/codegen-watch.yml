@@ -31,12 +31,23 @@ jobs:
       fail-fast: false
       matrix:
         toolchain: [beta, nightly]
-        platform: [x86_64, aarch64]
+        platform: [x86_64, aarch64, x86_64-windows, aarch64-windows]
         include:
           - platform: x86_64
             runner: ubuntu-26.04
+            target: x86_64-unknown-linux-gnu
           - platform: aarch64
             runner: ubuntu-26.04-arm
+            target: aarch64-unknown-linux-gnu
+          # Cross-built, as in ci.yml: a library's assembly listing needs no linker.
+          - platform: x86_64-windows
+            runner: ubuntu-26.04
+            target: x86_64-pc-windows-msvc
+          - platform: aarch64-windows
+            runner: ubuntu-26.04
+            target: aarch64-pc-windows-msvc
+    env:
+      TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -44,6 +55,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ matrix.toolchain }}
+          targets: ${{ matrix.target }}
       - name: The compiler under watch
         env:
           TOOLCHAIN: ${{ matrix.toolchain }}
@@ -51,8 +63,8 @@ jobs:
       - name: The release profile
         env:
           TOOLCHAIN: ${{ matrix.toolchain }}
-        run: cargo "+$TOOLCHAIN" xtask codegen check
+        run: cargo "+$TOOLCHAIN" xtask codegen check --target "$TARGET"
       - name: As a dependent crate builds it by default
         env:
           TOOLCHAIN: ${{ matrix.toolchain }}
-        run: cargo "+$TOOLCHAIN" xtask codegen check --profile consumer
+        run: cargo "+$TOOLCHAIN" xtask codegen check --target "$TARGET" --profile consumer

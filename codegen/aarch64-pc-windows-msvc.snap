@@ -1,0 +1,17 @@
+# Hot paths on aarch64-pc-windows-msvc, checked by `cargo xtask codegen check`.
+# One function per line: its Rust path, then what the pinned toolchain's
+# release build made of it. `asm` is a hash of the inline assembly's mnemonics
+# and their count, `glue` the instructions the compiler generated around it,
+# `calls` how many of those are calls. Rewrite the numbers with
+# `cargo xtask codegen bless --target aarch64-pc-windows-msvc`.
+# `body=compiler` marks a function whose assembly covers only part of it: the
+# rest is intrinsics, exact on the pinned build and not bounded elsewhere.
+# The whole-function assembly kernels in `fusion::aarch64::asm` are built for
+# Linux and Android only, so this target runs the lane kernels below, whose
+# assembly is the adjacent multiply pairs and the key loads.
+crc_turbo::crc32::fusion::aarch64::lanes::crc32_iscsi_v3s4 asm=4c3b2e965e0cb635/20 glue=485 calls=1 body=compiler
+crc_turbo::crc32::fusion::aarch64::lanes::crc32_iso_hdlc_v3s4 asm=4c3b2e965e0cb635/20 glue=485 calls=1 body=compiler
+crc_turbo::crc32::fusion::aarch64::lanes::crc32_iscsi_eor3_v4 asm=0000000000000000/0 glue=66 calls=0 body=compiler
+crc_turbo::crc32::fusion::aarch64::lanes::crc32_iso_hdlc_eor3_v4 asm=0000000000000000/0 glue=66 calls=0 body=compiler
+crc_turbo::crc32::fusion::aarch64::lanes::crc32_iscsi_eor3_v8 asm=0000000000000000/0 glue=95 calls=0 body=compiler
+crc_turbo::crc32::fusion::aarch64::lanes::crc32_iso_hdlc_eor3_v8 asm=0000000000000000/0 glue=95 calls=0 body=compiler

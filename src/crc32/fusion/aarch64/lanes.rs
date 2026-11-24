@@ -31,9 +31,9 @@ use core::arch::aarch64::{
 };
 
 #[cfg(not(target_vendor = "apple"))]
-use crate::crc32::fusion::aarch64::{clmul_hi, clmul_lo};
+use crate::crc32::fusion::aarch64::veor3q_u64;
 #[cfg(not(target_vendor = "apple"))]
-use core::arch::aarch64::veor3q_u64;
+use crate::crc32::fusion::aarch64::{clmul_hi, clmul_lo};
 
 /// `x` folded forward over the 16 bytes at the distance `k` was made for, plus `data`.
 #[inline]
@@ -47,6 +47,7 @@ unsafe fn fold_pair(x: uint64x2_t, k: uint64x2_t, data: uint64x2_t) -> uint64x2_
 /// fast-crc32's `v3s4x2e_v2` writes them (its `clmul_lo_e` and `clmul_hi_e`), on every target:
 /// the compiler's own schedule of [`fold_pair`] may move the EOR away from its product. The
 /// stream kernels' fold.
+#[cfg(not(miri))]
 #[inline]
 #[target_feature(enable = "aes")]
 unsafe fn fold_pair_adjacent(x: uint64x2_t, k: uint64x2_t, data: uint64x2_t) -> uint64x2_t {
@@ -74,6 +75,14 @@ unsafe fn fold_pair_adjacent(x: uint64x2_t, k: uint64x2_t, data: uint64x2_t) -> 
         );
     }
     r
+}
+
+/// Miri runs no assembly: there the pairs are [`fold_pair`]'s intrinsics, the same value.
+#[cfg(miri)]
+#[inline]
+#[target_feature(enable = "aes")]
+unsafe fn fold_pair_adjacent(x: uint64x2_t, k: uint64x2_t, data: uint64x2_t) -> uint64x2_t {
+    fold_pair(x, k, data)
 }
 
 /// [`fold_pair`] with one EOR3 for the two products and the data.
@@ -113,7 +122,7 @@ unsafe fn load_key(k: &[u64; 2]) -> uint64x2_t {
     unsafe {
         #[allow(unused_mut)]
         let mut v = vld1q_u64(k.as_ptr());
-        #[cfg(not(target_vendor = "apple"))]
+        #[cfg(not(any(target_vendor = "apple", miri)))]
         core::arch::asm!(
             "/* {0:v} */",
             inout(vreg) v,
@@ -230,7 +239,7 @@ lane_kernel!(
     /// CRC-32/ISCSI, four lanes, EOR3 folds. Linux and Android run the
     /// assembly copy in `asm`, which fixes where the kernel sits.
     #[cfg_attr(
-        all(target_endian = "little", any(target_os = "linux", target_os = "android")),
+        all(target_endian = "little", not(miri), any(target_os = "linux", target_os = "android")),
         allow(dead_code)
     )]
     crc32_iscsi_eor3_v4, 4, "crc,aes,sha3", fold_eor3, shifts::iscsi_fold_keys, __crc32cd,
@@ -255,7 +264,7 @@ lane_kernel!(
     /// CRC-32/ISO-HDLC, four lanes, EOR3 folds. Linux and Android run the
     /// assembly copy in `asm`, which fixes where the kernel sits.
     #[cfg_attr(
-        all(target_endian = "little", any(target_os = "linux", target_os = "android")),
+        all(target_endian = "little", not(miri), any(target_os = "linux", target_os = "android")),
         allow(dead_code)
     )]
     crc32_iso_hdlc_eor3_v4, 4, "crc,aes,sha3", fold_eor3, shifts::iso_hdlc_fold_keys, __crc32d,
