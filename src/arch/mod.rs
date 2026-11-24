@@ -378,6 +378,15 @@ fn choose_iso_hdlc() -> (IsoHdlcChecksum, IsoHdlcUpdate) {
     use core::sync::atomic::Ordering;
 
     let entries: (IsoHdlcChecksum, IsoHdlcUpdate) = match get_arch_ops() {
+        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        ArchOpsInstance::X86_64Avx512Vpclmulqdq(_)
+            if crate::crc32::fusion::is_sapphire_rapids() =>
+        {
+            (
+                iso_hdlc_checksum_x86_64_avx512_spr,
+                iso_hdlc_x86_64_avx512_spr,
+            )
+        }
         #[cfg(target_arch = "x86_64")]
         ArchOpsInstance::X86_64Avx512Vpclmulqdq(_) => (
             iso_hdlc_checksum_x86_64_avx512_vpclmulqdq,
@@ -437,6 +446,63 @@ unsafe fn iso_hdlc_x86_64_avx2_ecore(crc: u32, bytes: &[u8]) -> u32 {
         return iso_hdlc_mid_x86_64_avx2_ecore(crc, bytes) as u32;
     }
     iso_hdlc_x86_64_avx2_vpclmulqdq(crc, bytes)
+}
+
+/// Sapphire Rapids' CRC-32/ISO-HDLC on the `x86_64-avx512-vpclmulqdq` tier from 256 bytes up
+/// to [`MID_END`]: the 512-bit cascade with four accumulators, fast-crc32's
+/// `avx512_vpclmulqdq_crc32_v4` loop, [`x86_64::iso_hdlc_fold512`]. Below 256 bytes the tier's
+/// own mid fold. On a Xeon Platinum 8488C, against libdeflate in the same run, 2 KiB went from
+/// 0.95x to 0.99x and 512 bytes from 1.06x to 1.12x; on a Xeon Platinum 8375C (Ice Lake) and an
+/// EPYC 9R14 (Zen 4) it was no faster than the tier's fold, and up to 3% slower, so they keep it.
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[inline(never)]
+#[target_feature(enable = "avx512vl,avx512bw,vpclmulqdq")]
+unsafe fn iso_hdlc_mid_x86_64_avx512_spr(crc: u32, bytes: &[u8]) -> u64 {
+    if bytes.len() >= 256 {
+        return x86_64::iso_hdlc_fold512::iso_hdlc_fold512::<false>(crc, bytes);
+    }
+    iso_hdlc_mid_x86_64_avx512_vpclmulqdq(crc, bytes)
+}
+
+/// Sapphire Rapids' CRC-32/ISO-HDLC from [`MID_END`]: below [`SPR_EIGHT_END`] the 512-bit
+/// cascade with eight accumulators over 512-byte steps, libdeflate's and fast-crc32's
+/// `avx512_vpclmulqdq_crc32_v8` loop, and the tier's long fold after that.
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[inline(never)]
+#[target_feature(enable = "avx512vl,avx512bw,vpclmulqdq")]
+unsafe fn iso_hdlc_fold_x86_64_avx512_spr(crc: u32, bytes: &[u8]) -> u64 {
+    if bytes.len() < SPR_EIGHT_END {
+        return x86_64::iso_hdlc_fold512::iso_hdlc_fold512::<true>(crc, bytes);
+    }
+    iso_hdlc_fold_x86_64_avx512_vpclmulqdq(crc, bytes)
+}
+
+/// Where Sapphire Rapids' eight-accumulator cascade hands over to the tier's long fold. On the
+/// Xeon Platinum 8488C, against libdeflate in the same run, it took 4 KiB from 0.97x to 0.98x
+/// and 8 KiB from 0.97x to 1.02x, and was behind the tier's fold at 16 KiB, 0.97x to 0.99x.
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+const SPR_EIGHT_END: usize = 16 << 10;
+
+/// Sapphire Rapids' checksum entry: the tier's ladder in line, then
+/// [`iso_hdlc_mid_x86_64_avx512_spr`] and [`iso_hdlc_fold_x86_64_avx512_spr`].
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+use crate::arch::x86::short_asm::iso_hdlc_checksum_avx512_spr as iso_hdlc_checksum_x86_64_avx512_spr;
+
+/// [`iso_hdlc_x86_64_avx512_vpclmulqdq`] on Sapphire Rapids: the same entry, with the 512-bit
+/// cascade from 256 bytes.
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[inline]
+#[target_feature(enable = "avx512vl,vpclmulqdq")]
+unsafe fn iso_hdlc_x86_64_avx512_spr(crc: u32, bytes: &[u8]) -> u32 {
+    x86_iso_hdlc_body!(
+        crc,
+        bytes,
+        iso_hdlc_mid_x86_64_avx512_spr,
+        iso_hdlc_fold_x86_64_avx512_spr,
+        crate::arch::x86_64::avx512_vpclmulqdq::X86_64Avx512VpclmulqdqOps::new(),
+        crate::arch::x86::short_asm::iso_hdlc_short128_avx,
+        128
+    )
 }
 
 /// Whether a CPU on the SSE tier has AVX, so that CRC-32/ISO-HDLC takes the SSE tier's entries
@@ -1017,6 +1083,27 @@ mod tests {
         check_iso_hdlc_matches_software(
             |state, bytes| unsafe { !iso_hdlc_x86_64_avx2_ecore(!state, bytes) },
             |bytes| unsafe { iso_hdlc_checksum_x86_64_avx2_ecore(bytes) },
+        );
+    }
+
+    /// Sapphire Rapids' CRC-32/ISO-HDLC entries on the `x86_64-avx512-vpclmulqdq` tier, forced
+    /// on any CPU with its features, against the table-driven software path.
+    #[test]
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    #[cfg_attr(miri, ignore)]
+    fn test_avx512_spr_iso_hdlc_tier_matches_software() {
+        if !(is_x86_feature_detected!("avx512vl")
+            && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("vpclmulqdq"))
+        {
+            eprintln!(
+                "skipping test_avx512_spr_iso_hdlc_tier_matches_software: the CPU lacks VPCLMULQDQ"
+            );
+            return;
+        }
+        check_iso_hdlc_matches_software(
+            |state, bytes| unsafe { !iso_hdlc_x86_64_avx512_spr(!state, bytes) },
+            |bytes| unsafe { iso_hdlc_checksum_x86_64_avx512_spr(bytes) },
         );
     }
 

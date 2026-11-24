@@ -293,7 +293,7 @@ impl CpuId {
 
     /// Sapphire Rapids and Emerald Rapids servers, models 0x8f and 0xcf.
     #[cfg(target_arch = "x86_64")]
-    fn is_sapphire_rapids(&self) -> bool {
+    pub(crate) fn is_sapphire_rapids(&self) -> bool {
         self.is_intel_family_6() && matches!(self.model, 0x8f | 0xcf)
     }
 
@@ -1201,6 +1201,31 @@ mod tests {
             vendor: *vendor,
             family,
             model,
+        }
+    }
+
+    /// CRC-32/ISO-HDLC's 512-bit cascade on the `x86_64-avx512-vpclmulqdq` tier is chosen by
+    /// [`CpuId::is_sapphire_rapids`]: Sapphire Rapids and Emerald Rapids take it, and the CPUs
+    /// on either side of them on the tier, Ice Lake servers, Granite Rapids and Zen 4 and 5,
+    /// keep the tier's general fold.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn sapphire_rapids_selects_the_iso_hdlc_cascade() {
+        const INTEL: &[u8; 12] = b"GenuineIntel";
+        const AMD: &[u8; 12] = b"AuthenticAMD";
+        for (id, takes) in [
+            (cpu(INTEL, 6, 0x8f), true),
+            (cpu(INTEL, 6, 0xcf), true),
+            (cpu(INTEL, 6, 0x6a), false),
+            (cpu(INTEL, 6, 0x6c), false),
+            (cpu(INTEL, 6, 0xad), false),
+            (cpu(INTEL, 6, 0x55), false),
+            (cpu(AMD, 0x19, 0x11), false),
+            (cpu(AMD, 0x19, 0x61), false),
+            (cpu(AMD, 0x1a, 0x02), false),
+            (cpu(AMD, 6, 0x8f), false),
+        ] {
+            assert_eq!(id.is_sapphire_rapids(), takes, "{id:?}");
         }
     }
 

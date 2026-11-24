@@ -202,6 +202,10 @@ own changelog up to the fork point continues below, unchanged.
   256-bit folds (eight accumulators, then four onto four, two onto two and
   one onto one) instead of this tier's own fold; crc-fast has the generic
   fold there.
+- On Sapphire Rapids on the `x86_64-avx512-vpclmulqdq` tier,
+  CRC-32/ISO-HDLC from 256 bytes to 16 KiB takes a cascade of 512-bit
+  folds (four accumulators to 4 KiB, eight from there, then halving onto
+  one) instead of this tier's own fold; crc-fast has the generic fold there.
 - CRC-32/ISCSI buffers up to the plan's limit (256 bytes on the AVX-512
   tiers) are checksummed with the CRC32 instruction over unaligned words,
   written as inline assembly inside the caller on x86_64, ahead of the
@@ -1213,6 +1217,37 @@ own changelog up to the fork point continues below, unchanged.
   libdeflate leads there at 32, 96, 128 and 192 bytes (0.92x to 0.94x).
   The cascade is a candidate for every CPU on the tier, measured so far on
   this one alone.
+- On Sapphire Rapids (Intel family 6, models 0x8f and 0xcf) on the
+  `x86_64-avx512-vpclmulqdq` tier, CRC-32/ISO-HDLC from 256 bytes to 16 KiB
+  takes a cascade of 512-bit folds, the shape of fast-crc32's
+  `avx512_vpclmulqdq_crc32_v4` and `_v8` and of libdeflate's
+  `crc32_pclmul_template.h` (reimplemented from them; no code is taken):
+  four 512-bit accumulators over 256-byte steps up to 4 KiB, eight over
+  512-byte steps from 4 KiB, each halving folding onto the accumulators a
+  fixed distance ahead and taking the next piece of the buffer the length
+  calls for, then 512 bits onto 128 lane by lane, 32- and 16-byte blocks,
+  the last bytes by one overlapping read and the 96-bit Barrett reduction.
+  The coefficient pairs are computed at compile time from powers of x and
+  checked equal to the generated keys. Below 256 bytes and from 16 KiB the
+  tier's own paths are unchanged. Measured on a Xeon Platinum 8488C, GB/s,
+  aligned, median of eight interleaved rounds:
+
+  | bytes | 1.11.0 | with | best library | with / best |
+  |---:|---:|---:|---:|---:|
+  | 256 | 8.5 | 44.1 | 43.5 (`v4`) | 1.01 |
+  | 512 | 16.9 | 66.9 | 66.2 (libdeflate) | 1.01 |
+  | 1024 | 31.9 | 82.8 | 85.1 (libdeflate) | 0.97 |
+  | 2048 | 57.0 | 93.7 | 96.9 (`v8`) | 0.97 |
+  | 4096 | 75.6 | 101.8 | 103.6 (libdeflate) | 0.98 |
+  | 8192 | 90.2 | 105.6 | 106.8 (`v8`) | 0.99 |
+
+  In a separate batch beside the tier's own fold, the cascade moved 2048
+  bytes from 0.95x to 0.99x of libdeflate, 4 KiB from 0.97x to 0.98x and
+  8 KiB from 0.97x to 1.02x; the eight-accumulator cascade lost at 16 KiB
+  (0.97x against 0.99x), so it stops there. On Ice Lake (Xeon Platinum
+  8375C) neither cascade moved 1024 and 2048 bytes (0.91x and 0.84x of
+  fast-crc32's `v4`, which runs the same four-accumulator loop), and on
+  Zen 4 both were 1% to 3% slower than the tier's fold, so both keep it.
 - On AMD family 0x17 (Zen 2), CRC-32/ISCSI from 32 KiB runs three CRC32
   instruction streams alone, fast-crc32's `s3` shape, with the stream
   shifts from the compile-time tables above. The EPYC 7R32 issues the CRC32

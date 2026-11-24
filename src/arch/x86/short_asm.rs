@@ -1625,6 +1625,18 @@ iso_hdlc_checksum!(
     iso_hdlc_fold_x86_64_avx2_vpclmulqdq,
     crate::arch::x86_64::avx2_vpclmulqdq::X86_64Avx2VpclmulqdqOps::new()
 );
+// Sapphire Rapids: the 512-bit ladder, and the 512-bit cascade from 256 bytes, see
+// `crate::arch::choose_iso_hdlc`
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+iso_hdlc_checksum!(
+    "avx512vl,vpclmulqdq",
+    avx,
+    w512,
+    iso_hdlc_checksum_avx512_spr,
+    iso_hdlc_mid_x86_64_avx512_spr,
+    iso_hdlc_fold_x86_64_avx512_spr,
+    crate::arch::x86_64::avx512_vpclmulqdq::X86_64Avx512VpclmulqdqOps::new()
+);
 
 /// The wide ladders' bodies from a carried CRC, for the tests: the checksum entries are the
 /// only callers in the library, and they start from no CRC.
@@ -1840,5 +1852,7 @@ mod tests {
         }
         check_iso_hdlc(128, super::wide_updates::iso_hdlc_short_w512);
         check_checksum(iso_hdlc_checksum_avx512_vpclmulqdq);
+        #[cfg(feature = "std")]
+        check_checksum(iso_hdlc_checksum_avx512_spr);
     }
 }

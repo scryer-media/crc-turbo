@@ -23,6 +23,14 @@ pub(crate) fn is_intel_ecore() -> bool {
     x86::CpuId::detect().is_intel_ecore()
 }
 
+/// Whether this CPU is a Sapphire Rapids or Emerald Rapids server,
+/// [`x86::CpuId::is_sapphire_rapids`]: the CPUs whose `x86_64-avx512-vpclmulqdq` tier takes
+/// CRC-32/ISO-HDLC's 512-bit cascade from 256 bytes, see `crate::arch::choose_iso_hdlc`.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn is_sapphire_rapids() -> bool {
+    x86::CpuId::detect().is_sapphire_rapids()
+}
+
 /// The aarch64 fusion kernel's choice, kept in one byte and read with a relaxed load: 0 before
 /// it is made, then 1 for none, 2 for the PMULL kernel, 3 for the EOR3 one and 4 for the EOR3
 /// one with Neoverse V2's plan ([`aarch64::Core`]). The byte carries
