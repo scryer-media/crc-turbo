@@ -4,6 +4,11 @@
 
 #[cfg(not(feature = "generated-tables"))]
 use crate::tables;
+#[cfg(feature = "alloc")]
+extern crate alloc;
+
+#[cfg(any(test, target_family = "wasm"))]
+use crate::arch::sparse;
 use crate::CrcAlgorithm;
 use crate::CrcParams;
 
@@ -73,14 +78,20 @@ const fn crc64_single(poly: u64, reflect: bool, mut value: u64) -> u64 {
 /// This function creates a table compatible with the `crc` crate's `Table<16>` format,
 /// enabling processing of 16 bytes at a time for improved performance.
 pub const fn generate_table_u16(width: u8, poly: u16, reflect: bool) -> [[u16; 256]; 16] {
+    let mut table = [[0u16; 256]; 16];
+    fill_table_u16(&mut table, width, poly, reflect);
+    table
+}
+
+/// Fills a 16-lane CRC-16 lookup table in place, so a heap table never passes through the
+/// stack.
+const fn fill_table_u16(table: &mut [[u16; 256]; 16], width: u8, poly: u16, reflect: bool) {
     let poly = if reflect {
         let poly = poly.reverse_bits();
         poly >> (16u8 - width)
     } else {
         poly << (16u8 - width)
     };
-
-    let mut table = [[0u16; 256]; 16];
 
     // Generate first table (lane 0) directly
     let mut i = 0;
@@ -104,7 +115,16 @@ pub const fn generate_table_u16(width: u8, poly: u16, reflect: bool) -> [[u16; 2
         }
         i += 1;
     }
+}
 
+/// A CRC-16 lookup table built on the heap.
+#[cfg(feature = "alloc")]
+fn boxed_table_u16(width: u8, poly: u16, reflect: bool) -> alloc::boxed::Box<[[u16; 256]; 16]> {
+    let mut table: alloc::boxed::Box<[[u16; 256]; 16]> = alloc::vec![[0u16; 256]; 16]
+        .into_boxed_slice()
+        .try_into()
+        .expect("sixteen lanes");
+    fill_table_u16(&mut table, width, poly, reflect);
     table
 }
 
@@ -113,14 +133,20 @@ pub const fn generate_table_u16(width: u8, poly: u16, reflect: bool) -> [[u16; 2
 /// This function creates a table compatible with the `crc` crate's `Table<16>` format,
 /// enabling processing of 16 bytes at a time for improved performance.
 pub const fn generate_table_u32(width: u8, poly: u32, reflect: bool) -> [[u32; 256]; 16] {
+    let mut table = [[0u32; 256]; 16];
+    fill_table_u32(&mut table, width, poly, reflect);
+    table
+}
+
+/// Fills a 16-lane CRC-32 lookup table in place, so a heap table never passes through the
+/// stack.
+const fn fill_table_u32(table: &mut [[u32; 256]; 16], width: u8, poly: u32, reflect: bool) {
     let poly = if reflect {
         let poly = poly.reverse_bits();
         poly >> (32u8 - width)
     } else {
         poly << (32u8 - width)
     };
-
-    let mut table = [[0u32; 256]; 16];
 
     // Generate first table (lane 0) directly
     let mut i = 0;
@@ -144,7 +170,16 @@ pub const fn generate_table_u32(width: u8, poly: u32, reflect: bool) -> [[u32; 2
         }
         i += 1;
     }
+}
 
+/// A CRC-32 lookup table built on the heap.
+#[cfg(feature = "alloc")]
+fn boxed_table_u32(width: u8, poly: u32, reflect: bool) -> alloc::boxed::Box<[[u32; 256]; 16]> {
+    let mut table: alloc::boxed::Box<[[u32; 256]; 16]> = alloc::vec![[0u32; 256]; 16]
+        .into_boxed_slice()
+        .try_into()
+        .expect("sixteen lanes");
+    fill_table_u32(&mut table, width, poly, reflect);
     table
 }
 
@@ -153,14 +188,20 @@ pub const fn generate_table_u32(width: u8, poly: u32, reflect: bool) -> [[u32; 2
 /// This function creates a table compatible with the `crc` crate's `Table<16>` format,
 /// enabling processing of 16 bytes at a time for improved performance.
 pub const fn generate_table_u64(width: u8, poly: u64, reflect: bool) -> [[u64; 256]; 16] {
+    let mut table = [[0u64; 256]; 16];
+    fill_table_u64(&mut table, width, poly, reflect);
+    table
+}
+
+/// Fills a 16-lane CRC-64 lookup table in place, so a heap table never passes through the
+/// stack.
+const fn fill_table_u64(table: &mut [[u64; 256]; 16], width: u8, poly: u64, reflect: bool) {
     let poly = if reflect {
         let poly = poly.reverse_bits();
         poly >> (64u8 - width)
     } else {
         poly << (64u8 - width)
     };
-
-    let mut table = [[0u64; 256]; 16];
 
     // Generate first table (lane 0) directly
     let mut i = 0;
@@ -184,7 +225,16 @@ pub const fn generate_table_u64(width: u8, poly: u64, reflect: bool) -> [[u64; 2
         }
         i += 1;
     }
+}
 
+/// A CRC-64 lookup table built on the heap.
+#[cfg(feature = "alloc")]
+fn boxed_table_u64(width: u8, poly: u64, reflect: bool) -> alloc::boxed::Box<[[u64; 256]; 16]> {
+    let mut table: alloc::boxed::Box<[[u64; 256]; 16]> = alloc::vec![[0u64; 256]; 16]
+        .into_boxed_slice()
+        .try_into()
+        .expect("sixteen lanes");
+    fill_table_u64(&mut table, width, poly, reflect);
     table
 }
 
@@ -265,13 +315,207 @@ pub(crate) fn update(state: u64, data: &[u8], params: &CrcParams) -> u64 {
     }
 }
 
+/// The table path with, on WebAssembly, the sparse-multiple reduction in front of it for inputs
+/// at least `kernel.min_len` long. Built-in algorithms pass their kernel as a constant, so one
+/// without a kernel compiles to the table loop alone.
+macro_rules! table_update {
+    ($name:ident, $native:ident, $t:ty, $width:literal) => {
+        #[inline(always)]
+        fn $name(
+            state: $t,
+            table: &[[$t; 256]; 16],
+            refin: bool,
+            data: &[u8],
+            kernel: Option<Kernel>,
+        ) -> $t {
+            #[cfg(target_family = "wasm")]
+            if let Some(kernel) = kernel {
+                if data.len() >= kernel.min_len {
+                    let mut tail = [0u8; sparse::TAIL_MAX];
+                    let len = (kernel.reduce)(state as u64, $width, refin, data, &mut tail);
+                    return $native(0, table, refin, &tail[..len]);
+                }
+            }
+            #[cfg(not(target_family = "wasm"))]
+            let _ = kernel;
+            $native(state, table, refin, data)
+        }
+    };
+}
+table_update!(table_update_u16, native_update_u16, u16, 16);
+table_update!(table_update_u32, native_update_u32, u32, 32);
+table_update!(table_update_u64, native_update_u64, u64, 64);
+
+/// The kernel type `table_update` takes: the sparse reduction on WebAssembly, nothing elsewhere.
+#[cfg(any(test, target_family = "wasm"))]
+type Kernel = sparse::Kernel;
+#[cfg(not(any(test, target_family = "wasm")))]
+#[derive(Clone, Copy)]
+enum Kernel {}
+
+/// The kernel for parameters known only at run time. The length is checked first so short inputs
+/// skip the lookup.
+#[inline(always)]
+fn runtime_kernel(width: u8, params: &CrcParams, refin: bool, len: usize) -> Option<Kernel> {
+    #[cfg(target_family = "wasm")]
+    if len >= sparse::MIN_LEN {
+        return sparse::dispatch(width, params.poly, refin);
+    }
+    let _ = (width, params, refin, len);
+    None
+}
+
+/// The kernel for a built-in algorithm, as a constant.
+macro_rules! const_kernel {
+    ($width:literal, $params:expr) => {{
+        #[cfg(target_family = "wasm")]
+        const KERNEL: Option<Kernel> = sparse::dispatch($width, $params.poly, $params.refin);
+        #[cfg(not(target_family = "wasm"))]
+        const KERNEL: Option<Kernel> = None;
+        KERNEL
+    }};
+}
+
+/// One calculator per built-in algorithm, for the targets without an accelerated path. Each names
+/// its algorithm's table and kernel as constants, so a program that uses one algorithm links one
+/// table rather than every algorithm's. Calling [`update`] with a
+/// built-in algorithm's parameters links every table, since the algorithm is a run-time value
+/// there.
+///
+/// Taken from Andres J Ruiz Torres's crc-fast pull request 67.
+#[allow(non_snake_case)]
+#[cfg_attr(
+    any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"),
+    allow(dead_code)
+)]
+pub(crate) mod calc {
+    use super::{
+        builtin_table_u16, builtin_table_u32, builtin_table_u64, table_update_u16,
+        table_update_u32, table_update_u64, Kernel,
+    };
+    #[cfg(target_family = "wasm")]
+    use crate::arch::sparse;
+    #[cfg_attr(not(target_family = "wasm"), allow(unused_imports))]
+    use crate::{crc16, crc32, crc64, CrcAlgorithm, CrcParams};
+
+    macro_rules! calculators {
+        ($($alg:ident: $width:tt $params:path;)+) => {
+            $(
+                #[doc = concat!("The `", stringify!($alg), "` calculator.")]
+                pub(crate) fn $alg(state: u64, data: &[u8], _params: &CrcParams) -> u64 {
+                    calculators!(@update $width, $alg, $params, state, data)
+                }
+            )+
+
+            /// Every calculator and its algorithm, for the tests.
+            #[cfg(test)]
+            pub(crate) const ALL: &[(CrcAlgorithm, crate::CalculatorFn)] =
+                &[$((CrcAlgorithm::$alg, $alg as crate::CalculatorFn)),+];
+        };
+        (@update 16, $alg:ident, $params:path, $state:ident, $data:ident) => {{
+            let (table, refin) = builtin(builtin_table_u16(CrcAlgorithm::$alg));
+            table_update_u16($state as u16, table, refin, $data, const_kernel!(16, $params)) as u64
+        }};
+        (@update 32, $alg:ident, $params:path, $state:ident, $data:ident) => {{
+            let (table, refin) = builtin(builtin_table_u32(CrcAlgorithm::$alg));
+            table_update_u32($state as u32, table, refin, $data, const_kernel!(32, $params)) as u64
+        }};
+        (@update 64, $alg:ident, $params:path, $state:ident, $data:ident) => {{
+            let (table, refin) = builtin(builtin_table_u64(CrcAlgorithm::$alg));
+            table_update_u64($state, table, refin, $data, const_kernel!(64, $params))
+        }};
+    }
+
+    #[inline(always)]
+    fn builtin<T>(table: Option<T>) -> T {
+        match table {
+            Some(table) => table,
+            None => unreachable!("every built-in algorithm has a table"),
+        }
+    }
+
+    calculators! {
+        Crc16Arc: 16 crc16::consts::CRC16_ARC;
+        Crc16Cdma2000: 16 crc16::consts::CRC16_CDMA2000;
+        Crc16Cms: 16 crc16::consts::CRC16_CMS;
+        Crc16Dds110: 16 crc16::consts::CRC16_DDS_110;
+        Crc16DectR: 16 crc16::consts::CRC16_DECT_R;
+        Crc16DectX: 16 crc16::consts::CRC16_DECT_X;
+        Crc16Dnp: 16 crc16::consts::CRC16_DNP;
+        Crc16En13757: 16 crc16::consts::CRC16_EN_13757;
+        Crc16Genibus: 16 crc16::consts::CRC16_GENIBUS;
+        Crc16Gsm: 16 crc16::consts::CRC16_GSM;
+        Crc16Ibm3740: 16 crc16::consts::CRC16_IBM_3740;
+        Crc16IbmSdlc: 16 crc16::consts::CRC16_IBM_SDLC;
+        Crc16IsoIec144433A: 16 crc16::consts::CRC16_ISO_IEC_14443_3_A;
+        Crc16Kermit: 16 crc16::consts::CRC16_KERMIT;
+        Crc16Lj1200: 16 crc16::consts::CRC16_LJ1200;
+        Crc16M17: 16 crc16::consts::CRC16_M17;
+        Crc16MaximDow: 16 crc16::consts::CRC16_MAXIM_DOW;
+        Crc16Mcrf4xx: 16 crc16::consts::CRC16_MCRF4XX;
+        Crc16Modbus: 16 crc16::consts::CRC16_MODBUS;
+        Crc16Nrsc5: 16 crc16::consts::CRC16_NRSC_5;
+        Crc16OpensafetyA: 16 crc16::consts::CRC16_OPENSAFETY_A;
+        Crc16OpensafetyB: 16 crc16::consts::CRC16_OPENSAFETY_B;
+        Crc16Profibus: 16 crc16::consts::CRC16_PROFIBUS;
+        Crc16Riello: 16 crc16::consts::CRC16_RIELLO;
+        Crc16SpiFujitsu: 16 crc16::consts::CRC16_SPI_FUJITSU;
+        Crc16T10Dif: 16 crc16::consts::CRC16_T10_DIF;
+        Crc16Teledisk: 16 crc16::consts::CRC16_TELEDISK;
+        Crc16Tms37157: 16 crc16::consts::CRC16_TMS37157;
+        Crc16Umts: 16 crc16::consts::CRC16_UMTS;
+        Crc16Usb: 16 crc16::consts::CRC16_USB;
+        Crc16Xmodem: 16 crc16::consts::CRC16_XMODEM;
+        Crc32Aixm: 32 crc32::consts::CRC32_AIXM;
+        Crc32Autosar: 32 crc32::consts::CRC32_AUTOSAR;
+        Crc32Base91D: 32 crc32::consts::CRC32_BASE91_D;
+        Crc32Bzip2: 32 crc32::consts::CRC32_BZIP2;
+        Crc32CdRomEdc: 32 crc32::consts::CRC32_CD_ROM_EDC;
+        Crc32Cksum: 32 crc32::consts::CRC32_CKSUM;
+        Crc32Iscsi: 32 crc32::consts::CRC32_ISCSI;
+        Crc32IsoHdlc: 32 crc32::consts::CRC32_ISO_HDLC;
+        Crc32Jamcrc: 32 crc32::consts::CRC32_JAMCRC;
+        Crc32Mef: 32 crc32::consts::CRC32_MEF;
+        Crc32Mpeg2: 32 crc32::consts::CRC32_MPEG_2;
+        Crc32Xfer: 32 crc32::consts::CRC32_XFER;
+        Crc64Ecma182: 64 crc64::consts::CRC64_ECMA_182;
+        Crc64GoIso: 64 crc64::consts::CRC64_GO_ISO;
+        Crc64Ms: 64 crc64::consts::CRC64_MS;
+        Crc64Nvme: 64 crc64::consts::CRC64_NVME;
+        Crc64Redis: 64 crc64::consts::CRC64_REDIS;
+        Crc64We: 64 crc64::consts::CRC64_WE;
+        Crc64Xz: 64 crc64::consts::CRC64_XZ;
+    }
+}
+
+/// Reduces `data` by a sparse multiple whatever the target, then finishes the pending words through
+/// the tables: the kernels' path, forced on, for the tests. `data` must be longer than the kernel's
+/// pending words.
+#[cfg(test)]
+pub(crate) fn update_sparse(
+    state: u64,
+    data: &[u8],
+    params: &CrcParams,
+    kernel: sparse::Kernel,
+) -> u64 {
+    let mut tail = [0u8; sparse::TAIL_MAX];
+    let len = (kernel.reduce)(state, params.width, params.refin, data, &mut tail);
+    update(0, &tail[..len], params)
+}
+
 // ============================================================================
 // CRC-16 dispatch
 // ============================================================================
 
 fn update_crc16(state: u16, data: &[u8], params: &CrcParams) -> u16 {
     match builtin_table_u16(params.algorithm) {
-        Some((table, refin)) => native_update_u16(state, table, refin, data),
+        Some((table, refin)) => table_update_u16(
+            state,
+            table,
+            refin,
+            data,
+            runtime_kernel(16, params, refin, data.len()),
+        ),
         None => update_crc16_custom(state, data, params),
     }
 }
@@ -279,6 +523,7 @@ fn update_crc16(state: u16, data: &[u8], params: &CrcParams) -> u16 {
 /// The stored table of a built-in CRC-16 algorithm and whether it is reflected, or `None` for
 /// custom parameters.
 #[cfg(not(feature = "generated-tables"))]
+#[inline(always)]
 fn builtin_table_u16(algorithm: CrcAlgorithm) -> Option<(&'static [[u16; 256]; 16], bool)> {
     Some(match algorithm {
         CrcAlgorithm::Crc16Arc => (&tables::crc16::CRC16_ARC_TABLE, true),
@@ -319,7 +564,7 @@ fn builtin_table_u16(algorithm: CrcAlgorithm) -> Option<(&'static [[u16; 256]; 1
 
 #[cfg(feature = "alloc")]
 fn update_crc16_custom(state: u16, data: &[u8], params: &CrcParams) -> u16 {
-    extern crate alloc;
+    #[cfg(any(feature = "std", feature = "cache"))]
     use alloc::boxed::Box;
 
     let refin = params.refin;
@@ -341,8 +586,7 @@ fn update_crc16_custom(state: u16, data: &[u8], params: &CrcParams) -> u16 {
             let mut cache_guard = cache.lock().unwrap();
 
             cache_guard.entry(key).or_insert_with(|| {
-                let table = generate_table_u16(params.width, params.poly as u16, refin);
-                Box::leak(Box::new(table))
+                Box::leak(boxed_table_u16(params.width, params.poly as u16, refin))
             })
         }
 
@@ -352,19 +596,24 @@ fn update_crc16_custom(state: u16, data: &[u8], params: &CrcParams) -> u16 {
             let mut cache_guard = cache.lock();
 
             cache_guard.entry(key).or_insert_with(|| {
-                let table = generate_table_u16(params.width, params.poly as u16, refin);
-                Box::leak(Box::new(table))
+                Box::leak(boxed_table_u16(params.width, params.poly as u16, refin))
             })
         }
     };
 
+    // Without a cache the table belongs to this call and is freed when it returns.
     #[cfg(not(any(feature = "std", feature = "cache")))]
-    let table: &'static [[u16; 256]; 16] = {
-        let table = generate_table_u16(params.width, params.poly as u16, refin);
-        Box::leak(Box::new(table))
-    };
+    let owned = boxed_table_u16(params.width, params.poly as u16, refin);
+    #[cfg(not(any(feature = "std", feature = "cache")))]
+    let table: &[[u16; 256]; 16] = &owned;
 
-    native_update_u16(state, table, refin, data)
+    table_update_u16(
+        state,
+        table,
+        refin,
+        data,
+        runtime_kernel(16, params, refin, data.len()),
+    )
 }
 
 #[cfg(not(feature = "alloc"))]
@@ -378,7 +627,13 @@ fn update_crc16_custom(_state: u16, _data: &[u8], _params: &CrcParams) -> u16 {
 
 fn update_crc32(state: u32, data: &[u8], params: &CrcParams) -> u32 {
     match builtin_table_u32(params.algorithm) {
-        Some((table, refin)) => native_update_u32(state, table, refin, data),
+        Some((table, refin)) => table_update_u32(
+            state,
+            table,
+            refin,
+            data,
+            runtime_kernel(32, params, refin, data.len()),
+        ),
         None => update_crc32_custom(state, data, params),
     }
 }
@@ -386,6 +641,7 @@ fn update_crc32(state: u32, data: &[u8], params: &CrcParams) -> u32 {
 /// The stored table of a built-in CRC-32 algorithm and whether it is reflected, or `None` for
 /// custom parameters.
 #[cfg(not(feature = "generated-tables"))]
+#[inline(always)]
 fn builtin_table_u32(algorithm: CrcAlgorithm) -> Option<(&'static [[u32; 256]; 16], bool)> {
     Some(match algorithm {
         CrcAlgorithm::Crc32Aixm => (&tables::crc32::CRC32_AIXM_TABLE, false),
@@ -408,7 +664,7 @@ fn builtin_table_u32(algorithm: CrcAlgorithm) -> Option<(&'static [[u32; 256]; 1
 
 #[cfg(feature = "alloc")]
 fn update_crc32_custom(state: u32, data: &[u8], params: &CrcParams) -> u32 {
-    extern crate alloc;
+    #[cfg(any(feature = "std", feature = "cache"))]
     use alloc::boxed::Box;
 
     let refin = params.refin;
@@ -430,8 +686,7 @@ fn update_crc32_custom(state: u32, data: &[u8], params: &CrcParams) -> u32 {
             let mut cache_guard = cache.lock().unwrap();
 
             cache_guard.entry(key).or_insert_with(|| {
-                let table = generate_table_u32(params.width, params.poly as u32, refin);
-                Box::leak(Box::new(table))
+                Box::leak(boxed_table_u32(params.width, params.poly as u32, refin))
             })
         }
 
@@ -441,19 +696,24 @@ fn update_crc32_custom(state: u32, data: &[u8], params: &CrcParams) -> u32 {
             let mut cache_guard = cache.lock();
 
             cache_guard.entry(key).or_insert_with(|| {
-                let table = generate_table_u32(params.width, params.poly as u32, refin);
-                Box::leak(Box::new(table))
+                Box::leak(boxed_table_u32(params.width, params.poly as u32, refin))
             })
         }
     };
 
+    // Without a cache the table belongs to this call and is freed when it returns.
     #[cfg(not(any(feature = "std", feature = "cache")))]
-    let table: &'static [[u32; 256]; 16] = {
-        let table = generate_table_u32(params.width, params.poly as u32, refin);
-        Box::leak(Box::new(table))
-    };
+    let owned = boxed_table_u32(params.width, params.poly as u32, refin);
+    #[cfg(not(any(feature = "std", feature = "cache")))]
+    let table: &[[u32; 256]; 16] = &owned;
 
-    native_update_u32(state, table, refin, data)
+    table_update_u32(
+        state,
+        table,
+        refin,
+        data,
+        runtime_kernel(32, params, refin, data.len()),
+    )
 }
 
 #[cfg(not(feature = "alloc"))]
@@ -467,7 +727,13 @@ fn update_crc32_custom(_state: u32, _data: &[u8], _params: &CrcParams) -> u32 {
 
 fn update_crc64(state: u64, data: &[u8], params: &CrcParams) -> u64 {
     match builtin_table_u64(params.algorithm) {
-        Some((table, refin)) => native_update_u64(state, table, refin, data),
+        Some((table, refin)) => table_update_u64(
+            state,
+            table,
+            refin,
+            data,
+            runtime_kernel(64, params, refin, data.len()),
+        ),
         None => update_crc64_custom(state, data, params),
     }
 }
@@ -475,6 +741,7 @@ fn update_crc64(state: u64, data: &[u8], params: &CrcParams) -> u64 {
 /// The stored table of a built-in CRC-64 algorithm and whether it is reflected, or `None` for
 /// custom parameters.
 #[cfg(not(feature = "generated-tables"))]
+#[inline(always)]
 fn builtin_table_u64(algorithm: CrcAlgorithm) -> Option<(&'static [[u64; 256]; 16], bool)> {
     Some(match algorithm {
         CrcAlgorithm::Crc64Ecma182 => (&tables::crc64::CRC64_ECMA_182_TABLE, false),
@@ -492,7 +759,7 @@ fn builtin_table_u64(algorithm: CrcAlgorithm) -> Option<(&'static [[u64; 256]; 1
 
 #[cfg(feature = "alloc")]
 fn update_crc64_custom(state: u64, data: &[u8], params: &CrcParams) -> u64 {
-    extern crate alloc;
+    #[cfg(any(feature = "std", feature = "cache"))]
     use alloc::boxed::Box;
 
     let refin = params.refin;
@@ -513,10 +780,9 @@ fn update_crc64_custom(state: u64, data: &[u8], params: &CrcParams) -> u64 {
             let cache = CUSTOM_CRC64_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
             let mut cache_guard = cache.lock().unwrap();
 
-            cache_guard.entry(key).or_insert_with(|| {
-                let table = generate_table_u64(params.width, params.poly, refin);
-                Box::leak(Box::new(table))
-            })
+            cache_guard
+                .entry(key)
+                .or_insert_with(|| Box::leak(boxed_table_u64(params.width, params.poly, refin)))
         }
 
         #[cfg(all(not(feature = "std"), feature = "cache"))]
@@ -524,20 +790,25 @@ fn update_crc64_custom(state: u64, data: &[u8], params: &CrcParams) -> u64 {
             let cache = CUSTOM_CRC64_CACHE.call_once(|| Mutex::new(HashMap::new()));
             let mut cache_guard = cache.lock();
 
-            cache_guard.entry(key).or_insert_with(|| {
-                let table = generate_table_u64(params.width, params.poly, refin);
-                Box::leak(Box::new(table))
-            })
+            cache_guard
+                .entry(key)
+                .or_insert_with(|| Box::leak(boxed_table_u64(params.width, params.poly, refin)))
         }
     };
 
+    // Without a cache the table belongs to this call and is freed when it returns.
     #[cfg(not(any(feature = "std", feature = "cache")))]
-    let table: &'static [[u64; 256]; 16] = {
-        let table = generate_table_u64(params.width, params.poly, refin);
-        Box::leak(Box::new(table))
-    };
+    let owned = boxed_table_u64(params.width, params.poly, refin);
+    #[cfg(not(any(feature = "std", feature = "cache")))]
+    let table: &[[u64; 256]; 16] = &owned;
 
-    native_update_u64(state, table, refin, data)
+    table_update_u64(
+        state,
+        table,
+        refin,
+        data,
+        runtime_kernel(64, params, refin, data.len()),
+    )
 }
 
 #[cfg(not(feature = "alloc"))]
@@ -550,7 +821,7 @@ fn update_crc64_custom(_state: u64, _data: &[u8], _params: &CrcParams) -> u64 {
 /// parameters by the generator that produced the stored tables, so the tables are identical.
 #[cfg(feature = "generated-tables")]
 mod generated {
-    use super::{generate_table_u16, generate_table_u32, generate_table_u64};
+    use super::{boxed_table_u16, boxed_table_u32, boxed_table_u64};
     use crate::{CrcAlgorithm, CrcParams};
     #[cfg(not(feature = "std"))]
     use alloc::boxed::Box;
@@ -581,18 +852,20 @@ mod generated {
             .expect("every CrcAlgorithm has a table slot")
     }
 
-    fn fill<T>(slot: &'static Slot<T>, init: impl FnOnce() -> T) -> &'static T {
+    /// The slot's table, built in place on the heap the first time: a table is up to 32 KiB,
+    /// more than a small target's stack should hold as a temporary.
+    fn fill<T>(slot: &'static Slot<T>, init: impl FnOnce() -> Box<T>) -> &'static T {
         #[cfg(feature = "std")]
-        let table = slot.get_or_init(|| Box::new(init()));
+        let table = slot.get_or_init(init);
         #[cfg(not(feature = "std"))]
-        let table = slot.call_once(|| Box::new(init()));
+        let table = slot.call_once(init);
         table
     }
 
     pub(super) fn u16(algorithm: CrcAlgorithm) -> (&'static [[u16; 256]; 16], bool) {
         let params = params(algorithm, 16);
         let table = fill(slot(&U16, algorithm), || {
-            generate_table_u16(16, params.poly as u16, params.refin)
+            boxed_table_u16(16, params.poly as u16, params.refin)
         });
         (table, params.refin)
     }
@@ -600,7 +873,7 @@ mod generated {
     pub(super) fn u32(algorithm: CrcAlgorithm) -> (&'static [[u32; 256]; 16], bool) {
         let params = params(algorithm, 32);
         let table = fill(slot(&U32, algorithm), || {
-            generate_table_u32(32, params.poly as u32, params.refin)
+            boxed_table_u32(32, params.poly as u32, params.refin)
         });
         (table, params.refin)
     }
@@ -608,7 +881,7 @@ mod generated {
     pub(super) fn u64(algorithm: CrcAlgorithm) -> (&'static [[u64; 256]; 16], bool) {
         let params = params(algorithm, 64);
         let table = fill(slot(&U64, algorithm), || {
-            generate_table_u64(64, params.poly, params.refin)
+            boxed_table_u64(64, params.poly, params.refin)
         });
         (table, params.refin)
     }
@@ -617,6 +890,7 @@ mod generated {
 /// The table of a built-in CRC-16 algorithm, generated on first use, and whether it is
 /// reflected, or `None` for custom parameters.
 #[cfg(feature = "generated-tables")]
+#[inline(always)]
 fn builtin_table_u16(algorithm: CrcAlgorithm) -> Option<(&'static [[u16; 256]; 16], bool)> {
     (algorithm != CrcAlgorithm::CrcCustom).then(|| generated::u16(algorithm))
 }
@@ -625,6 +899,7 @@ fn builtin_table_u16(algorithm: CrcAlgorithm) -> Option<(&'static [[u16; 256]; 1
 /// reflected, or `None` for custom parameters.
 #[cfg(feature = "generated-tables")]
 #[allow(deprecated)]
+#[inline(always)]
 fn builtin_table_u32(algorithm: CrcAlgorithm) -> Option<(&'static [[u32; 256]; 16], bool)> {
     (!matches!(
         algorithm,
@@ -637,6 +912,7 @@ fn builtin_table_u32(algorithm: CrcAlgorithm) -> Option<(&'static [[u32; 256]; 1
 /// reflected, or `None` for custom parameters.
 #[cfg(feature = "generated-tables")]
 #[allow(deprecated)]
+#[inline(always)]
 fn builtin_table_u64(algorithm: CrcAlgorithm) -> Option<(&'static [[u64; 256]; 16], bool)> {
     (!matches!(
         algorithm,
@@ -943,6 +1219,42 @@ mod table_tests {
                     );
                 }
                 width => panic!("unexpected width {width}"),
+            }
+        }
+    }
+
+    /// Every built-in algorithm has a calculator of its own, and it computes what the dispatching
+    /// path computes, from the initial state and from a carried one.
+    #[test]
+    fn every_built_in_algorithm_has_its_calculator() {
+        use rand::{rng, RngExt};
+        let mut data = [0u8; 4099];
+        rng().fill(&mut data[..]);
+        let lengths: &[usize] = if cfg!(miri) {
+            &[0, 1, 9, 130]
+        } else {
+            &[0, 1, 7, 8, 15, 16, 63, 64, 65, 200, 257, 1000, 4099]
+        };
+        assert_eq!(calc::ALL.len(), TEST_ALL_CONFIGS.len());
+        for config in TEST_ALL_CONFIGS {
+            let params = config.get_params();
+            let calculator = calc::ALL
+                .iter()
+                .find(|(algorithm, _)| *algorithm == params.algorithm)
+                .map(|(_, calculator)| *calculator)
+                .unwrap_or_else(|| panic!("no calculator for {:?}", params.algorithm));
+            for &len in lengths {
+                for state in [
+                    params.init_algorithm,
+                    0x0123_4567_89ab_cdef & (u64::MAX >> (64 - params.width)),
+                ] {
+                    assert_eq!(
+                        calculator(state, &data[..len], params),
+                        update(state, &data[..len], params),
+                        "{:?} at {len} bytes",
+                        params.algorithm
+                    );
+                }
             }
         }
     }

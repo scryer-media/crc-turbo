@@ -146,7 +146,11 @@ pub(crate) enum DataChunkProcessor {
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
 impl DataChunkProcessor {
-    /// Select the appropriate processor based on data length
+    /// Select the appropriate processor based on data length.
+    ///
+    /// Inlined, so that the strategy match after it becomes the length checks themselves; out of
+    /// line it was a call and a jump table on every short buffer.
+    #[inline(always)]
     pub fn for_length(len: usize) -> Self {
         match len {
             0..=15 => Self::From0To15,

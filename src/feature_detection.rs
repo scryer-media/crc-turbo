@@ -358,11 +358,13 @@ impl ArchOpsInstance {
 ///
 /// This function provides access to the cached ArchOps instance that was selected based on
 /// feature detection results at library initialization time, eliminating runtime feature
-/// detection overhead from hot paths.
+/// detection overhead from hot paths. Inlined, so that a checksum loads the tier and branches
+/// on it in place instead of first calling out to fetch it.
 #[cfg(all(
     feature = "std",
     any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
 ))]
+#[inline]
 pub fn get_arch_ops() -> &'static ArchOpsInstance {
     ARCH_OPS_INSTANCE.get_or_init(create_arch_ops)
 }
@@ -371,6 +373,7 @@ pub fn get_arch_ops() -> &'static ArchOpsInstance {
     not(feature = "std"),
     any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
 ))]
+#[inline]
 pub fn get_arch_ops() -> &'static ArchOpsInstance {
     ARCH_OPS_INSTANCE.call_once(create_arch_ops)
 }
@@ -381,6 +384,7 @@ pub fn get_arch_ops() -> &'static ArchOpsInstance {
 /// architecture-specific implementation at library initialization time, eliminating
 /// runtime feature detection overhead from hot paths.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
+#[cold]
 fn create_arch_ops() -> ArchOpsInstance {
     let capabilities = unsafe { detect_arch_capabilities() };
 

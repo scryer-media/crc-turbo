@@ -12,7 +12,9 @@
 
 #![cfg(target_arch = "aarch64")]
 
-use crate::crc32::fusion::aarch64::{clmul_hi, clmul_lo, clmul_scalar};
+#[cfg(target_vendor = "apple")]
+use crate::crc32::fusion::aarch64::fold_eor3;
+use crate::crc32::fusion::aarch64::{clmul_hi, clmul_lo, clmul_scalar, shifts};
 use core::arch::aarch64::{
     __crc32b, __crc32d, __crc32w, uint64x2_t, veor3q_u64, veorq_u64, vgetq_lane_u64, vld1q_u64,
     vmov_n_u64, vmull_p8, vreinterpret_p8_u64, vreinterpretq_u64_p16,
@@ -75,34 +77,52 @@ pub(crate) unsafe fn crc32_iso_hdlc_eor3_v9s3x2e_s3(
 
         // Main loop
         while buf <= limit {
-            let y0 = clmul_lo(x0, k);
-            x0 = clmul_hi(x0, k);
-            let y1 = clmul_lo(x1, k);
-            x1 = clmul_hi(x1, k);
-            let y2 = clmul_lo(x2, k);
-            x2 = clmul_hi(x2, k);
-            let y3 = clmul_lo(x3, k);
-            x3 = clmul_hi(x3, k);
-            let y4 = clmul_lo(x4, k);
-            x4 = clmul_hi(x4, k);
-            let y5 = clmul_lo(x5, k);
-            x5 = clmul_hi(x5, k);
-            let y6 = clmul_lo(x6, k);
-            x6 = clmul_hi(x6, k);
-            let y7 = clmul_lo(x7, k);
-            x7 = clmul_hi(x7, k);
-            let y8 = clmul_lo(x8, k);
-            x8 = clmul_hi(x8, k);
+            // Off Apple, every product first and then the EOR3s, the order 1.11.0 ran: on
+            // Graviton 3 at 1 MiB, past its 1 MiB L2, the fold interleaved product by product
+            // ran 0.94 to 0.96 of 1.11.0's speed, and this order 0.99 to 1.02.
+            #[cfg(target_vendor = "apple")]
+            {
+                x0 = fold_eor3(x0, k, vld1q_u64(buf2 as *const u64));
+                x1 = fold_eor3(x1, k, vld1q_u64(buf2.add(16) as *const u64));
+                x2 = fold_eor3(x2, k, vld1q_u64(buf2.add(32) as *const u64));
+                x3 = fold_eor3(x3, k, vld1q_u64(buf2.add(48) as *const u64));
+                x4 = fold_eor3(x4, k, vld1q_u64(buf2.add(64) as *const u64));
+                x5 = fold_eor3(x5, k, vld1q_u64(buf2.add(80) as *const u64));
+                x6 = fold_eor3(x6, k, vld1q_u64(buf2.add(96) as *const u64));
+                x7 = fold_eor3(x7, k, vld1q_u64(buf2.add(112) as *const u64));
+                x8 = fold_eor3(x8, k, vld1q_u64(buf2.add(128) as *const u64));
+            }
+            #[cfg(not(target_vendor = "apple"))]
+            {
+                let y0 = clmul_lo(x0, k);
+                x0 = clmul_hi(x0, k);
+                let y1 = clmul_lo(x1, k);
+                x1 = clmul_hi(x1, k);
+                let y2 = clmul_lo(x2, k);
+                x2 = clmul_hi(x2, k);
+                let y3 = clmul_lo(x3, k);
+                x3 = clmul_hi(x3, k);
+                let y4 = clmul_lo(x4, k);
+                x4 = clmul_hi(x4, k);
+                let y5 = clmul_lo(x5, k);
+                x5 = clmul_hi(x5, k);
+                let y6 = clmul_lo(x6, k);
+                x6 = clmul_hi(x6, k);
+                let y7 = clmul_lo(x7, k);
+                x7 = clmul_hi(x7, k);
+                let y8 = clmul_lo(x8, k);
+                x8 = clmul_hi(x8, k);
 
-            x0 = veor3q_u64(x0, y0, vld1q_u64(buf2 as *const u64));
-            x1 = veor3q_u64(x1, y1, vld1q_u64(buf2.add(16) as *const u64));
-            x2 = veor3q_u64(x2, y2, vld1q_u64(buf2.add(32) as *const u64));
-            x3 = veor3q_u64(x3, y3, vld1q_u64(buf2.add(48) as *const u64));
-            x4 = veor3q_u64(x4, y4, vld1q_u64(buf2.add(64) as *const u64));
-            x5 = veor3q_u64(x5, y5, vld1q_u64(buf2.add(80) as *const u64));
-            x6 = veor3q_u64(x6, y6, vld1q_u64(buf2.add(96) as *const u64));
-            x7 = veor3q_u64(x7, y7, vld1q_u64(buf2.add(112) as *const u64));
-            x8 = veor3q_u64(x8, y8, vld1q_u64(buf2.add(128) as *const u64));
+                x0 = veor3q_u64(x0, y0, vld1q_u64(buf2 as *const u64));
+                x1 = veor3q_u64(x1, y1, vld1q_u64(buf2.add(16) as *const u64));
+                x2 = veor3q_u64(x2, y2, vld1q_u64(buf2.add(32) as *const u64));
+                x3 = veor3q_u64(x3, y3, vld1q_u64(buf2.add(48) as *const u64));
+                x4 = veor3q_u64(x4, y4, vld1q_u64(buf2.add(64) as *const u64));
+                x5 = veor3q_u64(x5, y5, vld1q_u64(buf2.add(80) as *const u64));
+                x6 = veor3q_u64(x6, y6, vld1q_u64(buf2.add(96) as *const u64));
+                x7 = veor3q_u64(x7, y7, vld1q_u64(buf2.add(112) as *const u64));
+                x8 = veor3q_u64(x8, y8, vld1q_u64(buf2.add(128) as *const u64));
+            }
 
             crc0 = __crc32d(crc0, *(buf as *const u64));
             crc1 = __crc32d(crc1, *(buf.add(klen) as *const u64));
@@ -228,9 +248,22 @@ pub(crate) unsafe fn crc32_iso_hdlc_eor3_v9s3x2e_s3(
 }
 
 #[inline]
-#[target_feature(enable = "aes")]
+#[target_feature(enable = "crc,aes")]
 unsafe fn crc_shift_iso_hdlc(crc: u32, nbytes: usize) -> uint64x2_t {
-    clmul_scalar(crc, xnmodp_iso_hdlc((nbytes * 8 - 33) as u64))
+    clmul_scalar(crc, shift_iso_hdlc(nbytes))
+}
+
+/// `x^(8 * nbytes - 33) mod P`, from the shift tables where they reach.
+#[inline]
+#[target_feature(enable = "crc,aes")]
+pub(crate) unsafe fn shift_iso_hdlc(nbytes: usize) -> u32 {
+    match shifts::lookup(&shifts::ISO_HDLC, &shifts::ISO_HDLC_LONG, nbytes) {
+        shifts::Shift::Exact(shift) => shift,
+        shifts::Shift::Product(near, far) => {
+            __crc32d(0, vgetq_lane_u64(clmul_scalar(near, far), 0))
+        }
+        shifts::Shift::Beyond => xnmodp_iso_hdlc((nbytes * 8 - 33) as u64),
+    }
 }
 
 // x^n mod P, in log(n) time
@@ -267,4 +300,36 @@ unsafe fn xnmodp_iso_hdlc(mut n: u64) -> u32 {
         acc = __crc32d(0, y << low);
     }
     acc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The compile-time shift table holds what the kernel's run-time squaring, which uses the
+    /// CRC32 instructions, computes for the same distance.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn shift_table_matches_the_squaring() {
+        if !std::arch::is_aarch64_feature_detected!("crc")
+            || !std::arch::is_aarch64_feature_detected!("aes")
+        {
+            return;
+        }
+        for w in 1..=shifts::MAX_WORDS {
+            let squared = unsafe { xnmodp_iso_hdlc(64 * w as u64 - 33) };
+            assert_eq!(shifts::ISO_HDLC[w], squared, "{w} words");
+        }
+        // Past the short table: every boundary of the long one near its start and end, and a
+        // spread between, through the product of the two tables, and past both.
+        let mut words: Vec<usize> = Vec::new();
+        for h in (1..8).chain(shifts::LONG_LEN - 3..shifts::LONG_LEN + 2) {
+            let edge = h * shifts::MAX_WORDS;
+            words.extend([edge, edge + 1, edge + 777, edge + shifts::MAX_WORDS - 1]);
+        }
+        for w in words {
+            let squared = unsafe { xnmodp_iso_hdlc(64 * w as u64 - 33) };
+            assert_eq!(unsafe { shift_iso_hdlc(8 * w) }, squared, "{w} words");
+        }
+    }
 }

@@ -15,7 +15,21 @@
 
 mod iscsi;
 
+#[cfg(all(target_arch = "x86_64", test))]
+use iscsi::sse_pclmulqdq::crc32_iscsi_avx2_v4_aligned;
+#[cfg(all(target_arch = "x86_64", miri))]
+pub(crate) use iscsi::sse_pclmulqdq::crc32_iscsi_avx2_v4_aligned as crc32_iscsi_ecore_window;
+#[cfg(all(target_arch = "x86_64", not(miri), test))]
+use iscsi::sse_pclmulqdq::crc32_iscsi_avx2_v4_asm;
+/// The E-core window's kernel: the assembly where it can be built, the intrinsics under Miri,
+/// which runs no inline assembly.
+#[cfg(all(target_arch = "x86_64", not(miri)))]
+pub(crate) use iscsi::sse_pclmulqdq::crc32_iscsi_avx2_v4_asm as crc32_iscsi_ecore_window;
 use iscsi::sse_pclmulqdq::crc32_iscsi_sse_v4x2s4x4;
+#[cfg(target_arch = "x86_64")]
+use iscsi::sse_pclmulqdq::{crc32_iscsi_avx2_s3, crc32_iscsi_avx2_v4, crc32_iscsi_avx2_v4x2s4x4};
+#[cfg(target_arch = "x86_64")]
+use iscsi::sse_pclmulqdq_far::crc32_iscsi_avx2_v4s3x3;
 use iscsi::sse_pclmulqdq_far::crc32_iscsi_sse_v4s3x3;
 
 #[cfg(target_arch = "x86")]
@@ -26,17 +40,103 @@ use core::arch::x86_64::*;
 use iscsi::avx512_pclmulqdq::crc32_iscsi_avx512_v4s3x3;
 #[cfg(target_arch = "x86_64")]
 use iscsi::avx512_vpclmulqdq::crc32_iscsi_avx512_vpclmulqdq_v3x2;
+#[cfg(target_arch = "x86_64")]
+use iscsi::avx512_vpclmulqdq_streams::crc32_iscsi_avx512_vpclmulqdq_v4s5x3;
 
 use crate::feature_detection::PerformanceTier;
 
-/// Buffers up to this length run the unrolled CRC32 instruction loop: below it a fusion kernel's
-/// fixed cost (aligning, and shifting the partial CRCs back together) is more than it saves.
+/// Buffers up to this length run the unrolled CRC32 instruction loop on the AVX-512 tiers: below
+/// it a fusion kernel's fixed cost (aligning, and shifting the partial CRCs back together) is
+/// more than it saves.
 #[cfg(target_arch = "x86_64")]
 const SMALL_BUFFER_MAX: usize = 256;
 
-/// The same for the SSE kernel. Its shifts come from a table, so its fixed cost is lower: on a
-/// Xeon 6731E it overtakes the CRC32 instruction alone at 200 bytes.
+/// Where the AVX-512 VPCLMULQDQ tier's kernel starts running CRC32 instruction streams beside
+/// its fold lanes on Ice Lake servers: below it the streams' partial CRCs cost more to multiply
+/// back together than the streams save. The folding path runs up to here.
+#[cfg(target_arch = "x86_64")]
+const ICE_LAKE_STREAMS_MIN: usize = 16 << 10;
+
+/// The same on Zen 4, where the streams ran at 0.93x the fold lanes' speed at 16 KiB and, from
+/// an unaligned start, 0.98x at 32 KiB.
+#[cfg(target_arch = "x86_64")]
+const ZEN4_STREAMS_MIN: usize = 64 << 10;
+
+/// [`IscsiPlan::fold_end`] on the AVX-512 VPCLMULQDQ tier away from Ice Lake.
+#[cfg(target_arch = "x86_64")]
+const AVX512_FOLD_END: usize = 8192;
+
+/// [`IscsiPlan::fold_min`] on the AVX-512 VPCLMULQDQ tier where it was measured, Sapphire Rapids
+/// excepted: there the kernel takes every length past its window, as in 1.11.0. Its 64-byte
+/// blocks after the 384-byte steps are folded, not run through the CRC32 instruction as in
+/// 1.11.0, which is what had made 1.11.0 slow at 4 KiB; with them folded the kernel was level
+/// with the folding path at 4 KiB and ahead of it at lengths between (see `iscsi_limits`).
+#[cfg(target_arch = "x86_64")]
+const AVX512_FOLD_MIN: usize = 4096;
+
+/// Buffers shorter than this take the four-stream kernel's AVX2 build on the AVX-512 PCLMULQDQ
+/// tier; from here up the tier's own kernel, whose three streams and four 128-bit fold lanes
+/// need a long buffer to pay for their set-up.
+#[cfg(target_arch = "x86_64")]
+const AVX512_PCLMULQDQ_MIN: usize = 32 << 10;
+
+/// The longest buffer the vector-only kernel takes on Haswell and on the AVX-512 PCLMULQDQ tier
+/// (Skylake-SP, Cascade Lake), see [`iscsi_mid_max`].
+#[cfg(target_arch = "x86_64")]
+const INTEL_MID_MAX: usize = 768;
+/// [`IscsiPlan::direct_max`] on those CPUs: the CRC32 instruction alone is ahead of the
+/// vector-only kernel through 224 bytes and behind it from 256.
+#[cfg(target_arch = "x86_64")]
+const INTEL_DIRECT_MAX: usize = 240;
+/// The longest buffer the vector-only kernel takes on AMD's family 0x17 (Zen 2), past
+/// [`ZEN2_DIRECT_MAX`].
+#[cfg(target_arch = "x86_64")]
+const ZEN2_MID_MAX: usize = 447;
+/// [`IscsiPlan::direct_max`] on AMD's family 0x19 (Zen 3, and Zen 4 below AVX-512) with the
+/// AVX2 build.
+#[cfg(target_arch = "x86_64")]
+const ZEN3_DIRECT_MAX: usize = 320;
+/// The longest buffer the vector-only kernel takes there.
+#[cfg(target_arch = "x86_64")]
+const ZEN3_MID_MAX: usize = 447;
+/// The longest buffer the vector-only kernel takes on the AVX-512 VPCLMULQDQ tier, on the CPUs
+/// whose plan has it, past [`SMALL_BUFFER_MAX`]: from a start off a 64-byte boundary, where every
+/// one of the 512-bit kernel's loads splits two cache lines.
+#[cfg(target_arch = "x86_64")]
+const VPCLMUL_MID_MAX: usize = 447;
+/// The longest buffer it takes from a 64-byte aligned start on Sapphire Rapids and Ice Lake; Zen 4
+/// keeps the 512-bit kernel for those.
+#[cfg(target_arch = "x86_64")]
+const VPCLMUL_MID_ALIGNED_MAX: usize = 383;
+
+/// The SSE and AVX2 entry points take buffers up to this length with the CRC32 instruction alone.
+/// It is the lowest of the per-CPU limits in [`IscsiPlan::direct_max`], so the direct call has
+/// already taken them on every CPU; it keeps the entry points whole when called on their own.
 const SSE_SMALL_BUFFER_MAX: usize = 199;
+
+/// [`IscsiPlan::direct_max`] on Intel's E-core parts, see [`iscsi_limits`].
+const ECORE_DIRECT_MAX: usize = SSE_SMALL_BUFFER_MAX;
+/// [`IscsiPlan::direct_max`] on Intel's E-core parts with the AVX2 build, whose plan hands over
+/// to the vector-only kernel: on a Xeon 6731E the `v4` shape from a 16-byte boundary was ahead
+/// of the CRC32 instruction alone at 160 bytes, aligned or not, and level with it or behind at 128.
+#[cfg(target_arch = "x86_64")]
+pub(crate) const ECORE_V4_DIRECT_MAX: usize = 159;
+/// The longest buffer the vector-only kernel takes there: on a Xeon 6731E it was ahead of the
+/// four-stream kernel at 640 bytes and behind it at 768.
+#[cfg(target_arch = "x86_64")]
+pub(crate) const ECORE_MID_MAX: usize = 703;
+/// The shortest buffer the E-core window takes from a 16-byte aligned start, where the fold has
+/// no head to take first: on a Xeon 6731E fast-crc32's `v4` was ahead of the CRC32 instruction
+/// alone from 112 bytes aligned and behind it at 96.
+#[cfg(target_arch = "x86_64")]
+pub(crate) const ECORE_V4_ALIGNED_MIN: usize = 112;
+/// [`IscsiPlan::direct_max`] on AMD's family 0x17 (Zen, Zen+, Zen 2).
+const ZEN2_DIRECT_MAX: usize = 288;
+/// [`IscsiPlan::direct_max`] below AVX-512 everywhere else, and the longest any plan has.
+const DIRECT_MAX: usize = 384;
+/// [`IscsiPlan::fold_min`] on AMD's family 0x19 (Zen 3) on the AVX2 tier.
+#[cfg(target_arch = "x86_64")]
+const ZEN3_FOLD_MIN: usize = 4096;
 
 /// Buffers longer than this go to the three-stream SSE kernel. The four-stream kernel reads five
 /// places in the buffer at once, and once the buffer no longer fits in the cache that is one more
@@ -44,16 +144,24 @@ const SSE_SMALL_BUFFER_MAX: usize = 199;
 /// the three-stream kernel at 3 MiB, 2% behind at 4 MiB and 14% behind from 8 MiB up.
 const SSE_FAR_MIN: usize = 3 << 20;
 
-/// Buffers up to this length never reach a kernel: [`crc32_iscsi_small_unaligned`] is called for
-/// them directly, so they pay neither the indirect call nor a kernel's entry. It is the lowest
-/// of the kernels' own limits, so none is kept from a length it would have fused.
-pub(crate) const DIRECT_SMALL_MAX: usize = SSE_SMALL_BUFFER_MAX;
+/// Buffers from this length take the three CRC32 streams alone on AMD's family 0x17 (Zen 2), see
+/// [`iscsi_plan`].
+#[cfg(target_arch = "x86_64")]
+const ZEN2_STREAMS_MIN: usize = 32 << 10;
+
+/// Where Alder Lake's plan hands over to the three-stream kernel instead, see [`iscsi_far_min`].
+#[cfg(target_arch = "x86_64")]
+const ALDER_LAKE_FAR_MIN: usize = 128 << 10;
 
 /// The CRC-32/ISCSI fusion kernel a tier runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum IscsiKernel {
     /// 128-bit PCLMULQDQ folds beside four CRC32 instruction streams.
     Sse,
+    /// The same kernels compiled for AVX2, on CPUs that have it: the VEX encoding of the same
+    /// 128-bit instructions, which saves a register copy before most of them.
+    #[cfg(target_arch = "x86_64")]
+    Avx2,
     /// 128-bit PCLMULQDQ folds with AVX-512VL ternary logic beside three CRC32 streams.
     #[cfg(target_arch = "x86_64")]
     Avx512Pclmulqdq,
@@ -66,8 +174,14 @@ pub(crate) enum IscsiKernel {
 ///
 /// Every x86 tier above the software one has PCLMULQDQ; `has_sse42` adds the CRC32 instructions,
 /// which no tier implies. Each tier is held to its own width, so a pinned `CRC_TURBO_TIER` covers
-/// the fusion kernels too.
-pub(crate) fn select_iscsi_kernel(tier: PerformanceTier, has_sse42: bool) -> Option<IscsiKernel> {
+/// the fusion kernels too. Below AVX-512 the kernels are 128 bits wide whatever the encoding, so
+/// `has_avx2` picks their AVX2 build on the SSE tier as well as the AVX2 one.
+pub(crate) fn select_iscsi_kernel(
+    tier: PerformanceTier,
+    has_sse42: bool,
+    // 32-bit x86 has no AVX2 build of the kernels
+    #[cfg_attr(target_arch = "x86", allow(unused_variables))] has_avx2: bool,
+) -> Option<IscsiKernel> {
     if !has_sse42 {
         return None;
     }
@@ -77,6 +191,14 @@ pub(crate) fn select_iscsi_kernel(tier: PerformanceTier, has_sse42: bool) -> Opt
         PerformanceTier::X86_64Avx512Vpclmulqdq => Some(IscsiKernel::Avx512Vpclmulqdq),
         #[cfg(target_arch = "x86_64")]
         PerformanceTier::X86_64Avx512Pclmulqdq => Some(IscsiKernel::Avx512Pclmulqdq),
+        #[cfg(target_arch = "x86_64")]
+        PerformanceTier::X86_64Avx2Vpclmulqdq
+        | PerformanceTier::X86_64SsePclmulqdq
+        | PerformanceTier::X86SsePclmulqdq
+            if has_avx2 =>
+        {
+            Some(IscsiKernel::Avx2)
+        }
         PerformanceTier::X86_64Avx2Vpclmulqdq
         | PerformanceTier::X86_64SsePclmulqdq
         | PerformanceTier::X86SsePclmulqdq => Some(IscsiKernel::Sse),
@@ -94,13 +216,448 @@ pub(crate) fn iscsi_kernel_fn(kernel: IscsiKernel) -> unsafe fn(u32, &[u8]) -> u
     match kernel {
         IscsiKernel::Sse => crc32_iscsi_sse,
         #[cfg(target_arch = "x86_64")]
-        IscsiKernel::Avx512Pclmulqdq => crc32_iscsi_avx512_pclmulqdq,
+        IscsiKernel::Avx2 => crc32_iscsi_avx2::<SSE_FAR_MIN, 0, { usize::MAX }>,
         #[cfg(target_arch = "x86_64")]
-        IscsiKernel::Avx512Vpclmulqdq => crc32_iscsi_avx512_vpclmulqdq,
+        IscsiKernel::Avx512Pclmulqdq => crc32_iscsi_avx512_pclmulqdq::<0>,
+        #[cfg(target_arch = "x86_64")]
+        IscsiKernel::Avx512Vpclmulqdq => crc32_iscsi_avx512_vpclmulqdq::<{ usize::MAX }, 0, 0>,
     }
 }
 
-/// CRC-32/ISCSI through the SSE kernel, for the tiers below AVX-512.
+/// What CRC-32/ISCSI dispatch needs to know of a CPU beyond its features. The lengths where the
+/// CRC32 instruction alone, the fusion kernel and the folding path hand over differ by core,
+/// not by feature, so they are chosen from the vendor, family and model, once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CpuId {
+    pub(crate) vendor: [u8; 12],
+    /// Family, with the extended family added when the base family is 0xF.
+    pub(crate) family: u32,
+    /// Model, with the extended model added for families 6 and 0xF.
+    pub(crate) model: u32,
+}
+
+impl CpuId {
+    /// This CPU, from CPUID leaves 0 and 1.
+    pub(crate) fn detect() -> Self {
+        // SAFETY: CPUID is present on every CPU of the targets this crate builds for, x86_64
+        // and 32-bit x86 from the Pentium, which is why current compilers declare `__cpuid`
+        // safe. Rust 1.89, the minimum, still declares it unsafe.
+        #[allow(unused_unsafe)]
+        let (vendor_leaf, version) = unsafe { (__cpuid(0), __cpuid(1)) };
+
+        let mut vendor = [0u8; 12];
+        vendor[..4].copy_from_slice(&vendor_leaf.ebx.to_le_bytes());
+        vendor[4..8].copy_from_slice(&vendor_leaf.edx.to_le_bytes());
+        vendor[8..].copy_from_slice(&vendor_leaf.ecx.to_le_bytes());
+
+        let base_family = (version.eax >> 8) & 0xf;
+        let base_model = (version.eax >> 4) & 0xf;
+        let family = match base_family {
+            0xf => base_family + ((version.eax >> 20) & 0xff),
+            _ => base_family,
+        };
+        let model = match base_family {
+            0x6 | 0xf => base_model | (((version.eax >> 16) & 0xf) << 4),
+            _ => base_model,
+        };
+
+        CpuId {
+            vendor,
+            family,
+            model,
+        }
+    }
+
+    fn is_amd(&self) -> bool {
+        &self.vendor == b"AuthenticAMD"
+    }
+
+    /// Intel's parts built only of E-cores from Gracemont on: Alder Lake-N, Sierra Forest, Grand
+    /// Ridge and Clearwater Forest. A hybrid part is not one: its threads move between P-cores and
+    /// E-cores, and it is planned for its P-cores.
+    pub(crate) fn is_intel_ecore(&self) -> bool {
+        &self.vendor == b"GenuineIntel"
+            && self.family == 6
+            && matches!(self.model, 0xbe | 0xaf | 0xb6 | 0xdd)
+    }
+
+    /// Any Intel family 6 part.
+    #[cfg(target_arch = "x86_64")]
+    fn is_intel_family_6(&self) -> bool {
+        &self.vendor == b"GenuineIntel" && self.family == 6
+    }
+
+    /// Ice Lake servers, models 0x6a and 0x6c.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn is_ice_lake_server(&self) -> bool {
+        self.is_intel_family_6() && matches!(self.model, 0x6a | 0x6c)
+    }
+
+    /// Haswell, models 0x3c, 0x3f, 0x45 and 0x46.
+    #[cfg(target_arch = "x86_64")]
+    fn is_haswell(&self) -> bool {
+        self.is_intel_family_6() && matches!(self.model, 0x3c | 0x3f | 0x45 | 0x46)
+    }
+
+    /// Sapphire Rapids and Emerald Rapids servers, models 0x8f and 0xcf.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn is_sapphire_rapids(&self) -> bool {
+        self.is_intel_family_6() && matches!(self.model, 0x8f | 0xcf)
+    }
+
+    /// AMD's family 0x17: Zen, Zen+ and Zen 2.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn is_amd_family_17(&self) -> bool {
+        self.is_amd() && self.family == 0x17
+    }
+
+    /// AMD's family 0x19, whose AVX-512 parts are Zen 4.
+    #[cfg(target_arch = "x86_64")]
+    fn is_amd_family_19(&self) -> bool {
+        self.is_amd() && self.family == 0x19
+    }
+
+    /// Alder Lake's hybrid parts, models 0x97 (desktop) and 0x9a (mobile): Golden Cove P-cores
+    /// beside Gracemont E-cores.
+    #[cfg(target_arch = "x86_64")]
+    fn is_alder_lake(&self) -> bool {
+        &self.vendor == b"GenuineIntel" && self.family == 6 && matches!(self.model, 0x97 | 0x9a)
+    }
+}
+
+/// How CRC-32/ISCSI is taken on this CPU: the CRC32 instruction alone up to `direct_max`, the
+/// fusion kernel after that, and the folding path from `fold_min`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct IscsiPlan {
+    /// The fusion kernel, from [`iscsi_kernel_fn`].
+    pub(crate) kernel: unsafe fn(u32, &[u8]) -> u32,
+    /// Buffers up to this length take [`crc32_iscsi_small_unaligned`], called directly, so they
+    /// pay neither the indirect call nor a kernel's entry.
+    pub(crate) direct_max: usize,
+    /// One more than the longest buffer the dispatch entry hands straight to
+    /// [`crc32_iscsi_avx2_v4_aligned`], past `direct_max`, without the plan's kernel entry: 0
+    /// where the plan has no such window. Only Intel's E-core parts have one, [`ECORE_MID_MAX`],
+    /// and their kernel is the tier's default build: the dispatch entry has taken the window
+    /// before it, with one direct call as fast-crc32's `v4` is reached, rather than through the
+    /// plan and its indirect call.
+    #[cfg_attr(target_arch = "x86", allow(dead_code))]
+    pub(crate) v4_end: usize,
+    /// Buffers this long or longer take the folding path instead of the kernel; `usize::MAX`
+    /// where the kernel is faster at every length.
+    pub(crate) fold_min: usize,
+    /// Buffers this long or longer take the kernel again; `usize::MAX` where the folding path
+    /// stays ahead.
+    pub(crate) fold_end: usize,
+}
+
+impl IscsiPlan {
+    /// What the dispatch entry compares a length against before anything else: one more than
+    /// `direct_max`, or on the plans with the E-core window its shortest aligned length,
+    /// [`ECORE_V4_ALIGNED_MIN`], which no other plan has. A shorter buffer takes the CRC32
+    /// instruction alone with exactly the instructions it took before the window was added; a
+    /// longer one tests [`is_ecore_entry_end`] on the value already loaded, and a plan without the
+    /// window goes on to its kernel as before, past one compare of that register.
+    pub(crate) fn entry_end(&self) -> usize {
+        #[cfg(target_arch = "x86_64")]
+        if self.v4_end != 0 {
+            return ECORE_V4_ALIGNED_MIN;
+        }
+        self.direct_max + 1
+    }
+}
+
+// No plan without the window has its entry end
+#[cfg(target_arch = "x86_64")]
+const _: () = {
+    let ends = [
+        SMALL_BUFFER_MAX,
+        INTEL_DIRECT_MAX,
+        SSE_SMALL_BUFFER_MAX,
+        ECORE_DIRECT_MAX,
+        ZEN2_DIRECT_MAX,
+        ZEN3_DIRECT_MAX,
+        DIRECT_MAX,
+    ];
+    let mut i = 0;
+    while i < ends.len() {
+        assert!(ends[i] + 1 != ECORE_V4_ALIGNED_MIN);
+        i += 1;
+    }
+};
+
+/// Whether `end`, the dispatch entry's loaded [`IscsiPlan::entry_end`], is the E-core plan's.
+/// The entry tests it once a length is past it, on the register it compared the length with, and
+/// only then leaves for [`ecore_window`], out of line: a plan without the window adds that
+/// compare and a branch not taken ahead of the jump to its kernel, and reads nothing more.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub(crate) fn is_ecore_entry_end(end: usize) -> bool {
+    end == ECORE_V4_ALIGNED_MIN
+}
+
+/// The kernel the E-core window takes for a buffer, if any.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EcoreWindow {
+    /// Not the window's: the plan.
+    Plan,
+    /// Below the window from an unaligned start: the CRC32 instruction alone, as the plan's
+    /// direct limit would take it, without going through the plan.
+    Direct,
+    /// [`crc32_iscsi_ecore_window`], `v4`.
+    V4,
+}
+
+/// Which kernel the E-core window takes `len` bytes from address `start` with, `len` being past
+/// the plan's entry end: through [`ECORE_MID_MAX`], from [`ECORE_V4_ALIGNED_MIN`] when the start
+/// is 16-byte aligned, where the fold has no head, and past [`ECORE_V4_DIRECT_MAX`] from any start.
+/// The unaligned ones below that take the CRC32 instruction alone, the longer ones the plan.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub(crate) fn ecore_window(len: usize, start: usize) -> EcoreWindow {
+    // The window's test first and whole, so its call is the fall-through; split as three
+    // arms, LLVM put the jump to the plan ahead of it and every window call took a branch more
+    if len <= ECORE_MID_MAX && (len > ECORE_V4_DIRECT_MAX || start & 15 == 0) {
+        EcoreWindow::V4
+    } else if len > ECORE_MID_MAX {
+        EcoreWindow::Plan
+    } else {
+        EcoreWindow::Direct
+    }
+}
+
+/// The two tests together, as the dispatch entry makes them on a length past `end`.
+#[cfg(all(target_arch = "x86_64", test))]
+fn ecore_window_takes(end: usize, len: usize, start: usize) -> Option<EcoreWindow> {
+    is_ecore_entry_end(end).then(|| ecore_window(len, start))
+}
+
+/// The plan for `kernel` on `tier` and `cpu`.
+pub(crate) fn iscsi_plan(kernel: IscsiKernel, tier: PerformanceTier, cpu: CpuId) -> IscsiPlan {
+    let (direct_max, fold_min) = iscsi_limits(kernel, tier, cpu);
+    let fold_end = iscsi_fold_end(kernel, tier, cpu);
+    #[cfg(target_arch = "x86_64")]
+    let v4_end = match (
+        kernel,
+        iscsi_far_min(kernel, cpu),
+        iscsi_mid_max(kernel, cpu),
+    ) {
+        (IscsiKernel::Avx2, SSE_FAR_MIN, ECORE_MID_MAX) if cpu.is_intel_ecore() => {
+            ECORE_MID_MAX + 1
+        }
+        _ => 0,
+    };
+    #[cfg(target_arch = "x86")]
+    let v4_end = 0;
+    // The vector-only window and the far handover pick the entry's build; Zen 2 also takes the
+    // three CRC32 streams alone for long buffers.
+    let kernel = match (
+        kernel,
+        iscsi_far_min(kernel, cpu),
+        iscsi_mid_max(kernel, cpu),
+    ) {
+        #[cfg(target_arch = "x86_64")]
+        (IscsiKernel::Avx2, ALDER_LAKE_FAR_MIN, 0) => {
+            crc32_iscsi_avx2::<ALDER_LAKE_FAR_MIN, 0, { usize::MAX }>
+        }
+        #[cfg(target_arch = "x86_64")]
+        (IscsiKernel::Avx2, SSE_FAR_MIN, ZEN2_MID_MAX) if cpu.is_amd() && cpu.family == 0x17 => {
+            crc32_iscsi_avx2::<SSE_FAR_MIN, ZEN2_MID_MAX, ZEN2_STREAMS_MIN>
+        }
+        #[cfg(target_arch = "x86_64")]
+        (IscsiKernel::Avx2, SSE_FAR_MIN, ZEN3_MID_MAX) if cpu.is_amd_family_19() => {
+            crc32_iscsi_avx2::<SSE_FAR_MIN, ZEN3_MID_MAX, { usize::MAX }>
+        }
+        #[cfg(target_arch = "x86_64")]
+        (IscsiKernel::Avx2, SSE_FAR_MIN, INTEL_MID_MAX) => {
+            crc32_iscsi_avx2::<SSE_FAR_MIN, INTEL_MID_MAX, { usize::MAX }>
+        }
+        #[cfg(target_arch = "x86_64")]
+        (IscsiKernel::Avx512Pclmulqdq, _, INTEL_MID_MAX) => {
+            crc32_iscsi_avx512_pclmulqdq::<INTEL_MID_MAX>
+        }
+        #[cfg(target_arch = "x86_64")]
+        (IscsiKernel::Avx512Vpclmulqdq, _, VPCLMUL_MID_MAX) if cpu.is_ice_lake_server() => {
+            crc32_iscsi_avx512_vpclmulqdq::<
+                ICE_LAKE_STREAMS_MIN,
+                VPCLMUL_MID_MAX,
+                VPCLMUL_MID_ALIGNED_MAX,
+            >
+        }
+        #[cfg(target_arch = "x86_64")]
+        (IscsiKernel::Avx512Vpclmulqdq, _, VPCLMUL_MID_MAX) if cpu.is_amd_family_19() => {
+            crc32_iscsi_avx512_vpclmulqdq::<ZEN4_STREAMS_MIN, VPCLMUL_MID_MAX, 0>
+        }
+        #[cfg(target_arch = "x86_64")]
+        (IscsiKernel::Avx512Vpclmulqdq, _, VPCLMUL_MID_MAX) => {
+            crc32_iscsi_avx512_vpclmulqdq::<{ usize::MAX }, VPCLMUL_MID_MAX, VPCLMUL_MID_ALIGNED_MAX>
+        }
+        _ => iscsi_kernel_fn(kernel),
+    };
+    IscsiPlan {
+        kernel,
+        direct_max,
+        v4_end,
+        fold_min,
+        fold_end,
+    }
+}
+
+/// [`IscsiPlan::fold_end`] for `kernel` on `tier` and `cpu`: the AVX-512 VPCLMULQDQ tier folds
+/// a window of lengths, see [`iscsi_limits`]; Zen 3 on the AVX2 tier folds to any length.
+// 32-bit x86 has no AVX-512 kernel, so no window
+#[cfg_attr(target_arch = "x86", allow(unused_variables))]
+fn iscsi_fold_end(kernel: IscsiKernel, tier: PerformanceTier, cpu: CpuId) -> usize {
+    match kernel {
+        #[cfg(target_arch = "x86_64")]
+        IscsiKernel::Avx512Vpclmulqdq if cpu.is_ice_lake_server() => ICE_LAKE_STREAMS_MIN,
+        #[cfg(target_arch = "x86_64")]
+        IscsiKernel::Avx512Vpclmulqdq if iscsi_limits(kernel, tier, cpu).1 != usize::MAX => {
+            AVX512_FOLD_END
+        }
+        _ => usize::MAX,
+    }
+}
+
+/// The length above which `kernel` hands over to the three-stream kernel on `cpu`, for the SSE
+/// and AVX2 builds; `usize::MAX` for the AVX-512 kernels, which have one shape at every length.
+///
+/// On Alder Lake's P-cores the four-stream kernel fell 1% to 2% behind the three-stream one of
+/// 1.11.1 from 256 KiB to 2 MiB, while on its E-cores it was 4% to 10% ahead. Threads move between
+/// the two, so the plan takes the three-stream kernel from 128 KiB: on an i5-1240P that matched
+/// 1.11.1 on the P-cores and was still 1.18x to 1.20x faster than it on the E-cores, where a
+/// 256 KiB handover gained 2% more but left the P-cores 1% behind at 256 KiB. Elsewhere the
+/// three-stream kernel waits for buffers past the cache, see `SSE_FAR_MIN`.
+fn iscsi_far_min(kernel: IscsiKernel, cpu: CpuId) -> usize {
+    match kernel {
+        #[cfg(target_arch = "x86_64")]
+        IscsiKernel::Avx512Pclmulqdq | IscsiKernel::Avx512Vpclmulqdq => usize::MAX,
+        #[cfg(target_arch = "x86_64")]
+        IscsiKernel::Avx2 if cpu.is_alder_lake() => ALDER_LAKE_FAR_MIN,
+        _ => {
+            let _ = cpu;
+            SSE_FAR_MIN
+        }
+    }
+}
+
+/// [`IscsiPlan::direct_max`] and [`IscsiPlan::fold_min`] for `kernel` on `tier` and `cpu`.
+///
+/// The SSE kernel overtakes the CRC32 instruction alone at different lengths on different cores,
+/// measured against each other on each, aligned and three bytes off, with the AVX2 build where
+/// the CPU has AVX2 (the Xeon 6731E row is the SSE build; its AVX2 build was not measured):
+///
+/// | CPU | the loop is ahead through | the kernel from |
+/// |---|---:|---:|
+/// | Xeon 6731E (Sierra Forest, E-cores) | 199 | 200 |
+/// | EPYC 7R32 (Zen 2) | 288 | 320 |
+/// | EPYC 7R13 (Zen 3) | 320 (384 even) | 448 |
+/// | Xeon E5-2666 v3 (Haswell) | 320 (384 unaligned) | 448 |
+/// | Xeon Platinum 8375C (Ice Lake), AVX2 tier pinned | 320 (384 even) | 448 |
+/// | Core i5-1240P (Alder Lake), P-core | 384 | 512 |
+/// | Core i5-1240P (Alder Lake), E-core | 199 | 200 |
+///
+/// Alder Lake keeps the P-core's 384: threads move between the two kinds of core, and a
+/// 200-byte handover cost the P-cores up to 12% from 200 to 256 bytes.
+///
+/// On Zen 3 the AVX2 tier's 256-bit VPCLMULQDQ fold is 1.05x the fusion kernel's speed at 4 KiB
+/// and up to 1.14x at larger sizes, so from 4 KiB CRC-32/ISCSI folds there. On Ice Lake, Zen 2
+/// and Haswell the fold ran at about 0.6x the fusion kernel's speed, so they keep the kernel, and
+/// so does Alder Lake: 1.02x to 1.07x on its P-cores from 64 KiB to 4 MiB, but about 0.75x from
+/// 8 MiB and about 0.6x on its E-cores.
+fn iscsi_limits(kernel: IscsiKernel, tier: PerformanceTier, cpu: CpuId) -> (usize, usize) {
+    match kernel {
+        #[cfg(target_arch = "x86_64")]
+        IscsiKernel::Avx512Vpclmulqdq => {
+            let fold_min = if (cpu.is_intel_family_6() && !cpu.is_sapphire_rapids())
+                || cpu.is_amd_family_19()
+            {
+                AVX512_FOLD_MIN
+            } else {
+                usize::MAX
+            };
+            (SMALL_BUFFER_MAX, fold_min)
+        }
+        // AVX-512 without VPCLMULQDQ is Skylake-X, Cascade Lake and Cooper Lake, one core.
+        #[cfg(target_arch = "x86_64")]
+        IscsiKernel::Avx512Pclmulqdq => (INTEL_DIRECT_MAX, usize::MAX),
+        _ => {
+            // The AVX2 build's plans with a vector-only kernel hand over to it sooner
+            let direct_max = match kernel {
+                #[cfg(target_arch = "x86_64")]
+                IscsiKernel::Avx2 if cpu.is_amd_family_19() => ZEN3_DIRECT_MAX,
+                #[cfg(target_arch = "x86_64")]
+                IscsiKernel::Avx2 if cpu.is_haswell() => INTEL_DIRECT_MAX,
+                #[cfg(target_arch = "x86_64")]
+                IscsiKernel::Avx2 if cpu.is_intel_ecore() => ECORE_V4_DIRECT_MAX,
+                _ => sse_direct_max(cpu),
+            };
+            let fold_min = match tier {
+                #[cfg(target_arch = "x86_64")]
+                PerformanceTier::X86_64Avx2Vpclmulqdq if cpu.is_amd() && cpu.family == 0x19 => {
+                    ZEN3_FOLD_MIN
+                }
+                _ => usize::MAX,
+            };
+            (direct_max, fold_min)
+        }
+    }
+}
+
+/// [`IscsiPlan::direct_max`] for the SSE build of the kernels on `cpu`, and for the AVX2 build
+/// on the CPUs whose plan has no vector-only kernel.
+fn sse_direct_max(cpu: CpuId) -> usize {
+    if cpu.is_intel_ecore() {
+        ECORE_DIRECT_MAX
+    } else if cpu.is_amd() && cpu.family == 0x17 {
+        ZEN2_DIRECT_MAX
+    } else {
+        DIRECT_MAX
+    }
+}
+
+/// The longest buffer `kernel`'s plan on `cpu` hands to the vector-only kernel, past
+/// [`IscsiPlan::direct_max`], or 0 where it has none. Measured against the CRC32 instruction alone
+/// below it and the plan's kernel above it, aligned and three bytes off:
+///
+/// | CPU | the CRC32 instruction through | the vector-only kernel through |
+/// |---|---:|---:|
+/// | Xeon E5-2666 v3 (Haswell) | 240 | 768 |
+/// | Xeon Platinum 8124M (Skylake-SP) | 240 | 768 |
+/// | EPYC 7R32 (Zen 2) | 288 | 447 |
+/// | EPYC 7R13 (Zen 3) | 320 | 447 |
+/// | Xeon Platinum 8488C (Sapphire Rapids) | 256 | 383, and 447 off a 64-byte boundary |
+/// | Xeon Platinum 8375C (Ice Lake) | 256 | 383, and 447 off a 64-byte boundary |
+/// | EPYC 9R14 (Zen 4) | 256 | 447 off a 64-byte boundary only |
+///
+/// The SSE build has no vector-only kernel.
+// 32-bit x86 has only the SSE build
+#[cfg_attr(target_arch = "x86", allow(unused_variables))]
+fn iscsi_mid_max(kernel: IscsiKernel, cpu: CpuId) -> usize {
+    match kernel {
+        #[cfg(target_arch = "x86_64")]
+        IscsiKernel::Avx2 if cpu.is_alder_lake() => 0,
+        #[cfg(target_arch = "x86_64")]
+        IscsiKernel::Avx2 if cpu.is_amd() && cpu.family == 0x17 => ZEN2_MID_MAX,
+        #[cfg(target_arch = "x86_64")]
+        IscsiKernel::Avx2 if cpu.is_amd_family_19() => ZEN3_MID_MAX,
+        #[cfg(target_arch = "x86_64")]
+        IscsiKernel::Avx2 if cpu.is_haswell() => INTEL_MID_MAX,
+        #[cfg(target_arch = "x86_64")]
+        IscsiKernel::Avx2 if cpu.is_intel_ecore() => ECORE_MID_MAX,
+        #[cfg(target_arch = "x86_64")]
+        IscsiKernel::Avx512Pclmulqdq => INTEL_MID_MAX,
+        #[cfg(target_arch = "x86_64")]
+        IscsiKernel::Avx512Vpclmulqdq
+            if cpu.is_sapphire_rapids() || cpu.is_ice_lake_server() || cpu.is_amd_family_19() =>
+        {
+            VPCLMUL_MID_MAX
+        }
+        _ => 0,
+    }
+}
+
+/// CRC-32/ISCSI through the SSE kernel, for the tiers below AVX-512 on CPUs without AVX2.
 ///
 /// # Safety
 ///
@@ -108,7 +665,7 @@ pub(crate) fn iscsi_kernel_fn(kernel: IscsiKernel) -> unsafe fn(u32, &[u8]) -> u
 #[target_feature(enable = "sse4.2,pclmulqdq")]
 pub(crate) unsafe fn crc32_iscsi_sse(crc: u32, data: &[u8]) -> u32 {
     if data.len() <= SSE_SMALL_BUFFER_MAX {
-        return crc32_iscsi_small_fast(crc, data);
+        return crc32_iscsi_small_unaligned(crc, data);
     }
 
     if data.len() > SSE_FAR_MIN {
@@ -118,16 +675,63 @@ pub(crate) unsafe fn crc32_iscsi_sse(crc: u32, data: &[u8]) -> u32 {
     crc32_iscsi_sse_v4x2s4x4(crc, data.as_ptr(), data.len())
 }
 
-/// CRC-32/ISCSI through the AVX-512 PCLMULQDQ kernel, for the `x86_64-avx512-pclmulqdq` tier.
+/// [`crc32_iscsi_sse`] through the kernels' AVX2 build, handing over to the three-stream kernel
+/// above `FAR_MIN` bytes ([`iscsi_far_min`]).
 ///
 /// # Safety
 ///
-/// The CPU must have AVX512VL and PCLMULQDQ.
+/// The CPU must have AVX2, SSE4.2 and PCLMULQDQ.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512vl,pclmulqdq")]
-pub(crate) unsafe fn crc32_iscsi_avx512_pclmulqdq(crc: u32, data: &[u8]) -> u32 {
+#[target_feature(enable = "avx2,sse4.2,pclmulqdq")]
+pub(crate) unsafe fn crc32_iscsi_avx2<
+    const FAR_MIN: usize,
+    const MID_MAX: usize,
+    const STREAMS_MIN: usize,
+>(
+    crc: u32,
+    data: &[u8],
+) -> u32 {
+    if data.len() >= STREAMS_MIN {
+        return crc32_iscsi_avx2_s3(crc, data.as_ptr(), data.len());
+    }
+
+    if MID_MAX != 0 && data.len() <= MID_MAX {
+        return crc32_iscsi_avx2_v4(crc, data.as_ptr(), data.len());
+    }
+
+    if data.len() <= SSE_SMALL_BUFFER_MAX {
+        return crc32_iscsi_small_unaligned(crc, data);
+    }
+
+    if data.len() > FAR_MIN {
+        return crc32_iscsi_avx2_v4s3x3(crc, data.as_ptr(), data.len());
+    }
+
+    crc32_iscsi_avx2_v4x2s4x4(crc, data.as_ptr(), data.len())
+}
+
+/// CRC-32/ISCSI for the `x86_64-avx512-pclmulqdq` tier: the four-stream kernel's AVX2 build below
+/// `AVX512_PCLMULQDQ_MIN`, the AVX-512 PCLMULQDQ kernel from there up.
+///
+/// # Safety
+///
+/// The CPU must have AVX512VL, which no CPU has without AVX2, SSE4.2 and PCLMULQDQ.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512vl,avx2,sse4.2,pclmulqdq")]
+pub(crate) unsafe fn crc32_iscsi_avx512_pclmulqdq<const MID_MAX: usize>(
+    crc: u32,
+    data: &[u8],
+) -> u32 {
+    if MID_MAX != 0 && data.len() <= MID_MAX {
+        return crc32_iscsi_avx2_v4(crc, data.as_ptr(), data.len());
+    }
+
     if data.len() <= SMALL_BUFFER_MAX {
         return crc32_iscsi_small_fast(crc, data);
+    }
+
+    if data.len() < AVX512_PCLMULQDQ_MIN {
+        return crc32_iscsi_avx2_v4x2s4x4(crc, data.as_ptr(), data.len());
     }
 
     crc32_iscsi_avx512_v4s3x3(crc, data.as_ptr(), data.len())
@@ -140,9 +744,29 @@ pub(crate) unsafe fn crc32_iscsi_avx512_pclmulqdq(crc: u32, data: &[u8]) -> u32 
 /// The CPU must have AVX512VL and VPCLMULQDQ.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512vl,vpclmulqdq")]
-pub(crate) unsafe fn crc32_iscsi_avx512_vpclmulqdq(crc: u32, data: &[u8]) -> u32 {
+pub(crate) unsafe fn crc32_iscsi_avx512_vpclmulqdq<
+    const STREAMS_MIN: usize,
+    const MID_MAX: usize,
+    const MID_ALIGNED_MAX: usize,
+>(
+    crc: u32,
+    data: &[u8],
+) -> u32 {
+    // Past `MID_ALIGNED_MAX` the window takes only a start off a 64-byte boundary: from an
+    // aligned one the 512-bit kernel's loads stay within cache lines and it is ahead there.
+    if MID_MAX != 0
+        && data.len() <= MID_MAX
+        && (data.len() <= MID_ALIGNED_MAX || !(data.as_ptr() as usize).is_multiple_of(64))
+    {
+        return crc32_iscsi_avx2_v4(crc, data.as_ptr(), data.len());
+    }
+
     if data.len() <= SMALL_BUFFER_MAX {
         return crc32_iscsi_small_fast(crc, data);
+    }
+
+    if data.len() >= STREAMS_MIN {
+        return crc32_iscsi_avx512_vpclmulqdq_v4s5x3(crc, data.as_ptr(), data.len());
     }
 
     crc32_iscsi_avx512_vpclmulqdq_v3x2(crc, data.as_ptr(), data.len())
@@ -265,6 +889,7 @@ unsafe fn mm_crc32_u64(crc: u32, val: u64) -> u32 {
 }
 
 /// CRC-32/ISCSI calculation for small buffers (<= 256 bytes) using unrolled native CRC instructions
+#[cfg(target_arch = "x86_64")]
 #[inline]
 #[target_feature(enable = "sse4.2")]
 pub unsafe fn crc32_iscsi_small_fast(mut crc: u32, data: &[u8]) -> u32 {
@@ -311,39 +936,179 @@ pub unsafe fn crc32_iscsi_small_fast(mut crc: u32, data: &[u8]) -> u32 {
 #[inline]
 #[target_feature(enable = "sse4.2")]
 pub unsafe fn crc32_iscsi_small_unaligned(mut crc: u32, data: &[u8]) -> u32 {
-    let word = |bytes: &[u8]| u64::from_le_bytes(bytes.try_into().unwrap());
+    let word = |bytes: &[u8; 8]| u64::from_le_bytes(*bytes);
 
-    let mut blocks = data.chunks_exact(64);
-    for block in &mut blocks {
-        crc = mm_crc32_u64(crc, word(&block[0..8]));
-        crc = mm_crc32_u64(crc, word(&block[8..16]));
-        crc = mm_crc32_u64(crc, word(&block[16..24]));
-        crc = mm_crc32_u64(crc, word(&block[24..32]));
-        crc = mm_crc32_u64(crc, word(&block[32..40]));
-        crc = mm_crc32_u64(crc, word(&block[40..48]));
-        crc = mm_crc32_u64(crc, word(&block[48..56]));
-        crc = mm_crc32_u64(crc, word(&block[56..64]));
+    // Below 64 bytes, one straight-line step each of 32, 16 and 8 bytes. A loop over the
+    // remaining words compiled to a counted loop and an unrolled one with set-up between them.
+    let mut rest = data;
+    while let Some((block, tail)) = rest.split_first_chunk::<64>() {
+        for chunk in block.as_chunks::<8>().0 {
+            crc = mm_crc32_u64(crc, word(chunk));
+        }
+        rest = tail;
     }
-
-    let mut words = blocks.remainder().chunks_exact(8);
-    for bytes in &mut words {
-        crc = mm_crc32_u64(crc, word(bytes));
+    if let Some((quad, tail)) = rest.split_first_chunk::<32>() {
+        for chunk in quad.as_chunks::<8>().0 {
+            crc = mm_crc32_u64(crc, word(chunk));
+        }
+        rest = tail;
     }
-
-    let mut tail = words.remainder();
-    if tail.len() >= 4 {
-        crc = _mm_crc32_u32(crc, u32::from_le_bytes(tail[..4].try_into().unwrap()));
-        tail = &tail[4..];
+    if let Some((pair, tail)) = rest.split_first_chunk::<16>() {
+        for chunk in pair.as_chunks::<8>().0 {
+            crc = mm_crc32_u64(crc, word(chunk));
+        }
+        rest = tail;
     }
-    if tail.len() >= 2 {
-        crc = _mm_crc32_u16(crc, u16::from_le_bytes(tail[..2].try_into().unwrap()));
-        tail = &tail[2..];
+    if let Some((chunk, tail)) = rest.split_first_chunk::<8>() {
+        crc = mm_crc32_u64(crc, word(chunk));
+        rest = tail;
     }
-    if let Some(&byte) = tail.first() {
+    if let Some((quad, tail)) = rest.split_first_chunk::<4>() {
+        crc = _mm_crc32_u32(crc, u32::from_le_bytes(*quad));
+        rest = tail;
+    }
+    if let Some((half, tail)) = rest.split_first_chunk::<2>() {
+        crc = _mm_crc32_u16(crc, u16::from_le_bytes(*half));
+        rest = tail;
+    }
+    if let Some(&byte) = rest.first() {
         crc = _mm_crc32_u8(crc, byte);
     }
 
     crc
+}
+
+/// The dispatch entry's short arm: [`crc32_iscsi_short_inline`] where it can be built, which
+/// inlines into the entry, and [`crc32_iscsi_small_unaligned`], called, on 32-bit x86 and under
+/// Miri, which runs no inline assembly.
+///
+/// # Safety
+///
+/// The CPU must have SSE4.2.
+#[inline(always)]
+pub(crate) unsafe fn crc32_iscsi_direct(crc: u32, data: &[u8]) -> u32 {
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    {
+        crc32_iscsi_short_inline(crc, data)
+    }
+
+    #[cfg(not(all(target_arch = "x86_64", not(miri))))]
+    {
+        crc32_iscsi_small_unaligned(crc, data)
+    }
+}
+
+/// [`crc32_iscsi_small_unaligned`] written as inline assembly, so that it inlines into a caller
+/// built without SSE4.2, which a `#[target_feature]` function cannot: the dispatch entry then
+/// takes a short buffer with no call, no frame and no register saves of its own.
+///
+/// The same steps as the intrinsic version, a word at a time from wherever the buffer starts:
+/// 64 bytes at a time, then at most one each of 32, 16, 8, 4, 2 and 1 bytes. Each of those is
+/// a rung that falls through when its step is not needed, with the step out of line: one branch
+/// not taken per rung, as LLVM laid out the intrinsic version. Testing the length's bits
+/// instead, a taken branch over every absent step, ran at 0.85x to 0.9x of that at 64 and 128
+/// bytes on a Xeon Platinum 8488C (Sapphire Rapids). It is one block, the loop and its branches
+/// included, so that its
+/// instructions and their order are fixed: the compiler places it but does not choose its code,
+/// and a later compiler cannot reshape it. It needs three registers, the ones its operands are
+/// already in.
+///
+/// # Safety
+///
+/// The CPU must have SSE4.2. The assembler takes the CRC32 instruction whatever the caller's
+/// features, so nothing but the caller's detection holds it to that.
+#[cfg(all(target_arch = "x86_64", not(miri)))]
+#[inline(always)]
+pub(crate) unsafe fn crc32_iscsi_short_inline(crc: u32, data: &[u8]) -> u32 {
+    use core::arch::asm;
+
+    let mut crc = crc as u64;
+
+    // SAFETY: every load is of bytes from `p` to `p + n`, the buffer: the loop takes 64 while at
+    // least 64 are left, and each rung after it takes its step only when `n` is at least that
+    unsafe {
+        asm!(
+            "cmp {n}, 64",
+            "jb 3f",
+            "2:",
+            "crc32 {c}, qword ptr [{p}]",
+            "crc32 {c}, qword ptr [{p} + 8]",
+            "crc32 {c}, qword ptr [{p} + 16]",
+            "crc32 {c}, qword ptr [{p} + 24]",
+            "crc32 {c}, qword ptr [{p} + 32]",
+            "crc32 {c}, qword ptr [{p} + 40]",
+            "crc32 {c}, qword ptr [{p} + 48]",
+            "crc32 {c}, qword ptr [{p} + 56]",
+            "add {p}, 64",
+            "sub {n}, 64",
+            "cmp {n}, 64",
+            "jae 2b",
+            // The ladder: a step that is not needed costs one branch not taken, and the steps
+            // sit out of line after it, each going on to the next rung.
+            "3:",
+            "cmp {n}, 32",
+            "jae 13f",
+            "4:",
+            "cmp {n}, 16",
+            "jae 14f",
+            "5:",
+            "cmp {n}, 8",
+            "jae 15f",
+            "6:",
+            "cmp {n}, 4",
+            "jae 16f",
+            "7:",
+            "cmp {n}, 2",
+            "jae 17f",
+            "8:",
+            "test {n}, {n}",
+            "jz 9f",
+            "18:",
+            "crc32 {c:e}, byte ptr [{p}]",
+            "jmp 9f",
+            "13:",
+            "crc32 {c}, qword ptr [{p}]",
+            "crc32 {c}, qword ptr [{p} + 8]",
+            "crc32 {c}, qword ptr [{p} + 16]",
+            "crc32 {c}, qword ptr [{p} + 24]",
+            "add {p}, 32",
+            "sub {n}, 32",
+            "cmp {n}, 16",
+            "jb 5b",
+            "14:",
+            "crc32 {c}, qword ptr [{p}]",
+            "crc32 {c}, qword ptr [{p} + 8]",
+            "add {p}, 16",
+            "sub {n}, 16",
+            "cmp {n}, 8",
+            "jb 6b",
+            "15:",
+            "crc32 {c}, qword ptr [{p}]",
+            "add {p}, 8",
+            "sub {n}, 8",
+            "cmp {n}, 4",
+            "jb 7b",
+            "16:",
+            "crc32 {c:e}, dword ptr [{p}]",
+            "add {p}, 4",
+            "sub {n}, 4",
+            "cmp {n}, 2",
+            "jb 8b",
+            "17:",
+            "crc32 {c:e}, word ptr [{p}]",
+            "add {p}, 2",
+            "sub {n}, 2",
+            "test {n}, {n}",
+            "jnz 18b",
+            "9:",
+            c = inout(reg) crc,
+            p = inout(reg) data.as_ptr() => _,
+            n = inout(reg) data.len() => _,
+            options(pure, readonly, nostack),
+        );
+    }
+
+    crc as u32
 }
 
 #[cfg(test)]
@@ -376,44 +1141,577 @@ mod tests {
         };
 
         run(
-            iscsi_kernel_fn(select_iscsi_kernel(tier, true).unwrap()),
+            iscsi_kernel_fn(
+                select_iscsi_kernel(tier, true, is_x86_feature_detected!("avx2")).unwrap(),
+            ),
             crc,
             data,
         )
     }
 
     /// Every tier resolves to its own kernel, and none of them without the CRC32 instructions.
+    /// Below AVX-512 the kernels' AVX2 build is taken wherever the CPU has AVX2.
     #[test]
     fn each_tier_selects_its_own_kernel() {
+        #[cfg(target_arch = "x86_64")]
+        let below_avx512_with_avx2 = Some(IscsiKernel::Avx2);
+        #[cfg(target_arch = "x86")]
+        let below_avx512_with_avx2 = Some(IscsiKernel::Sse);
+
+        // (tier, without AVX2, with AVX2)
         let tiers = [
-            (PerformanceTier::X86SsePclmulqdq, Some(IscsiKernel::Sse)),
-            (PerformanceTier::X86_64SsePclmulqdq, Some(IscsiKernel::Sse)),
+            (
+                PerformanceTier::X86SsePclmulqdq,
+                Some(IscsiKernel::Sse),
+                below_avx512_with_avx2,
+            ),
+            (
+                PerformanceTier::X86_64SsePclmulqdq,
+                Some(IscsiKernel::Sse),
+                below_avx512_with_avx2,
+            ),
             // Zen 3, Alder Lake and Sierra Forest: 256-bit VPCLMULQDQ, and the SSE kernel
             (
                 PerformanceTier::X86_64Avx2Vpclmulqdq,
                 Some(IscsiKernel::Sse),
+                below_avx512_with_avx2,
             ),
             #[cfg(target_arch = "x86_64")]
             (
                 PerformanceTier::X86_64Avx512Pclmulqdq,
+                Some(IscsiKernel::Avx512Pclmulqdq),
                 Some(IscsiKernel::Avx512Pclmulqdq),
             ),
             #[cfg(target_arch = "x86_64")]
             (
                 PerformanceTier::X86_64Avx512Vpclmulqdq,
                 Some(IscsiKernel::Avx512Vpclmulqdq),
+                Some(IscsiKernel::Avx512Vpclmulqdq),
             ),
-            (PerformanceTier::SoftwareTable, None),
+            (PerformanceTier::SoftwareTable, None, None),
         ];
 
-        for (tier, kernel) in tiers {
-            assert_eq!(select_iscsi_kernel(tier, true), kernel, "{tier:?}");
+        for (tier, without_avx2, with_avx2) in tiers {
             assert_eq!(
-                select_iscsi_kernel(tier, false),
-                None,
-                "{tier:?} without SSE4.2"
+                select_iscsi_kernel(tier, true, false),
+                without_avx2,
+                "{tier:?}"
+            );
+            assert_eq!(
+                select_iscsi_kernel(tier, true, true),
+                with_avx2,
+                "{tier:?} AVX2"
+            );
+            for has_avx2 in [false, true] {
+                assert_eq!(
+                    select_iscsi_kernel(tier, false, has_avx2),
+                    None,
+                    "{tier:?} without SSE4.2"
+                );
+            }
+        }
+    }
+
+    fn cpu(vendor: &[u8; 12], family: u32, model: u32) -> CpuId {
+        CpuId {
+            vendor: *vendor,
+            family,
+            model,
+        }
+    }
+
+    /// CRC-32/ISO-HDLC's E-core entry on the `x86_64-avx2-vpclmulqdq` tier, libdeflate's
+    /// 128-bit shape in assembly, is chosen by [`CpuId::is_intel_ecore`]: the four E-core-only
+    /// models take it, and the hybrid parts, the same model numbers in another family and other
+    /// vendors keep the tier's entry.
+    #[test]
+    fn iso_hdlc_ecore_entry_selection() {
+        const INTEL: &[u8; 12] = b"GenuineIntel";
+        const AMD: &[u8; 12] = b"AuthenticAMD";
+        for model in [0xaf, 0xb6, 0xdd, 0xbe] {
+            assert!(cpu(INTEL, 6, model).is_intel_ecore(), "model {model:#x}");
+        }
+        let others = [
+            cpu(INTEL, 6, 0x97),
+            cpu(INTEL, 6, 0x9a),
+            cpu(INTEL, 6, 0xaa),
+            cpu(INTEL, 6, 0xb7),
+            cpu(INTEL, 6, 0xc6),
+            cpu(INTEL, 6, 0x8f),
+            cpu(INTEL, 6, 0xad),
+            cpu(INTEL, 6, 0x3c),
+            cpu(INTEL, 0xf, 0xaf),
+            cpu(INTEL, 0x13, 0x01),
+            cpu(AMD, 0x19, 0xaf),
+            cpu(AMD, 0x17, 0x31),
+        ];
+        for c in others {
+            assert!(!c.is_intel_ecore(), "{c:?}");
+        }
+    }
+
+    /// CRC-32/ISO-HDLC's 512-bit cascade on the `x86_64-avx512-vpclmulqdq` tier is chosen by
+    /// [`CpuId::is_sapphire_rapids`]: Sapphire Rapids and Emerald Rapids take it, and the CPUs
+    /// on either side of them on the tier, Ice Lake servers, Granite Rapids and Zen 4 and 5,
+    /// keep the tier's general fold.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn sapphire_rapids_selects_the_iso_hdlc_cascade() {
+        const INTEL: &[u8; 12] = b"GenuineIntel";
+        const AMD: &[u8; 12] = b"AuthenticAMD";
+        for (id, takes) in [
+            (cpu(INTEL, 6, 0x8f), true),
+            (cpu(INTEL, 6, 0xcf), true),
+            (cpu(INTEL, 6, 0x6a), false),
+            (cpu(INTEL, 6, 0x6c), false),
+            (cpu(INTEL, 6, 0xad), false),
+            (cpu(INTEL, 6, 0x55), false),
+            (cpu(AMD, 0x19, 0x11), false),
+            (cpu(AMD, 0x19, 0x61), false),
+            (cpu(AMD, 0x1a, 0x02), false),
+            (cpu(AMD, 6, 0x8f), false),
+        ] {
+            assert_eq!(id.is_sapphire_rapids(), takes, "{id:?}");
+        }
+    }
+
+    /// Sapphire and Emerald Rapids take the AVX-512 VPCLMULQDQ kernel at every length past its
+    /// window, as 1.11.0 did; Ice Lake servers, Granite Rapids, another Intel family 6 part on
+    /// the tier and Zen 4 keep their window of the folding path.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn sapphire_rapids_has_no_iscsi_fold_window() {
+        const INTEL: &[u8; 12] = b"GenuineIntel";
+        const AMD: &[u8; 12] = b"AuthenticAMD";
+        let tier = PerformanceTier::X86_64Avx512Vpclmulqdq;
+        for (id, window) in [
+            (cpu(INTEL, 6, 0x8f), None),
+            (cpu(INTEL, 6, 0xcf), None),
+            (
+                cpu(INTEL, 6, 0x6a),
+                Some((AVX512_FOLD_MIN, ICE_LAKE_STREAMS_MIN)),
+            ),
+            (
+                cpu(INTEL, 6, 0x6c),
+                Some((AVX512_FOLD_MIN, ICE_LAKE_STREAMS_MIN)),
+            ),
+            (
+                cpu(INTEL, 6, 0xad),
+                Some((AVX512_FOLD_MIN, AVX512_FOLD_END)),
+            ),
+            (
+                cpu(INTEL, 6, 0x8c),
+                Some((AVX512_FOLD_MIN, AVX512_FOLD_END)),
+            ),
+            (
+                cpu(AMD, 0x19, 0x11),
+                Some((AVX512_FOLD_MIN, AVX512_FOLD_END)),
+            ),
+            (cpu(AMD, 6, 0x8f), None),
+        ] {
+            let plan = iscsi_plan(IscsiKernel::Avx512Vpclmulqdq, tier, id);
+            let got = (plan.fold_min != usize::MAX).then_some((plan.fold_min, plan.fold_end));
+            assert_eq!(got, window, "{id:?}");
+            assert_eq!(plan.direct_max, SMALL_BUFFER_MAX, "{id:?}");
+        }
+    }
+
+    /// Fast-crc32's `v4` loop for CRC-32/ISO-HDLC on the `x86_64-avx512-vpclmulqdq` tier is chosen
+    /// by [`CpuId::is_ice_lake_server`]: models 0x6a and 0x6c take it, and the CPUs on either
+    /// side of them on the tier, Ice Lake client parts, Tiger Lake, Sapphire Rapids, Granite
+    /// Rapids and Zen 4 and 5, keep their own paths.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn ice_lake_server_selects_the_iso_hdlc_v4_loop() {
+        const INTEL: &[u8; 12] = b"GenuineIntel";
+        const AMD: &[u8; 12] = b"AuthenticAMD";
+        for (id, takes) in [
+            (cpu(INTEL, 6, 0x6a), true),
+            (cpu(INTEL, 6, 0x6c), true),
+            (cpu(INTEL, 6, 0x7d), false),
+            (cpu(INTEL, 6, 0x7e), false),
+            (cpu(INTEL, 6, 0x8c), false),
+            (cpu(INTEL, 6, 0x8f), false),
+            (cpu(INTEL, 6, 0xcf), false),
+            (cpu(INTEL, 6, 0xad), false),
+            (cpu(INTEL, 6, 0x55), false),
+            (cpu(INTEL, 0xf, 0x6a), false),
+            (cpu(AMD, 0x19, 0x11), false),
+            (cpu(AMD, 0x1a, 0x02), false),
+            (cpu(AMD, 6, 0x6a), false),
+        ] {
+            assert_eq!(id.is_ice_lake_server(), takes, "{id:?}");
+        }
+    }
+
+    /// The assembly of libdeflate's `crc32_pclmul_avx` for CRC-32/ISO-HDLC on the SSE tier is
+    /// chosen by [`CpuId::is_amd_family_17`]: Zen, Zen+ and Zen 2 take it, and family 0x19
+    /// (Zen 3, whose VPCLMULQDQ puts it on another tier anyway), family 0x18 (Hygon) and Intel
+    /// parts on the SSE tier keep the tier's entry.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn amd_family_17_selects_the_iso_hdlc_avx_asm() {
+        const INTEL: &[u8; 12] = b"GenuineIntel";
+        const AMD: &[u8; 12] = b"AuthenticAMD";
+        const HYGON: &[u8; 12] = b"HygonGenuine";
+        for (id, takes) in [
+            (cpu(AMD, 0x17, 0x31), true),
+            (cpu(AMD, 0x17, 0x01), true),
+            (cpu(AMD, 0x17, 0x71), true),
+            (cpu(AMD, 0x16, 0x30), false),
+            (cpu(AMD, 0x19, 0x01), false),
+            (cpu(HYGON, 0x18, 0x01), false),
+            (cpu(INTEL, 6, 0x3f), false),
+            (cpu(INTEL, 6, 0x55), false),
+            (cpu(INTEL, 0x17, 0x31), false),
+        ] {
+            assert_eq!(id.is_amd_family_17(), takes, "{id:?}");
+        }
+    }
+
+    /// Each CPU measured, and its neighbours either side of the rules, gets the limits measured
+    /// for it; the AVX-512 kernels keep theirs on every CPU.
+    #[test]
+    fn plan_limits_follow_the_cpu() {
+        const INTEL: &[u8; 12] = b"GenuineIntel";
+        const AMD: &[u8; 12] = b"AuthenticAMD";
+        const NONE: usize = usize::MAX;
+
+        let sse = PerformanceTier::X86SsePclmulqdq;
+        #[cfg(target_arch = "x86_64")]
+        let avx2 = PerformanceTier::X86_64Avx2Vpclmulqdq;
+        #[cfg(target_arch = "x86")]
+        let avx2 = sse;
+        #[cfg(target_arch = "x86_64")]
+        let kernel = IscsiKernel::Avx2;
+        #[cfg(target_arch = "x86")]
+        let kernel = IscsiKernel::Sse;
+        // The AVX2 build's limit where its plan has a vector-only kernel; the SSE build keeps the
+        // CRC32 instruction's own
+        #[cfg(target_arch = "x86_64")]
+        let (haswell, zen3) = (INTEL_DIRECT_MAX, ZEN3_DIRECT_MAX);
+        #[cfg(target_arch = "x86")]
+        let (haswell, zen3) = (DIRECT_MAX, DIRECT_MAX);
+        #[cfg(target_arch = "x86_64")]
+        let zen3_fold = ZEN3_FOLD_MIN;
+        #[cfg(target_arch = "x86")]
+        let zen3_fold = NONE;
+        // The E-cores' AVX2 build hands over to its vector-only kernel early
+        #[cfg(target_arch = "x86_64")]
+        let ecore = ECORE_V4_DIRECT_MAX;
+        #[cfg(target_arch = "x86")]
+        let ecore = ECORE_DIRECT_MAX;
+
+        // (CPU, tier, the plan's limits, the SSE build's direct limit)
+        let cases = [
+            // Sierra Forest, Grand Ridge, Clearwater Forest, Alder Lake-N
+            (cpu(INTEL, 6, 0xaf), avx2, (ecore, NONE), ECORE_DIRECT_MAX),
+            (cpu(INTEL, 6, 0xb6), avx2, (ecore, NONE), ECORE_DIRECT_MAX),
+            (cpu(INTEL, 6, 0xdd), avx2, (ecore, NONE), ECORE_DIRECT_MAX),
+            (cpu(INTEL, 6, 0xbe), sse, (ecore, NONE), ECORE_DIRECT_MAX),
+            // Alder Lake and Meteor Lake are hybrid, planned for their P-cores; Tremont is
+            // older than the E-cores measured
+            (cpu(INTEL, 6, 0x97), avx2, (DIRECT_MAX, NONE), DIRECT_MAX),
+            (cpu(INTEL, 6, 0xaa), avx2, (DIRECT_MAX, NONE), DIRECT_MAX),
+            (cpu(INTEL, 6, 0x9c), sse, (DIRECT_MAX, NONE), DIRECT_MAX),
+            // Haswell, client and server, against Broadwell and Ice Lake pinned below AVX-512
+            (cpu(INTEL, 6, 0x3f), sse, (haswell, NONE), DIRECT_MAX),
+            (cpu(INTEL, 6, 0x3c), avx2, (haswell, NONE), DIRECT_MAX),
+            (cpu(INTEL, 6, 0x4f), avx2, (DIRECT_MAX, NONE), DIRECT_MAX),
+            (cpu(INTEL, 6, 0x6a), avx2, (DIRECT_MAX, NONE), DIRECT_MAX),
+            // An E-core or Haswell model number in another family is not one
+            (cpu(INTEL, 0xf, 0xaf), avx2, (DIRECT_MAX, NONE), DIRECT_MAX),
+            (cpu(INTEL, 0xf, 0x3f), avx2, (DIRECT_MAX, NONE), DIRECT_MAX),
+            // Zen 2, and Zen 3 on the tier it selects and pinned to SSE
+            (
+                cpu(AMD, 0x17, 0x31),
+                sse,
+                (ZEN2_DIRECT_MAX, NONE),
+                ZEN2_DIRECT_MAX,
+            ),
+            (cpu(AMD, 0x19, 0x01), avx2, (zen3, zen3_fold), DIRECT_MAX),
+            (cpu(AMD, 0x19, 0x01), sse, (zen3, NONE), DIRECT_MAX),
+            // Zen 4 pinned below AVX-512 folds as Zen 3 does; Zen 5 and Hygon are not planned
+            (cpu(AMD, 0x19, 0x61), avx2, (zen3, zen3_fold), DIRECT_MAX),
+            (cpu(AMD, 0x1a, 0x02), avx2, (DIRECT_MAX, NONE), DIRECT_MAX),
+            (
+                cpu(b"HygonGenuine", 0x18, 0x00),
+                sse,
+                (DIRECT_MAX, NONE),
+                DIRECT_MAX,
+            ),
+        ];
+
+        for (id, tier, limits, sse_direct) in cases {
+            assert_eq!(iscsi_limits(kernel, tier, id), limits, "{id:?} {tier:?}");
+            assert_eq!(
+                iscsi_limits(IscsiKernel::Sse, sse, id).0,
+                sse_direct,
+                "{id:?} SSE build"
+            );
+
+            #[cfg(target_arch = "x86_64")]
+            for (kernel, tier, direct_max) in [
+                (
+                    IscsiKernel::Avx512Pclmulqdq,
+                    PerformanceTier::X86_64Avx512Pclmulqdq,
+                    INTEL_DIRECT_MAX,
+                ),
+                (
+                    IscsiKernel::Avx512Vpclmulqdq,
+                    PerformanceTier::X86_64Avx512Vpclmulqdq,
+                    SMALL_BUFFER_MAX,
+                ),
+            ] {
+                let folds = kernel == IscsiKernel::Avx512Vpclmulqdq
+                    && ((id.is_intel_family_6() && !id.is_sapphire_rapids())
+                        || id.is_amd_family_19());
+                let fold_end = if id.is_ice_lake_server() {
+                    ICE_LAKE_STREAMS_MIN
+                } else {
+                    AVX512_FOLD_END
+                };
+                assert_eq!(
+                    iscsi_limits(kernel, tier, id),
+                    (direct_max, if folds { AVX512_FOLD_MIN } else { NONE }),
+                    "{id:?} {kernel:?}"
+                );
+                assert_eq!(
+                    iscsi_fold_end(kernel, tier, id),
+                    if folds { fold_end } else { NONE },
+                    "{id:?} {kernel:?}"
+                );
+            }
+        }
+
+        // No plan's limit is below what the SSE and AVX2 entry points take alone; the
+        // E-cores' AVX2 limit is, because the dispatch entry sends their vector-only window
+        // past it straight to its kernel, before the plan's
+        assert!([
+            ECORE_DIRECT_MAX,
+            ZEN2_DIRECT_MAX,
+            #[cfg(target_arch = "x86_64")]
+            ZEN3_DIRECT_MAX,
+            #[cfg(target_arch = "x86_64")]
+            INTEL_DIRECT_MAX,
+            DIRECT_MAX,
+        ]
+        .iter()
+        .all(|&max| max >= SSE_SMALL_BUFFER_MAX));
+    }
+
+    /// The CPUs measured, and their neighbours either side of the rules, get the vector-only
+    /// window measured for them, past their plan's direct limit; their plan takes the entry
+    /// built for it rather than the tier's default; everywhere else there is no window.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn mid_window_follows_the_cpu() {
+        const INTEL: &[u8; 12] = b"GenuineIntel";
+        const AMD: &[u8; 12] = b"AuthenticAMD";
+        use IscsiKernel::*;
+
+        let avx2 = PerformanceTier::X86_64Avx2Vpclmulqdq;
+        let pclmul = PerformanceTier::X86_64Avx512Pclmulqdq;
+        let vpclmul = PerformanceTier::X86_64Avx512Vpclmulqdq;
+
+        let cases = [
+            // Haswell client and server, against Broadwell, Skylake and Alder Lake
+            (cpu(INTEL, 6, 0x3c), Avx2, avx2, INTEL_MID_MAX),
+            (cpu(INTEL, 6, 0x3f), Avx2, avx2, INTEL_MID_MAX),
+            (cpu(INTEL, 6, 0x45), Avx2, avx2, INTEL_MID_MAX),
+            (cpu(INTEL, 6, 0x46), Avx2, avx2, INTEL_MID_MAX),
+            (cpu(INTEL, 6, 0x3d), Avx2, avx2, 0),
+            (cpu(INTEL, 6, 0x4f), Avx2, avx2, 0),
+            (cpu(INTEL, 6, 0x5e), Avx2, avx2, 0),
+            (cpu(INTEL, 6, 0x97), Avx2, avx2, 0),
+            (cpu(INTEL, 0xf, 0x3f), Avx2, avx2, 0),
+            // Sierra Forest measured; Grand Ridge, Clearwater Forest and Alder Lake-N planned as
+            // it is; against Alder Lake, Sapphire Rapids pinned to AVX2, Meteor Lake and an
+            // E-core model number in another family
+            (cpu(INTEL, 6, 0xaf), Avx2, avx2, ECORE_MID_MAX),
+            (cpu(INTEL, 6, 0xb6), Avx2, avx2, ECORE_MID_MAX),
+            (cpu(INTEL, 6, 0xdd), Avx2, avx2, ECORE_MID_MAX),
+            (cpu(INTEL, 6, 0xbe), Avx2, avx2, ECORE_MID_MAX),
+            (cpu(INTEL, 6, 0x8f), Avx2, avx2, 0),
+            (cpu(INTEL, 6, 0xaa), Avx2, avx2, 0),
+            (cpu(INTEL, 0xf, 0xaf), Avx2, avx2, 0),
+            (cpu(INTEL, 6, 0xaf), Sse, avx2, 0),
+            // The SSE build has none, Haswell's included
+            (cpu(INTEL, 6, 0x3f), Sse, avx2, 0),
+            (cpu(AMD, 0x17, 0x31), Sse, avx2, 0),
+            // Zen 2, Zen 3, and Zen 4 pinned below AVX-512, against Zen 5 and Hygon
+            (cpu(AMD, 0x17, 0x31), Avx2, avx2, ZEN2_MID_MAX),
+            (cpu(AMD, 0x19, 0x01), Avx2, avx2, ZEN3_MID_MAX),
+            (cpu(AMD, 0x19, 0x61), Avx2, avx2, ZEN3_MID_MAX),
+            (cpu(AMD, 0x1a, 0x02), Avx2, avx2, 0),
+            (cpu(b"HygonGenuine", 0x18, 0x00), Avx2, avx2, 0),
+            // The AVX-512 PCLMULQDQ tier is one core
+            (cpu(INTEL, 6, 0x55), Avx512Pclmulqdq, pclmul, INTEL_MID_MAX),
+            // Sapphire and Emerald Rapids, Ice Lake and Zen 4, against Ice Lake's client part,
+            // Granite Rapids and Zen 5
+            (
+                cpu(INTEL, 6, 0x8f),
+                Avx512Vpclmulqdq,
+                vpclmul,
+                VPCLMUL_MID_MAX,
+            ),
+            (
+                cpu(INTEL, 6, 0xcf),
+                Avx512Vpclmulqdq,
+                vpclmul,
+                VPCLMUL_MID_MAX,
+            ),
+            (
+                cpu(INTEL, 6, 0x6a),
+                Avx512Vpclmulqdq,
+                vpclmul,
+                VPCLMUL_MID_MAX,
+            ),
+            (
+                cpu(AMD, 0x19, 0x61),
+                Avx512Vpclmulqdq,
+                vpclmul,
+                VPCLMUL_MID_MAX,
+            ),
+            (cpu(INTEL, 6, 0x7e), Avx512Vpclmulqdq, vpclmul, 0),
+            (cpu(INTEL, 6, 0xad), Avx512Vpclmulqdq, vpclmul, 0),
+            (cpu(AMD, 0x1a, 0x02), Avx512Vpclmulqdq, vpclmul, 0),
+        ];
+
+        for (id, kernel, tier, mid_max) in cases {
+            assert_eq!(iscsi_mid_max(kernel, id), mid_max, "{id:?} {kernel:?}");
+            // Only the E-cores' plan sends its window straight from the dispatch entry
+            let v4_end = if id.is_intel_ecore() && kernel == Avx2 {
+                ECORE_MID_MAX + 1
+            } else {
+                0
+            };
+            assert_eq!(
+                iscsi_plan(kernel, tier, id).v4_end,
+                v4_end,
+                "{id:?} {kernel:?}"
+            );
+            // The entry's one loaded value, and the split it makes past it with the length and
+            // the start: the window on the E-cores, from 112 bytes aligned and 160 from any start
+            // through 703, the unaligned ones below 160 to the CRC32 instruction, never on any
+            // other plan, at any length past the value or any start
+            let plan = iscsi_plan(kernel, tier, id);
+            let end = plan.entry_end();
+            if v4_end != 0 {
+                assert_eq!(end, ECORE_V4_ALIGNED_MIN, "{id:?} {kernel:?}");
+                use EcoreWindow::*;
+                for (len, start, takes) in [
+                    (112, 0x1000, V4),
+                    (112, 0x1008, Direct),
+                    (127, 0x1000, V4),
+                    (128, 0x1010, V4),
+                    (143, 0x1000, V4),
+                    (143, 0x1001, Direct),
+                    (144, 0x1000, V4),
+                    (159, 0x1001, Direct),
+                    (159, 0x1000, V4),
+                    (160, 0x1001, V4),
+                    (703, 0x100f, V4),
+                    (703, 0x1000, V4),
+                    (704, 0x1000, Plan),
+                    (4096, 0x1000, Plan),
+                    (usize::MAX, 0x1000, Plan),
+                ] {
+                    assert_eq!(
+                        ecore_window_takes(end, len, start),
+                        Some(takes),
+                        "{id:?} {kernel:?} len {len} start {start:#x}"
+                    );
+                }
+            } else {
+                assert_eq!(end, plan.direct_max + 1, "{id:?} {kernel:?}");
+                for len in end..end + 2048 {
+                    for start in [0x1000, 0x1001, 0x1008, 0x100f] {
+                        assert_eq!(
+                            ecore_window_takes(end, len, start),
+                            None,
+                            "{id:?} {kernel:?} len {len} start {start:#x}"
+                        );
+                    }
+                }
+            }
+            // The E-cores' window is the dispatch entry's, and their plan's kernel the default.
+            // Which function a plan names is compared by address, here and below; Miri gives
+            // each cast of a function to a pointer its own address, so not there.
+            #[cfg(not(miri))]
+            if v4_end != 0 {
+                assert_eq!(
+                    iscsi_plan(kernel, tier, id).kernel as usize,
+                    iscsi_kernel_fn(kernel) as usize,
+                    "{id:?} {kernel:?}"
+                );
+            }
+            if mid_max != 0 && v4_end == 0 {
+                let plan = iscsi_plan(kernel, tier, id);
+                assert!(plan.direct_max < mid_max, "{id:?} {kernel:?}");
+                #[cfg(not(miri))]
+                assert_ne!(
+                    plan.kernel as usize,
+                    iscsi_kernel_fn(kernel) as usize,
+                    "{id:?} {kernel:?} takes the default entry"
+                );
+            }
+        }
+    }
+
+    /// Alder Lake takes the three-stream kernel from 128 KiB on the AVX2 build; every other CPU,
+    /// and the SSE build everywhere, from 3 MiB; the AVX-512 kernels never hand over.
+    #[test]
+    fn far_min_follows_the_cpu() {
+        const INTEL: &[u8; 12] = b"GenuineIntel";
+        const AMD: &[u8; 12] = b"AuthenticAMD";
+
+        #[cfg(target_arch = "x86_64")]
+        for (id, far_min) in [
+            (cpu(INTEL, 6, 0x9a), ALDER_LAKE_FAR_MIN),
+            (cpu(INTEL, 6, 0x97), ALDER_LAKE_FAR_MIN),
+            // Raptor Lake, Meteor Lake, Ice Lake, Alder Lake-N and an E-core model number in
+            // another family were not measured or differ
+            (cpu(INTEL, 6, 0xb7), SSE_FAR_MIN),
+            (cpu(INTEL, 6, 0xaa), SSE_FAR_MIN),
+            (cpu(INTEL, 6, 0x6a), SSE_FAR_MIN),
+            (cpu(INTEL, 6, 0xbe), SSE_FAR_MIN),
+            (cpu(INTEL, 0xf, 0x9a), SSE_FAR_MIN),
+            (cpu(AMD, 0x19, 0x9a), SSE_FAR_MIN),
+        ] {
+            assert_eq!(iscsi_far_min(IscsiKernel::Avx2, id), far_min, "{id:?}");
+            assert_eq!(
+                iscsi_far_min(IscsiKernel::Sse, id),
+                SSE_FAR_MIN,
+                "{id:?} SSE"
+            );
+            assert_eq!(
+                iscsi_far_min(IscsiKernel::Avx512Vpclmulqdq, id),
+                usize::MAX,
+                "{id:?} AVX-512"
+            );
+            assert_eq!(
+                iscsi_far_min(IscsiKernel::Avx512Pclmulqdq, id),
+                usize::MAX,
+                "{id:?} AVX-512"
             );
         }
+        #[cfg(target_arch = "x86")]
+        assert_eq!(
+            iscsi_far_min(IscsiKernel::Sse, cpu(INTEL, 6, 0x9a)),
+            SSE_FAR_MIN
+        );
+        #[cfg(target_arch = "x86")]
+        let _ = AMD;
+    }
+
+    /// The CPU's own identity decodes to a vendor string and a family.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not run the CPUID instruction")]
+    fn cpu_id_detects_this_cpu() {
+        let id = CpuId::detect();
+        assert!(id.vendor.iter().all(|b| b.is_ascii_graphic()), "{id:?}");
+        assert!(id.family >= 4, "{id:?}");
     }
 
     /// The compile-time shift tables against the run-time routine they replace.
@@ -450,6 +1748,8 @@ mod tests {
             eprintln!("skipping sse_kernel_matches_software: no SSE4.2 + PCLMULQDQ");
             return;
         }
+        #[cfg(target_arch = "x86_64")]
+        let has_avx2 = is_x86_feature_detected!("avx2");
 
         let mut data = vec![0u8; 1_048_577 + 16];
         rng().fill(&mut data[..]);
@@ -483,12 +1783,25 @@ mod tests {
                         actual, expected,
                         "offset {offset} len {len} state {state:#x}"
                     );
+
+                    #[cfg(target_arch = "x86_64")]
+                    if has_avx2 {
+                        let actual = unsafe {
+                            crc32_iscsi_avx2_v4x2s4x4(state as u32, input.as_ptr(), input.len())
+                        } as u64;
+
+                        assert_eq!(
+                            actual, expected,
+                            "AVX2 build offset {offset} len {len} state {state:#x}"
+                        );
+                    }
                 }
             }
         }
     }
 
-    /// The short-buffer path against the table-driven software implementation: every length
+    /// The short-buffer path, and the dispatch entry's inline build of it, against the table-driven
+    /// software implementation: every length
     /// through the longest it is given and past it, from every alignment of the start within 16
     /// bytes, from the init state and a carried state.
     #[test]
@@ -500,23 +1813,206 @@ mod tests {
             return;
         }
 
-        let mut data = vec![0u8; 2 * DIRECT_SMALL_MAX + 80];
+        let mut data = vec![0u8; 2 * DIRECT_MAX + 80];
         rng().fill(&mut data[..]);
 
         let init = CRC32_ISCSI.init_algorithm;
         let carried = crate::arch::software::update(init, &data[40..47], &CRC32_ISCSI);
 
         for offset in 0..16 {
-            for len in 0..=2 * DIRECT_SMALL_MAX + 64 {
+            for len in 0..=2 * DIRECT_MAX + 64 {
                 let input = &data[offset..offset + len];
                 for state in [init, carried] {
                     let expected = crate::arch::software::update(state, input, &CRC32_ISCSI);
                     let actual = unsafe { crc32_iscsi_small_unaligned(state as u32, input) } as u64;
-
                     assert_eq!(
                         actual, expected,
                         "offset {offset} len {len} state {state:#x}"
                     );
+
+                    let direct = unsafe { crc32_iscsi_direct(state as u32, input) } as u64;
+                    assert_eq!(
+                        direct, expected,
+                        "direct: offset {offset} len {len} state {state:#x}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The vector-only kernel and the three-stream CRC32 kernel, called directly, against the
+    /// table-driven software implementation: every length through several of their 64-byte and
+    /// 24-byte steps and past where the plans hand over, the lengths around each exact pass of
+    /// the three-stream kernel and the first doubled one, and a megabyte, from starts within 16
+    /// bytes, from the init state and a carried state.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    #[cfg_attr(miri, ignore)]
+    fn vector_and_stream_kernels_match_software() {
+        use crate::crc32::consts::CRC32_ISCSI;
+
+        if !(is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("sse4.2")
+            && is_x86_feature_detected!("pclmulqdq"))
+        {
+            eprintln!("skipping vector_and_stream_kernels_match_software: no AVX2 + PCLMULQDQ");
+            return;
+        }
+
+        let mut data = vec![0u8; (1 << 20) + 96];
+        rng().fill(&mut data[..]);
+
+        let init = CRC32_ISCSI.init_algorithm;
+        let carried = crate::arch::software::update(init, &data[4096..4096 + 7], &CRC32_ISCSI);
+
+        let exact = 24 * 2 * iscsi::sse_pclmulqdq::MAX_SCALAR_ROUNDS;
+        let mut lengths: Vec<usize> = (0..=INTEL_MID_MAX + 80).collect();
+        for edge in [exact, exact + 24, 2 * exact, 2 * exact + 24, 4 * exact] {
+            lengths.extend(edge - 9..=edge + 33);
+        }
+        lengths.extend(1_048_575..=1_048_577);
+
+        for offset in [0usize, 1, 3, 7, 8, 9, 15, 33] {
+            for &len in &lengths {
+                let input = &data[offset..offset + len];
+                for state in [init, carried] {
+                    let expected = crate::arch::software::update(state, input, &CRC32_ISCSI);
+                    let (crc, ptr) = (state as u32, input.as_ptr());
+
+                    if len <= 4 * INTEL_MID_MAX || len == 1_048_576 {
+                        let actual = unsafe { crc32_iscsi_avx2_v4(crc, ptr, len) } as u64;
+                        assert_eq!(
+                            actual, expected,
+                            "v4 offset {offset} len {len} state {state:#x}"
+                        );
+                    }
+
+                    if len <= 4 * INTEL_MID_MAX {
+                        let actual = unsafe { crc32_iscsi_avx2_v4_aligned(crc, ptr, len) } as u64;
+                        assert_eq!(
+                            actual, expected,
+                            "v4 aligned offset {offset} len {len} state {state:#x}"
+                        );
+
+                        // Forced: the assembly runs here on any CPU with the features, not only
+                        // on the E-cores whose plan takes it
+                        #[cfg(not(miri))]
+                        {
+                            let actual = unsafe { crc32_iscsi_avx2_v4_asm(crc, ptr, len) } as u64;
+                            assert_eq!(
+                                actual, expected,
+                                "v4 asm offset {offset} len {len} state {state:#x}"
+                            );
+                        }
+                    }
+
+                    let actual = unsafe { crc32_iscsi_avx2_s3(crc, ptr, len) } as u64;
+                    assert_eq!(
+                        actual, expected,
+                        "s3 offset {offset} len {len} state {state:#x}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every entry a plan with a vector-only window or the CRC32 streams alone builds, called as
+    /// the plan calls it on this machine's features, against the table-driven software
+    /// implementation: every length through the windows and past them, the lengths around Zen 2's
+    /// hand-over to the three CRC32 streams, from 64-byte aligned starts and starts off them,
+    /// from the init state and a carried state.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    #[cfg_attr(miri, ignore)]
+    fn planned_entries_match_software() {
+        use crate::crc32::consts::CRC32_ISCSI;
+        const INTEL: &[u8; 12] = b"GenuineIntel";
+        const AMD: &[u8; 12] = b"AuthenticAMD";
+
+        let avx2 = is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("sse4.2")
+            && is_x86_feature_detected!("pclmulqdq");
+        let avx512vl = avx2 && is_x86_feature_detected!("avx512vl");
+        let vpclmul = avx512vl && is_x86_feature_detected!("vpclmulqdq");
+
+        let plans = [
+            (
+                avx2,
+                IscsiKernel::Avx2,
+                PerformanceTier::X86_64Avx2Vpclmulqdq,
+                cpu(INTEL, 6, 0x3f),
+            ),
+            (
+                avx2,
+                IscsiKernel::Avx2,
+                PerformanceTier::X86_64Avx2Vpclmulqdq,
+                cpu(AMD, 0x17, 0x31),
+            ),
+            (
+                avx2,
+                IscsiKernel::Avx2,
+                PerformanceTier::X86_64Avx2Vpclmulqdq,
+                cpu(AMD, 0x19, 0x01),
+            ),
+            (
+                avx2,
+                IscsiKernel::Avx2,
+                PerformanceTier::X86_64Avx2Vpclmulqdq,
+                cpu(INTEL, 6, 0xaf),
+            ),
+            (
+                avx512vl,
+                IscsiKernel::Avx512Pclmulqdq,
+                PerformanceTier::X86_64Avx512Pclmulqdq,
+                cpu(INTEL, 6, 0x55),
+            ),
+            (
+                vpclmul,
+                IscsiKernel::Avx512Vpclmulqdq,
+                PerformanceTier::X86_64Avx512Vpclmulqdq,
+                cpu(INTEL, 6, 0x8f),
+            ),
+            (
+                vpclmul,
+                IscsiKernel::Avx512Vpclmulqdq,
+                PerformanceTier::X86_64Avx512Vpclmulqdq,
+                cpu(INTEL, 6, 0x6a),
+            ),
+            (
+                vpclmul,
+                IscsiKernel::Avx512Vpclmulqdq,
+                PerformanceTier::X86_64Avx512Vpclmulqdq,
+                cpu(AMD, 0x19, 0x61),
+            ),
+        ];
+
+        let mut data = vec![0u8; ZEN2_STREAMS_MIN + 4096];
+        rng().fill(&mut data[..]);
+        let aligned = data.as_ptr().align_offset(64);
+
+        let init = CRC32_ISCSI.init_algorithm;
+        let carried = crate::arch::software::update(init, &data[..7], &CRC32_ISCSI);
+
+        let mut lengths: Vec<usize> = (0..=INTEL_MID_MAX + 80).collect();
+        lengths.extend(ZEN2_STREAMS_MIN - 9..=ZEN2_STREAMS_MIN + 33);
+
+        for (present, kernel, tier, id) in plans {
+            if !present {
+                eprintln!("skipping {kernel:?} for {id:?}: the CPU lacks its features");
+                continue;
+            }
+            let plan = iscsi_plan(kernel, tier, id);
+            for offset in [0usize, 1, 3, 8, 15, 33, 63] {
+                for &len in &lengths {
+                    let input = &data[aligned + offset..aligned + offset + len];
+                    for state in [init, carried] {
+                        let expected = crate::arch::software::update(state, input, &CRC32_ISCSI);
+                        let actual = unsafe { (plan.kernel)(state as u32, input) } as u64;
+                        assert_eq!(
+                            actual, expected,
+                            "{id:?} {kernel:?} offset {offset} len {len} state {state:#x}"
+                        );
+                    }
                 }
             }
         }
@@ -534,11 +2030,32 @@ mod tests {
             eprintln!("skipping far_kernel_matches_software: no SSE4.2 + PCLMULQDQ");
             return;
         }
+        #[cfg(target_arch = "x86_64")]
+        let has_avx2 = is_x86_feature_detected!("avx2");
 
         let mut data = vec![0u8; SSE_FAR_MIN + 96];
         rng().fill(&mut data[..]);
 
         let init = CRC32_ISCSI.init_algorithm;
+        #[cfg(target_arch = "x86_64")]
+        if has_avx2 {
+            for offset in [0usize, 5] {
+                for len in ALDER_LAKE_FAR_MIN - 8..=ALDER_LAKE_FAR_MIN + 72 {
+                    let input = &data[offset..offset + len];
+                    let expected = crate::arch::software::update(init, input, &CRC32_ISCSI);
+                    let actual = run(
+                        crc32_iscsi_avx2::<ALDER_LAKE_FAR_MIN, 0, { usize::MAX }>,
+                        init as u32,
+                        input,
+                    ) as u64;
+
+                    assert_eq!(
+                        actual, expected,
+                        "Alder Lake entry offset {offset} len {len}"
+                    );
+                }
+            }
+        }
         let carried = crate::arch::software::update(init, &data[4096..4096 + 7], &CRC32_ISCSI);
 
         let mut lengths: Vec<usize> = (0..=700).collect();
@@ -557,6 +2074,18 @@ mod tests {
                         actual, expected,
                         "offset {offset} len {len} state {state:#x}"
                     );
+
+                    #[cfg(target_arch = "x86_64")]
+                    if has_avx2 {
+                        let actual = unsafe {
+                            crc32_iscsi_avx2_v4s3x3(state as u32, input.as_ptr(), input.len())
+                        } as u64;
+
+                        assert_eq!(
+                            actual, expected,
+                            "AVX2 build offset {offset} len {len} state {state:#x}"
+                        );
+                    }
                 }
             }
         }
@@ -568,6 +2097,17 @@ mod tests {
                 let actual = run(crc32_iscsi_sse, init as u32, input) as u64;
 
                 assert_eq!(actual, expected, "entry offset {offset} len {len}");
+
+                #[cfg(target_arch = "x86_64")]
+                if has_avx2 {
+                    let actual = run(
+                        crc32_iscsi_avx2::<SSE_FAR_MIN, 0, { usize::MAX }>,
+                        init as u32,
+                        input,
+                    ) as u64;
+
+                    assert_eq!(actual, expected, "AVX2 entry offset {offset} len {len}");
+                }
             }
         }
     }
@@ -593,6 +2133,13 @@ mod tests {
                 );
                 #[cfg(target_arch = "x86_64")]
                 {
+                    if is_x86_feature_detected!("avx2") {
+                        assert_eq!(
+                            run(iscsi_kernel_fn(IscsiKernel::Avx2), 0xffffffff, slice) ^ 0xffffffff,
+                            expected,
+                            "avx2 len {len} offset {offset}"
+                        );
+                    }
                     if is_x86_feature_detected!("avx512vl") {
                         assert_eq!(
                             run(
@@ -619,6 +2166,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_crc32_iscsi_small_fast_check() {
         if is_x86_feature_detected!("sse4.2") {
@@ -631,6 +2179,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_crc32_iscsi_small_fast_all_lengths() {
         if is_x86_feature_detected!("sse4.2") {
@@ -640,6 +2189,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     fn test_crc32_iscsi_small_fast_random(len: usize) {
         let mut data = vec![0u8; len];
         rng().fill(&mut data[..]);

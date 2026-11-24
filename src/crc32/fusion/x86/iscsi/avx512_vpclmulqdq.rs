@@ -13,8 +13,6 @@
 /// Modified as necessary for this Rust implementation.
 ///
 /// Uses AVX-512 VPCLMULQDQ instructions
-// Out of line: inlined into its entry point, the registers it saves are saved for the short
-// buffers that return before reaching it
 #[inline(never)]
 #[target_feature(enable = "avx512vl,vpclmulqdq")]
 pub unsafe fn crc32_iscsi_avx512_vpclmulqdq_v3x2(
@@ -153,6 +151,16 @@ pub unsafe fn crc32_iscsi_avx512_vpclmulqdq_v3x2(
         x0 = clmul_hi_avx512_vpclmulqdq(x0, k);
         x0 = _mm512_ternarylogic_epi64(x0, y0, x1, 0x96);
 
+        // Fold each whole 64-byte block left into the one lane with the same 64-byte key the
+        // reduction above used, rather than leaving it to the CRC32 instruction.
+        while len >= 64 {
+            y0 = clmul_lo_avx512_vpclmulqdq(x0, k);
+            x0 = clmul_hi_avx512_vpclmulqdq(x0, k);
+            x0 = _mm512_ternarylogic_epi64(x0, y0, _mm512_loadu_si512(buf as *const __m512i), 0x96);
+            buf = buf.add(64);
+            len -= 64;
+        }
+
         // Reduce 512 bits to 128 bits
         // Multiple reduction constants for different parts of the 512-bit vector
         k = _mm512_setr_epi32(
@@ -208,4 +216,51 @@ pub unsafe fn crc32_iscsi_avx512_vpclmulqdq_v3x2(
     }
 
     crc0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crc32::consts::CRC32_ISCSI;
+
+    /// The kernel, called directly, against the software path, the oracle: every length through
+    /// three of its 384-byte steps, which takes in the short buffers the stream kernel hands it
+    /// and buffers shorter than a word, from every start within a cache line's first
+    /// 16 bytes and a few later ones, from the init state, zero and a carried state.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn matches_software() {
+        if !(is_x86_feature_detected!("avx512vl")
+            && is_x86_feature_detected!("vpclmulqdq")
+            && is_x86_feature_detected!("sse4.2"))
+        {
+            eprintln!("skipping matches_software: no AVX-512 VPCLMULQDQ");
+            return;
+        }
+
+        let data: Vec<u8> = (0..1400u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
+        // The kernel's own data, from a 64-byte boundary, so that the offsets below are the
+        // offsets of the head within a cache line
+        let base = data.as_ptr().align_offset(64);
+
+        for offset in (0..16).chain([31, 56, 63]) {
+            for len in 0..=3 * 384 + 72 {
+                let bytes = &data[base + offset..base + offset + len];
+                for state in [0xffff_ffffu32, 0, 0x1234_5678] {
+                    let expected =
+                        crate::arch::software::update(state as u64, bytes, &CRC32_ISCSI) as u32;
+                    // SAFETY: the features were detected above
+                    let got = unsafe {
+                        crc32_iscsi_avx512_vpclmulqdq_v3x2(state, bytes.as_ptr(), bytes.len())
+                    };
+                    assert_eq!(
+                        got, expected,
+                        "offset {offset}, length {len}, state {state:#x}"
+                    );
+                }
+            }
+        }
+    }
 }

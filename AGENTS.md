@@ -51,7 +51,12 @@ major version and a reason, not convenience.
 - `unsafe` is confined to the architecture modules, the C library
   (`src/ffi.rs`) and the places upstream already has it. Every block calling
   an intrinsic is reached only through a function with the matching
-  `#[target_feature]`, after detection.
+  `#[target_feature]`, after detection. The one exception is inline asm that
+  has to inline into a caller built without the feature, where a
+  `#[target_feature]` function would force a call: it may stand outside one
+  when it is reached only through a value that is set after detection of the
+  feature, is compiled out under `cfg(miri)` in favour of an intrinsics path,
+  and has an oracle test that a mutation of the asm fails.
 - Miri runs the whole suite on x86_64. A change that makes a test
   Miri-incompatible ignores that one test under `cfg(miri)`, never the lane.
 
@@ -63,6 +68,16 @@ major version and a reason, not convenience.
 - The CPUs without the feature the change needs are part of the claim: an
   AVX2 change is measured on an AVX-512 part too, and aarch64 is measured
   whenever shared code moves.
+- **Speed does not depend on the compiler's mood.** A consumer builds this
+  crate with their own rustc, LLVM and profile, so a hot path whose shape
+  matters is inline asm (with an intrinsics path for Miri and as the tested
+  fallback), not a shape the optimizer happened to choose. Each such path is
+  listed in `codegen/<target>.snap` and held there by `cargo xtask codegen
+  check`: the asm's mnemonics must match exactly on every compiler and
+  profile, and the generated code around it may not grow or gain a call. A
+  change to a listed path re-blesses the snapshot (`cargo xtask codegen
+  bless --target <target>`) in the same commit and says why in its message.
+  The check counts instructions; it never times anything.
 
 ## Tests
 

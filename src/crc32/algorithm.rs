@@ -133,12 +133,7 @@ impl EnhancedCrcWidth for crate::structs::Width32 {
 }
 
 /// Process inputs smaller than 16 bytes
-#[inline]
-#[cfg_attr(
-    any(target_arch = "x86", target_arch = "x86_64"),
-    target_feature(enable = "ssse3,sse4.1,pclmulqdq")
-)]
-#[cfg_attr(target_arch = "aarch64", target_feature(enable = "aes"))]
+#[inline(always)]
 pub(crate) unsafe fn process_0_to_15<T: ArchOps, W: EnhancedCrcWidth>(
     data: &[u8],
     state: &mut CrcState<T::Vector>,

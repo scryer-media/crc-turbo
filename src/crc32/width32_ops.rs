@@ -171,6 +171,32 @@ pub unsafe fn perform_final_reduction<T: ArchOps>(
 where
     T::Vector: Copy,
 {
+    // Three multiplies where the path below makes four: the high 64 bits are folded onto the
+    // low by x^96 mod P(x), which leaves 96 bits, and those are reduced by a Barrett step whose
+    // quotient is 64 bits wide (`keys[0]`, see `generate::barrett_quotient_96`). The Linux
+    // kernel's CRC template and libdeflate end the same way. Key tables from before that
+    // constant hold 0 in its slot and take the path below.
+    if keys[0] != 0 {
+        let fold = ops.create_vector_from_u64_pair_non_reflected(0, keys[5]);
+        if reflected {
+            // The 96 bits are the low 96; the result is the third 32-bit word.
+            let folded =
+                ops.xor_vectors(ops.carryless_mul_00(state, fold), ops.shift_right_8(state));
+            let barrett = ops.create_vector_from_u64_pair_non_reflected(keys[8], keys[0]);
+            let quotient = ops.carryless_mul_00(folded, barrett);
+            let product = ops.carryless_mul_10(quotient, barrett);
+            return ops.extract_u64s(ops.xor_vectors(folded, product));
+        }
+        // The 96 bits are the high 96, so the high 64 are the top of the dividend. Its quotient
+        // is the high half of their product with the constant, plus themselves for the
+        // constant's x^64 term; the result is the second 32-bit word.
+        let folded = ops.xor_vectors(ops.carryless_mul_01(state, fold), ops.shift_left_8(state));
+        let barrett = ops.create_vector_from_u64_pair_non_reflected(keys[0], keys[8]);
+        let quotient = ops.xor_vectors(ops.carryless_mul_11(folded, barrett), folded);
+        let product = ops.carryless_mul_01(quotient, barrett);
+        return ops.extract_u64s(ops.xor_vectors(folded, ops.shift_left_4(product)));
+    }
+
     let mut crc_state = CrcState {
         value: state,
         reflected,
@@ -184,12 +210,7 @@ where
 }
 
 /// Process inputs smaller than 16 bytes for 32-bit-space CRC operations (used by CRC-16 and CRC-32)
-#[inline]
-#[cfg_attr(
-    any(target_arch = "x86", target_arch = "x86_64"),
-    target_feature(enable = "ssse3,sse4.1,pclmulqdq")
-)]
-#[cfg_attr(target_arch = "aarch64", target_feature(enable = "aes"))]
+#[inline(always)]
 pub unsafe fn process_0_to_15<T: ArchOps, W: EnhancedCrcWidth>(
     data: &[u8],
     state: &mut CrcState<T::Vector>,
@@ -200,12 +221,14 @@ pub unsafe fn process_0_to_15<T: ArchOps, W: EnhancedCrcWidth>(
 where
     T::Vector: Copy,
 {
-    let mut buffer = [0u8; CRC_CHUNK_SIZE];
-    if state.reflected {
-        buffer[CRC_CHUNK_SIZE - data.len()..].copy_from_slice(data);
-    } else {
-        buffer[..data.len()].copy_from_slice(data);
-    }
+    let buffer = crate::algorithm::short_block(
+        data,
+        if state.reflected {
+            CRC_CHUNK_SIZE - data.len()
+        } else {
+            0
+        },
+    );
 
     let len = data.len() as i32;
     let base = &PSHUFB_SHF_TABLE_REVERSE as *const _ as *const u8;

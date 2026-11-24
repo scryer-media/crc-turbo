@@ -362,6 +362,19 @@ impl CrcKeysStorage {
         }
     }
 
+    /// The first 23 keys, borrowed: what the fold kernels read.
+    #[cfg_attr(
+        not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")),
+        allow(dead_code)
+    )]
+    #[inline(always)]
+    pub(crate) fn fold_keys(&self) -> &[u64; 23] {
+        match self {
+            CrcKeysStorage::KeysFold256(keys) => keys,
+            CrcKeysStorage::KeysFutureTest(keys) => keys.first_chunk().unwrap_or(&[0; 23]),
+        }
+    }
+
     /// Returns the number of keys available in this storage variant.
     #[inline(always)]
     const fn key_count(self) -> usize {
@@ -438,6 +451,52 @@ pub struct CrcParams {
     pub xorout: u64,
     pub check: u64,
     pub keys: CrcKeysStorage,
+}
+
+/// The calculator of a built-in algorithm: the dispatching one where an accelerated path exists,
+/// else the algorithm's own software calculator, which links its table alone.
+macro_rules! calculator {
+    ($alg:ident) => {{
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+        let calculator = Calculator::calculate as CalculatorFn;
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+        let calculator = crate::arch::software::calc::$alg as CalculatorFn;
+        calculator
+    }};
+}
+
+/// A built-in parameter set where the kernels read it: aligned to a power of two no smaller
+/// than itself, so it never spans a page boundary and no load from it is split across two
+/// pages. Left to the linker, the statics are packed 8-byte aligned one after another, and the
+/// one that lands across a page takes a split load on every key pair the fold reads from the far
+/// side. On an Apple M5 Max (16 KiB pages) that was CRC-64/MS in one build: 3.7 GB/s at 64
+/// bytes and 11.7 at 192, against 17 and 48 for CRC-64/XZ, with the same code running.
+#[repr(align(512))]
+struct PageSafeParams(CrcParams);
+
+const _: () = assert!(size_of::<CrcParams>() <= align_of::<PageSafeParams>());
+
+/// The `&'static CrcParams` the kernels get for a built-in constant; see [`PageSafeParams`].
+macro_rules! page_safe {
+    ($params:path) => {{
+        static PARAMS: PageSafeParams = PageSafeParams($params);
+        &PARAMS.0
+    }};
+}
+
+/// Runs a built-in algorithm's calculator; see [`calculator!`]. A built-in constant, written
+/// `&CONST`, is handed over from a [`page_safe!`] copy.
+macro_rules! calculate {
+    ($alg:ident, $state:expr, $data:expr, & $params:path $(,)?) => {
+        calculate!($alg, $state, $data, page_safe!($params))
+    };
+    ($alg:ident, $state:expr, $data:expr, $params:expr $(,)?) => {{
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+        let crc = Calculator::calculate($state, $data, $params);
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+        let crc = crate::arch::software::calc::$alg($state, $data, $params);
+        crc
+    }};
 }
 
 /// Type alias for a function pointer that represents a CRC calculation function.
@@ -831,175 +890,218 @@ pub fn try_checksum(algorithm: CrcAlgorithm, buf: &[u8]) -> Result<u64, CrcError
 ///
 /// For the `Custom` algorithms, which need [`checksum_with_params`]; [`try_checksum`] returns
 /// the error instead.
+#[inline(always)]
+pub fn checksum(algorithm: CrcAlgorithm, buf: &[u8]) -> u64 {
+    // The two CRC-32 algorithms with fusion kernels are peeled off here, so that a call naming
+    // one of them is its entry point inlined at the call site, whatever the compiler decides
+    // for the whole table. On a Xeon Platinum 8375C that took CRC-32/ISCSI at 64 bytes from
+    // 1.42x to 1.88x of 1.11.0's speed. CRC-64/NVME's arm is the same code either way and
+    // timed the same peeled or not, so it stays in the table.
+    match algorithm {
+        CrcAlgorithm::Crc32Iscsi => crc32_iscsi(buf) as u64,
+        CrcAlgorithm::Crc32IsoHdlc => crc32_iso_hdlc_checksum(buf),
+        _ => checksum_by_table(algorithm, buf),
+    }
+}
+
+/// [`checksum`] for every algorithm, by one match, inlined so that a constant algorithm leaves
+/// only its own arm.
 #[inline]
 #[allow(deprecated)]
-pub fn checksum(algorithm: CrcAlgorithm, buf: &[u8]) -> u64 {
+fn checksum_by_table(algorithm: CrcAlgorithm, buf: &[u8]) -> u64 {
     // avoid using get_calculator_params() here to reduce overhead for small data sizes
     match algorithm {
         CrcAlgorithm::Crc16Arc => {
-            Calculator::calculate(CRC16_ARC.init, buf, &CRC16_ARC) ^ CRC16_ARC.xorout
+            calculate!(Crc16Arc, CRC16_ARC.init, buf, &CRC16_ARC) ^ CRC16_ARC.xorout
         }
         CrcAlgorithm::Crc16Cdma2000 => {
-            Calculator::calculate(CRC16_CDMA2000.init, buf, &CRC16_CDMA2000) ^ CRC16_CDMA2000.xorout
+            calculate!(Crc16Cdma2000, CRC16_CDMA2000.init, buf, &CRC16_CDMA2000)
+                ^ CRC16_CDMA2000.xorout
         }
         CrcAlgorithm::Crc16Cms => {
-            Calculator::calculate(CRC16_CMS.init, buf, &CRC16_CMS) ^ CRC16_CMS.xorout
+            calculate!(Crc16Cms, CRC16_CMS.init, buf, &CRC16_CMS) ^ CRC16_CMS.xorout
         }
         CrcAlgorithm::Crc16Dds110 => {
-            Calculator::calculate(CRC16_DDS_110.init, buf, &CRC16_DDS_110) ^ CRC16_DDS_110.xorout
+            calculate!(Crc16Dds110, CRC16_DDS_110.init, buf, &CRC16_DDS_110) ^ CRC16_DDS_110.xorout
         }
         CrcAlgorithm::Crc16DectR => {
-            Calculator::calculate(CRC16_DECT_R.init, buf, &CRC16_DECT_R) ^ CRC16_DECT_R.xorout
+            calculate!(Crc16DectR, CRC16_DECT_R.init, buf, &CRC16_DECT_R) ^ CRC16_DECT_R.xorout
         }
         CrcAlgorithm::Crc16DectX => {
-            Calculator::calculate(CRC16_DECT_X.init, buf, &CRC16_DECT_X) ^ CRC16_DECT_X.xorout
+            calculate!(Crc16DectX, CRC16_DECT_X.init, buf, &CRC16_DECT_X) ^ CRC16_DECT_X.xorout
         }
         CrcAlgorithm::Crc16Dnp => {
-            Calculator::calculate(CRC16_DNP.init, buf, &CRC16_DNP) ^ CRC16_DNP.xorout
+            calculate!(Crc16Dnp, CRC16_DNP.init, buf, &CRC16_DNP) ^ CRC16_DNP.xorout
         }
         CrcAlgorithm::Crc16En13757 => {
-            Calculator::calculate(CRC16_EN_13757.init, buf, &CRC16_EN_13757) ^ CRC16_EN_13757.xorout
+            calculate!(Crc16En13757, CRC16_EN_13757.init, buf, &CRC16_EN_13757)
+                ^ CRC16_EN_13757.xorout
         }
         CrcAlgorithm::Crc16Genibus => {
-            Calculator::calculate(CRC16_GENIBUS.init, buf, &CRC16_GENIBUS) ^ CRC16_GENIBUS.xorout
+            calculate!(Crc16Genibus, CRC16_GENIBUS.init, buf, &CRC16_GENIBUS) ^ CRC16_GENIBUS.xorout
         }
         CrcAlgorithm::Crc16Gsm => {
-            Calculator::calculate(CRC16_GSM.init, buf, &CRC16_GSM) ^ CRC16_GSM.xorout
+            calculate!(Crc16Gsm, CRC16_GSM.init, buf, &CRC16_GSM) ^ CRC16_GSM.xorout
         }
         CrcAlgorithm::Crc16Ibm3740 => {
-            Calculator::calculate(CRC16_IBM_3740.init, buf, &CRC16_IBM_3740) ^ CRC16_IBM_3740.xorout
+            calculate!(Crc16Ibm3740, CRC16_IBM_3740.init, buf, &CRC16_IBM_3740)
+                ^ CRC16_IBM_3740.xorout
         }
         CrcAlgorithm::Crc16IbmSdlc => {
-            Calculator::calculate(CRC16_IBM_SDLC.init, buf, &CRC16_IBM_SDLC) ^ CRC16_IBM_SDLC.xorout
+            calculate!(Crc16IbmSdlc, CRC16_IBM_SDLC.init, buf, &CRC16_IBM_SDLC)
+                ^ CRC16_IBM_SDLC.xorout
         }
         CrcAlgorithm::Crc16IsoIec144433A => {
-            Calculator::calculate(
+            calculate!(
+                Crc16IsoIec144433A,
                 CRC16_ISO_IEC_14443_3_A.init_algorithm,
                 buf,
                 &CRC16_ISO_IEC_14443_3_A,
             ) ^ CRC16_ISO_IEC_14443_3_A.xorout
         }
         CrcAlgorithm::Crc16Kermit => {
-            Calculator::calculate(CRC16_KERMIT.init, buf, &CRC16_KERMIT) ^ CRC16_KERMIT.xorout
+            calculate!(Crc16Kermit, CRC16_KERMIT.init, buf, &CRC16_KERMIT) ^ CRC16_KERMIT.xorout
         }
         CrcAlgorithm::Crc16Lj1200 => {
-            Calculator::calculate(CRC16_LJ1200.init, buf, &CRC16_LJ1200) ^ CRC16_LJ1200.xorout
+            calculate!(Crc16Lj1200, CRC16_LJ1200.init, buf, &CRC16_LJ1200) ^ CRC16_LJ1200.xorout
         }
         CrcAlgorithm::Crc16M17 => {
-            Calculator::calculate(CRC16_M17.init, buf, &CRC16_M17) ^ CRC16_M17.xorout
+            calculate!(Crc16M17, CRC16_M17.init, buf, &CRC16_M17) ^ CRC16_M17.xorout
         }
         CrcAlgorithm::Crc16MaximDow => {
-            Calculator::calculate(CRC16_MAXIM_DOW.init, buf, &CRC16_MAXIM_DOW)
+            calculate!(Crc16MaximDow, CRC16_MAXIM_DOW.init, buf, &CRC16_MAXIM_DOW)
                 ^ CRC16_MAXIM_DOW.xorout
         }
         CrcAlgorithm::Crc16Mcrf4xx => {
-            Calculator::calculate(CRC16_MCRF4XX.init, buf, &CRC16_MCRF4XX) ^ CRC16_MCRF4XX.xorout
+            calculate!(Crc16Mcrf4xx, CRC16_MCRF4XX.init, buf, &CRC16_MCRF4XX) ^ CRC16_MCRF4XX.xorout
         }
         CrcAlgorithm::Crc16Modbus => {
-            Calculator::calculate(CRC16_MODBUS.init, buf, &CRC16_MODBUS) ^ CRC16_MODBUS.xorout
+            calculate!(Crc16Modbus, CRC16_MODBUS.init, buf, &CRC16_MODBUS) ^ CRC16_MODBUS.xorout
         }
         CrcAlgorithm::Crc16Nrsc5 => {
-            Calculator::calculate(CRC16_NRSC_5.init, buf, &CRC16_NRSC_5) ^ CRC16_NRSC_5.xorout
+            calculate!(Crc16Nrsc5, CRC16_NRSC_5.init, buf, &CRC16_NRSC_5) ^ CRC16_NRSC_5.xorout
         }
         CrcAlgorithm::Crc16OpensafetyA => {
-            Calculator::calculate(CRC16_OPENSAFETY_A.init, buf, &CRC16_OPENSAFETY_A)
-                ^ CRC16_OPENSAFETY_A.xorout
+            calculate!(
+                Crc16OpensafetyA,
+                CRC16_OPENSAFETY_A.init,
+                buf,
+                &CRC16_OPENSAFETY_A
+            ) ^ CRC16_OPENSAFETY_A.xorout
         }
         CrcAlgorithm::Crc16OpensafetyB => {
-            Calculator::calculate(CRC16_OPENSAFETY_B.init, buf, &CRC16_OPENSAFETY_B)
-                ^ CRC16_OPENSAFETY_B.xorout
+            calculate!(
+                Crc16OpensafetyB,
+                CRC16_OPENSAFETY_B.init,
+                buf,
+                &CRC16_OPENSAFETY_B
+            ) ^ CRC16_OPENSAFETY_B.xorout
         }
         CrcAlgorithm::Crc16Profibus => {
-            Calculator::calculate(CRC16_PROFIBUS.init, buf, &CRC16_PROFIBUS) ^ CRC16_PROFIBUS.xorout
+            calculate!(Crc16Profibus, CRC16_PROFIBUS.init, buf, &CRC16_PROFIBUS)
+                ^ CRC16_PROFIBUS.xorout
         }
         CrcAlgorithm::Crc16Riello => {
-            Calculator::calculate(CRC16_RIELLO.init_algorithm, buf, &CRC16_RIELLO)
+            calculate!(Crc16Riello, CRC16_RIELLO.init_algorithm, buf, &CRC16_RIELLO)
                 ^ CRC16_RIELLO.xorout
         }
         CrcAlgorithm::Crc16SpiFujitsu => {
-            Calculator::calculate(CRC16_SPI_FUJITSU.init, buf, &CRC16_SPI_FUJITSU)
-                ^ CRC16_SPI_FUJITSU.xorout
+            calculate!(
+                Crc16SpiFujitsu,
+                CRC16_SPI_FUJITSU.init,
+                buf,
+                &CRC16_SPI_FUJITSU
+            ) ^ CRC16_SPI_FUJITSU.xorout
         }
         CrcAlgorithm::Crc16T10Dif => {
-            Calculator::calculate(CRC16_T10_DIF.init, buf, &CRC16_T10_DIF) ^ CRC16_T10_DIF.xorout
+            calculate!(Crc16T10Dif, CRC16_T10_DIF.init, buf, &CRC16_T10_DIF) ^ CRC16_T10_DIF.xorout
         }
         CrcAlgorithm::Crc16Teledisk => {
-            Calculator::calculate(CRC16_TELEDISK.init, buf, &CRC16_TELEDISK) ^ CRC16_TELEDISK.xorout
+            calculate!(Crc16Teledisk, CRC16_TELEDISK.init, buf, &CRC16_TELEDISK)
+                ^ CRC16_TELEDISK.xorout
         }
         CrcAlgorithm::Crc16Tms37157 => {
-            Calculator::calculate(CRC16_TMS37157.init_algorithm, buf, &CRC16_TMS37157)
-                ^ CRC16_TMS37157.xorout
+            calculate!(
+                Crc16Tms37157,
+                CRC16_TMS37157.init_algorithm,
+                buf,
+                &CRC16_TMS37157
+            ) ^ CRC16_TMS37157.xorout
         }
         CrcAlgorithm::Crc16Umts => {
-            Calculator::calculate(CRC16_UMTS.init, buf, &CRC16_UMTS) ^ CRC16_UMTS.xorout
+            calculate!(Crc16Umts, CRC16_UMTS.init, buf, &CRC16_UMTS) ^ CRC16_UMTS.xorout
         }
         CrcAlgorithm::Crc16Usb => {
-            Calculator::calculate(CRC16_USB.init, buf, &CRC16_USB) ^ CRC16_USB.xorout
+            calculate!(Crc16Usb, CRC16_USB.init, buf, &CRC16_USB) ^ CRC16_USB.xorout
         }
         CrcAlgorithm::Crc16Xmodem => {
-            Calculator::calculate(CRC16_XMODEM.init, buf, &CRC16_XMODEM) ^ CRC16_XMODEM.xorout
+            calculate!(Crc16Xmodem, CRC16_XMODEM.init, buf, &CRC16_XMODEM) ^ CRC16_XMODEM.xorout
         }
         CrcAlgorithm::Crc32Aixm => {
-            Calculator::calculate(CRC32_AIXM.init, buf, &CRC32_AIXM) ^ CRC32_AIXM.xorout
+            calculate!(Crc32Aixm, CRC32_AIXM.init, buf, &CRC32_AIXM) ^ CRC32_AIXM.xorout
         }
         CrcAlgorithm::Crc32Autosar => {
-            Calculator::calculate(CRC32_AUTOSAR.init, buf, &CRC32_AUTOSAR) ^ CRC32_AUTOSAR.xorout
+            calculate!(Crc32Autosar, CRC32_AUTOSAR.init, buf, &CRC32_AUTOSAR) ^ CRC32_AUTOSAR.xorout
         }
         CrcAlgorithm::Crc32Base91D => {
-            Calculator::calculate(CRC32_BASE91_D.init, buf, &CRC32_BASE91_D) ^ CRC32_BASE91_D.xorout
+            calculate!(Crc32Base91D, CRC32_BASE91_D.init, buf, &CRC32_BASE91_D)
+                ^ CRC32_BASE91_D.xorout
         }
         CrcAlgorithm::Crc32Bzip2 => {
-            Calculator::calculate(CRC32_BZIP2.init, buf, &CRC32_BZIP2) ^ CRC32_BZIP2.xorout
+            calculate!(Crc32Bzip2, CRC32_BZIP2.init, buf, &CRC32_BZIP2) ^ CRC32_BZIP2.xorout
         }
         CrcAlgorithm::Crc32CdRomEdc => {
-            Calculator::calculate(CRC32_CD_ROM_EDC.init, buf, &CRC32_CD_ROM_EDC)
+            calculate!(Crc32CdRomEdc, CRC32_CD_ROM_EDC.init, buf, &CRC32_CD_ROM_EDC)
                 ^ CRC32_CD_ROM_EDC.xorout
         }
         CrcAlgorithm::Crc32Cksum => {
-            Calculator::calculate(CRC32_CKSUM.init, buf, &CRC32_CKSUM) ^ CRC32_CKSUM.xorout
+            calculate!(Crc32Cksum, CRC32_CKSUM.init, buf, &CRC32_CKSUM) ^ CRC32_CKSUM.xorout
         }
         CrcAlgorithm::Crc32Custom => missing_params(algorithm),
-        CrcAlgorithm::Crc32Iscsi => {
-            crc32_iscsi_calculator(CRC32_ISCSI.init, buf, &CRC32_ISCSI) ^ CRC32_ISCSI.xorout
-        }
+        CrcAlgorithm::Crc32Iscsi => crc32_iscsi_xorout::<{ CRC32_ISCSI.xorout as u32 }>(
+            CRC32_ISCSI.init,
+            buf,
+            page_safe!(CRC32_ISCSI),
+        ) as u64,
         CrcAlgorithm::Crc32IsoHdlc => {
-            crc32_iso_hdlc_calculator(CRC32_ISO_HDLC.init, buf, &CRC32_ISO_HDLC)
+            crc32_iso_hdlc_calculator(CRC32_ISO_HDLC.init, buf, page_safe!(CRC32_ISO_HDLC))
                 ^ CRC32_ISO_HDLC.xorout
         }
         CrcAlgorithm::Crc32Jamcrc => {
-            Calculator::calculate(CRC32_JAMCRC.init, buf, &CRC32_JAMCRC) ^ CRC32_JAMCRC.xorout
+            calculate!(Crc32Jamcrc, CRC32_JAMCRC.init, buf, &CRC32_JAMCRC) ^ CRC32_JAMCRC.xorout
         }
         CrcAlgorithm::Crc32Mef => {
-            Calculator::calculate(CRC32_MEF.init, buf, &CRC32_MEF) ^ CRC32_MEF.xorout
+            calculate!(Crc32Mef, CRC32_MEF.init, buf, &CRC32_MEF) ^ CRC32_MEF.xorout
         }
         CrcAlgorithm::Crc32Mpeg2 => {
-            Calculator::calculate(CRC32_MPEG_2.init, buf, &CRC32_MPEG_2) ^ CRC32_MPEG_2.xorout
+            calculate!(Crc32Mpeg2, CRC32_MPEG_2.init, buf, &CRC32_MPEG_2) ^ CRC32_MPEG_2.xorout
         }
         CrcAlgorithm::Crc32Xfer => {
-            Calculator::calculate(CRC32_XFER.init, buf, &CRC32_XFER) ^ CRC32_XFER.xorout
+            calculate!(Crc32Xfer, CRC32_XFER.init, buf, &CRC32_XFER) ^ CRC32_XFER.xorout
         }
         CrcAlgorithm::CrcCustom => missing_params(algorithm),
         CrcAlgorithm::Crc64Custom => missing_params(algorithm),
         CrcAlgorithm::Crc64Ecma182 => {
-            Calculator::calculate(CRC64_ECMA_182.init, buf, &CRC64_ECMA_182) ^ CRC64_ECMA_182.xorout
+            calculate!(Crc64Ecma182, CRC64_ECMA_182.init, buf, &CRC64_ECMA_182)
+                ^ CRC64_ECMA_182.xorout
         }
         CrcAlgorithm::Crc64GoIso => {
-            Calculator::calculate(CRC64_GO_ISO.init, buf, &CRC64_GO_ISO) ^ CRC64_GO_ISO.xorout
+            calculate!(Crc64GoIso, CRC64_GO_ISO.init, buf, &CRC64_GO_ISO) ^ CRC64_GO_ISO.xorout
         }
         CrcAlgorithm::Crc64Ms => {
-            Calculator::calculate(CRC64_MS.init, buf, &CRC64_MS) ^ CRC64_MS.xorout
+            calculate!(Crc64Ms, CRC64_MS.init, buf, &CRC64_MS) ^ CRC64_MS.xorout
         }
         CrcAlgorithm::Crc64Nvme => {
-            Calculator::calculate(CRC64_NVME.init, buf, &CRC64_NVME) ^ CRC64_NVME.xorout
+            calculate!(Crc64Nvme, CRC64_NVME.init, buf, &CRC64_NVME) ^ CRC64_NVME.xorout
         }
         CrcAlgorithm::Crc64Redis => {
-            Calculator::calculate(CRC64_REDIS.init, buf, &CRC64_REDIS) ^ CRC64_REDIS.xorout
+            calculate!(Crc64Redis, CRC64_REDIS.init, buf, &CRC64_REDIS) ^ CRC64_REDIS.xorout
         }
         CrcAlgorithm::Crc64We => {
-            Calculator::calculate(CRC64_WE.init, buf, &CRC64_WE) ^ CRC64_WE.xorout
+            calculate!(Crc64We, CRC64_WE.init, buf, &CRC64_WE) ^ CRC64_WE.xorout
         }
         CrcAlgorithm::Crc64Xz => {
-            Calculator::calculate(CRC64_XZ.init, buf, &CRC64_XZ) ^ CRC64_XZ.xorout
+            calculate!(Crc64Xz, CRC64_XZ.init, buf, &CRC64_XZ) ^ CRC64_XZ.xorout
         }
     }
 }
@@ -1296,7 +1398,11 @@ pub fn get_calculator_target(_algorithm: CrcAlgorithm) -> String {
 /// ```
 #[inline(always)]
 pub fn crc32_iscsi(data: &[u8]) -> u32 {
-    crc32_iscsi_calculator(CRC32_ISCSI.init, data, &CRC32_ISCSI) as u32 ^ CRC32_ISCSI.xorout as u32
+    crc32_iscsi_xorout::<{ CRC32_ISCSI.xorout as u32 }>(
+        CRC32_ISCSI.init,
+        data,
+        page_safe!(CRC32_ISCSI),
+    )
 }
 
 /// Calculates the CRC-32/ISO-HDLC checksum (commonly called "crc32" in many, but not all,
@@ -1316,8 +1422,41 @@ pub fn crc32_iscsi(data: &[u8]) -> u32 {
 /// ```
 #[inline(always)]
 pub fn crc32_iso_hdlc(data: &[u8]) -> u32 {
-    crc32_iso_hdlc_calculator(CRC32_ISO_HDLC.init, data, &CRC32_ISO_HDLC) as u32
-        ^ CRC32_ISO_HDLC.xorout as u32
+    // x86 jumps to the tier's checksum entry, which applies the initial value and the final
+    // XOR itself.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        arch::crc32_iso_hdlc(data) as u32
+    }
+
+    // aarch64 applies the final XOR in the kernel, so that this is a jump to it.
+    #[cfg(all(target_arch = "aarch64", feature = "std"))]
+    if let Some(crc) =
+        fusion::crc32_iso_hdlc::<{ CRC32_ISO_HDLC.xorout as u32 }>(CRC32_ISO_HDLC.init as u32, data)
+    {
+        return crc;
+    }
+
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        crc32_iso_hdlc_calculator(CRC32_ISO_HDLC.init, data, page_safe!(CRC32_ISO_HDLC)) as u32
+            ^ CRC32_ISO_HDLC.xorout as u32
+    }
+}
+
+/// [`crc32_iso_hdlc`] as [`checksum`] returns it. On x86 the tier's entry returns it widened,
+/// so that `checksum` jumps to it rather than calling it and widening the result.
+#[inline(always)]
+fn crc32_iso_hdlc_checksum(data: &[u8]) -> u64 {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        arch::crc32_iso_hdlc(data)
+    }
+
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        crc32_iso_hdlc(data) as u64
+    }
 }
 
 /// Calculates the CRC-64/NVME checksum.
@@ -1336,7 +1475,7 @@ pub fn crc32_iso_hdlc(data: &[u8]) -> u32 {
 /// ```
 #[inline(always)]
 pub fn crc64_nvme(data: &[u8]) -> u64 {
-    Calculator::calculate(CRC64_NVME.init, data, &CRC64_NVME) ^ CRC64_NVME.xorout
+    calculate!(Crc64Nvme, CRC64_NVME.init, data, &CRC64_NVME) ^ CRC64_NVME.xorout
 }
 
 /// Fallback version of get_calculator_target for unsupported architectures
@@ -1390,66 +1529,61 @@ fn try_get_calculator_params(
 #[allow(deprecated)]
 fn get_calculator_params(algorithm: CrcAlgorithm) -> (CalculatorFn, CrcParams) {
     match algorithm {
-        CrcAlgorithm::Crc16Arc => (Calculator::calculate as CalculatorFn, CRC16_ARC),
-        CrcAlgorithm::Crc16Cdma2000 => (Calculator::calculate as CalculatorFn, CRC16_CDMA2000),
-        CrcAlgorithm::Crc16Cms => (Calculator::calculate as CalculatorFn, CRC16_CMS),
-        CrcAlgorithm::Crc16Dds110 => (Calculator::calculate as CalculatorFn, CRC16_DDS_110),
-        CrcAlgorithm::Crc16DectR => (Calculator::calculate as CalculatorFn, CRC16_DECT_R),
-        CrcAlgorithm::Crc16DectX => (Calculator::calculate as CalculatorFn, CRC16_DECT_X),
-        CrcAlgorithm::Crc16Dnp => (Calculator::calculate as CalculatorFn, CRC16_DNP),
-        CrcAlgorithm::Crc16En13757 => (Calculator::calculate as CalculatorFn, CRC16_EN_13757),
-        CrcAlgorithm::Crc16Genibus => (Calculator::calculate as CalculatorFn, CRC16_GENIBUS),
-        CrcAlgorithm::Crc16Gsm => (Calculator::calculate as CalculatorFn, CRC16_GSM),
-        CrcAlgorithm::Crc16Ibm3740 => (Calculator::calculate as CalculatorFn, CRC16_IBM_3740),
-        CrcAlgorithm::Crc16IbmSdlc => (Calculator::calculate as CalculatorFn, CRC16_IBM_SDLC),
-        CrcAlgorithm::Crc16IsoIec144433A => (
-            Calculator::calculate as CalculatorFn,
-            CRC16_ISO_IEC_14443_3_A,
-        ),
-        CrcAlgorithm::Crc16Kermit => (Calculator::calculate as CalculatorFn, CRC16_KERMIT),
-        CrcAlgorithm::Crc16Lj1200 => (Calculator::calculate as CalculatorFn, CRC16_LJ1200),
-        CrcAlgorithm::Crc16M17 => (Calculator::calculate as CalculatorFn, CRC16_M17),
-        CrcAlgorithm::Crc16MaximDow => (Calculator::calculate as CalculatorFn, CRC16_MAXIM_DOW),
-        CrcAlgorithm::Crc16Mcrf4xx => (Calculator::calculate as CalculatorFn, CRC16_MCRF4XX),
-        CrcAlgorithm::Crc16Modbus => (Calculator::calculate as CalculatorFn, CRC16_MODBUS),
-        CrcAlgorithm::Crc16Nrsc5 => (Calculator::calculate as CalculatorFn, CRC16_NRSC_5),
-        CrcAlgorithm::Crc16OpensafetyA => {
-            (Calculator::calculate as CalculatorFn, CRC16_OPENSAFETY_A)
+        CrcAlgorithm::Crc16Arc => (calculator!(Crc16Arc), CRC16_ARC),
+        CrcAlgorithm::Crc16Cdma2000 => (calculator!(Crc16Cdma2000), CRC16_CDMA2000),
+        CrcAlgorithm::Crc16Cms => (calculator!(Crc16Cms), CRC16_CMS),
+        CrcAlgorithm::Crc16Dds110 => (calculator!(Crc16Dds110), CRC16_DDS_110),
+        CrcAlgorithm::Crc16DectR => (calculator!(Crc16DectR), CRC16_DECT_R),
+        CrcAlgorithm::Crc16DectX => (calculator!(Crc16DectX), CRC16_DECT_X),
+        CrcAlgorithm::Crc16Dnp => (calculator!(Crc16Dnp), CRC16_DNP),
+        CrcAlgorithm::Crc16En13757 => (calculator!(Crc16En13757), CRC16_EN_13757),
+        CrcAlgorithm::Crc16Genibus => (calculator!(Crc16Genibus), CRC16_GENIBUS),
+        CrcAlgorithm::Crc16Gsm => (calculator!(Crc16Gsm), CRC16_GSM),
+        CrcAlgorithm::Crc16Ibm3740 => (calculator!(Crc16Ibm3740), CRC16_IBM_3740),
+        CrcAlgorithm::Crc16IbmSdlc => (calculator!(Crc16IbmSdlc), CRC16_IBM_SDLC),
+        CrcAlgorithm::Crc16IsoIec144433A => {
+            (calculator!(Crc16IsoIec144433A), CRC16_ISO_IEC_14443_3_A)
         }
-        CrcAlgorithm::Crc16OpensafetyB => {
-            (Calculator::calculate as CalculatorFn, CRC16_OPENSAFETY_B)
-        }
-        CrcAlgorithm::Crc16Profibus => (Calculator::calculate as CalculatorFn, CRC16_PROFIBUS),
-        CrcAlgorithm::Crc16Riello => (Calculator::calculate as CalculatorFn, CRC16_RIELLO),
-        CrcAlgorithm::Crc16SpiFujitsu => (Calculator::calculate as CalculatorFn, CRC16_SPI_FUJITSU),
-        CrcAlgorithm::Crc16T10Dif => (Calculator::calculate as CalculatorFn, CRC16_T10_DIF),
-        CrcAlgorithm::Crc16Teledisk => (Calculator::calculate as CalculatorFn, CRC16_TELEDISK),
-        CrcAlgorithm::Crc16Tms37157 => (Calculator::calculate as CalculatorFn, CRC16_TMS37157),
-        CrcAlgorithm::Crc16Umts => (Calculator::calculate as CalculatorFn, CRC16_UMTS),
-        CrcAlgorithm::Crc16Usb => (Calculator::calculate as CalculatorFn, CRC16_USB),
-        CrcAlgorithm::Crc16Xmodem => (Calculator::calculate as CalculatorFn, CRC16_XMODEM),
-        CrcAlgorithm::Crc32Aixm => (Calculator::calculate as CalculatorFn, CRC32_AIXM),
-        CrcAlgorithm::Crc32Autosar => (Calculator::calculate as CalculatorFn, CRC32_AUTOSAR),
-        CrcAlgorithm::Crc32Base91D => (Calculator::calculate as CalculatorFn, CRC32_BASE91_D),
-        CrcAlgorithm::Crc32Bzip2 => (Calculator::calculate as CalculatorFn, CRC32_BZIP2),
-        CrcAlgorithm::Crc32CdRomEdc => (Calculator::calculate as CalculatorFn, CRC32_CD_ROM_EDC),
-        CrcAlgorithm::Crc32Cksum => (Calculator::calculate as CalculatorFn, CRC32_CKSUM),
+        CrcAlgorithm::Crc16Kermit => (calculator!(Crc16Kermit), CRC16_KERMIT),
+        CrcAlgorithm::Crc16Lj1200 => (calculator!(Crc16Lj1200), CRC16_LJ1200),
+        CrcAlgorithm::Crc16M17 => (calculator!(Crc16M17), CRC16_M17),
+        CrcAlgorithm::Crc16MaximDow => (calculator!(Crc16MaximDow), CRC16_MAXIM_DOW),
+        CrcAlgorithm::Crc16Mcrf4xx => (calculator!(Crc16Mcrf4xx), CRC16_MCRF4XX),
+        CrcAlgorithm::Crc16Modbus => (calculator!(Crc16Modbus), CRC16_MODBUS),
+        CrcAlgorithm::Crc16Nrsc5 => (calculator!(Crc16Nrsc5), CRC16_NRSC_5),
+        CrcAlgorithm::Crc16OpensafetyA => (calculator!(Crc16OpensafetyA), CRC16_OPENSAFETY_A),
+        CrcAlgorithm::Crc16OpensafetyB => (calculator!(Crc16OpensafetyB), CRC16_OPENSAFETY_B),
+        CrcAlgorithm::Crc16Profibus => (calculator!(Crc16Profibus), CRC16_PROFIBUS),
+        CrcAlgorithm::Crc16Riello => (calculator!(Crc16Riello), CRC16_RIELLO),
+        CrcAlgorithm::Crc16SpiFujitsu => (calculator!(Crc16SpiFujitsu), CRC16_SPI_FUJITSU),
+        CrcAlgorithm::Crc16T10Dif => (calculator!(Crc16T10Dif), CRC16_T10_DIF),
+        CrcAlgorithm::Crc16Teledisk => (calculator!(Crc16Teledisk), CRC16_TELEDISK),
+        CrcAlgorithm::Crc16Tms37157 => (calculator!(Crc16Tms37157), CRC16_TMS37157),
+        CrcAlgorithm::Crc16Umts => (calculator!(Crc16Umts), CRC16_UMTS),
+        CrcAlgorithm::Crc16Usb => (calculator!(Crc16Usb), CRC16_USB),
+        CrcAlgorithm::Crc16Xmodem => (calculator!(Crc16Xmodem), CRC16_XMODEM),
+        CrcAlgorithm::Crc32Aixm => (calculator!(Crc32Aixm), CRC32_AIXM),
+        CrcAlgorithm::Crc32Autosar => (calculator!(Crc32Autosar), CRC32_AUTOSAR),
+        CrcAlgorithm::Crc32Base91D => (calculator!(Crc32Base91D), CRC32_BASE91_D),
+        CrcAlgorithm::Crc32Bzip2 => (calculator!(Crc32Bzip2), CRC32_BZIP2),
+        CrcAlgorithm::Crc32CdRomEdc => (calculator!(Crc32CdRomEdc), CRC32_CD_ROM_EDC),
+        CrcAlgorithm::Crc32Cksum => (calculator!(Crc32Cksum), CRC32_CKSUM),
         CrcAlgorithm::Crc32Custom => missing_params(algorithm),
         CrcAlgorithm::Crc32Iscsi => (crc32_iscsi_calculator as CalculatorFn, CRC32_ISCSI),
         CrcAlgorithm::Crc32IsoHdlc => (crc32_iso_hdlc_calculator as CalculatorFn, CRC32_ISO_HDLC),
-        CrcAlgorithm::Crc32Jamcrc => (Calculator::calculate as CalculatorFn, CRC32_JAMCRC),
-        CrcAlgorithm::Crc32Mef => (Calculator::calculate as CalculatorFn, CRC32_MEF),
-        CrcAlgorithm::Crc32Mpeg2 => (Calculator::calculate as CalculatorFn, CRC32_MPEG_2),
-        CrcAlgorithm::Crc32Xfer => (Calculator::calculate as CalculatorFn, CRC32_XFER),
+        CrcAlgorithm::Crc32Jamcrc => (calculator!(Crc32Jamcrc), CRC32_JAMCRC),
+        CrcAlgorithm::Crc32Mef => (calculator!(Crc32Mef), CRC32_MEF),
+        CrcAlgorithm::Crc32Mpeg2 => (calculator!(Crc32Mpeg2), CRC32_MPEG_2),
+        CrcAlgorithm::Crc32Xfer => (calculator!(Crc32Xfer), CRC32_XFER),
         CrcAlgorithm::CrcCustom => missing_params(algorithm),
         CrcAlgorithm::Crc64Custom => missing_params(algorithm),
-        CrcAlgorithm::Crc64Ecma182 => (Calculator::calculate as CalculatorFn, CRC64_ECMA_182),
-        CrcAlgorithm::Crc64GoIso => (Calculator::calculate as CalculatorFn, CRC64_GO_ISO),
-        CrcAlgorithm::Crc64Ms => (Calculator::calculate as CalculatorFn, CRC64_MS),
-        CrcAlgorithm::Crc64Nvme => (Calculator::calculate as CalculatorFn, CRC64_NVME),
-        CrcAlgorithm::Crc64Redis => (Calculator::calculate as CalculatorFn, CRC64_REDIS),
-        CrcAlgorithm::Crc64We => (Calculator::calculate as CalculatorFn, CRC64_WE),
-        CrcAlgorithm::Crc64Xz => (Calculator::calculate as CalculatorFn, CRC64_XZ),
+        CrcAlgorithm::Crc64Ecma182 => (calculator!(Crc64Ecma182), CRC64_ECMA_182),
+        CrcAlgorithm::Crc64GoIso => (calculator!(Crc64GoIso), CRC64_GO_ISO),
+        CrcAlgorithm::Crc64Ms => (calculator!(Crc64Ms), CRC64_MS),
+        CrcAlgorithm::Crc64Nvme => (calculator!(Crc64Nvme), CRC64_NVME),
+        CrcAlgorithm::Crc64Redis => (calculator!(Crc64Redis), CRC64_REDIS),
+        CrcAlgorithm::Crc64We => (calculator!(Crc64We), CRC64_WE),
+        CrcAlgorithm::Crc64Xz => (calculator!(Crc64Xz), CRC64_XZ),
     }
 }
 
@@ -1459,18 +1593,27 @@ fn get_calculator_params(algorithm: CrcAlgorithm) -> (CalculatorFn, CrcParams) {
 /// Because both aarch64 and x86 have native hardware support for CRC-32/ISCSI, we can use
 /// fusion techniques to accelerate the calculation beyond what SIMD can do alone.
 #[inline(always)]
-fn crc32_iscsi_calculator(state: u64, data: &[u8], _params: &CrcParams) -> u64 {
+fn crc32_iscsi_calculator(state: u64, data: &[u8], params: &CrcParams) -> u64 {
+    crc32_iscsi_xorout::<0>(state, data, params) as u64
+}
+
+/// [`crc32_iscsi_calculator`] with `XOROUT` applied to the result: 0 for the calculator, which
+/// returns the state, and the algorithm's for [`crc32_iscsi`]. The fusion entry applies it on
+/// each of its arms, so that its call to the kernel is the last thing it does and needs no frame
+/// in the caller.
+#[inline(always)]
+fn crc32_iscsi_xorout<const XOROUT: u32>(state: u64, data: &[u8], _params: &CrcParams) -> u32 {
     // The kernel was chosen once, from the tier and the CPU's CRC32 instructions; a pinned
     // `CRC_TURBO_TIER` holds it to that tier's width.
     #[cfg(all(
         any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "x86"),
         feature = "std"
     ))]
-    if let Some(crc) = fusion::crc32_iscsi(state as u32, data) {
-        return crc as u64;
+    if let Some(crc) = fusion::crc32_iscsi::<XOROUT>(state as u32, data) {
+        return crc;
     }
 
-    Calculator::calculate(state, data, _params)
+    calculate!(Crc32Iscsi, state, data, _params) as u32 ^ XOROUT
 }
 
 /// Calculates the CRC-32/ISO-HDLC (commonly called "crc32" in many, but not all, implementations)
@@ -1482,11 +1625,20 @@ fn crc32_iscsi_calculator(state: u64, data: &[u8], _params: &CrcParams) -> u64 {
 #[inline(always)]
 fn crc32_iso_hdlc_calculator(state: u64, data: &[u8], _params: &CrcParams) -> u64 {
     #[cfg(all(target_arch = "aarch64", feature = "std"))]
-    if let Some(crc) = fusion::crc32_iso_hdlc(state as u32, data) {
+    if let Some(crc) = fusion::crc32_iso_hdlc::<0>(state as u32, data) {
         return crc as u64;
     }
 
-    Calculator::calculate(state, data, _params)
+    // x86 takes the tier's entry built for this algorithm's constants.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        arch::update_iso_hdlc(state as u32, data) as u64
+    }
+
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        calculate!(Crc32IsoHdlc, state, data, _params)
+    }
 }
 
 #[cfg(test)]

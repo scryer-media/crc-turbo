@@ -1,0 +1,26 @@
+[package]
+name = "crc-turbo-wasm-size"
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "A WebAssembly module using one crc-turbo algorithm, whose size CI checks"
+publish = false
+
+# Its own workspace, so its release profile is not the crate's.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+crc-turbo = { path = "..", default-features = false }
+
+# No LTO: a consumer's default release profile. The algorithm's own table is the one a module
+# should carry, not every algorithm's.
+[profile.release]
+opt-level = 3
+lto = false
+codegen-units = 1
+panic = "abort"
+strip = true

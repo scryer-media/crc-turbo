@@ -1,5 +1,6 @@
 /target
 /capi/target/
+/wasm-size/target/
 /target-*/
 /scratch
 /test/test_*.bin

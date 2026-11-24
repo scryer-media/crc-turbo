@@ -339,6 +339,19 @@ jobs:
         run: cargo build --locked --target ${{ matrix.target }} --no-default-features --features alloc,panic-handler --lib --release
       - name: WASM tests (on the host)
         run: cargo test --locked --test wasm_tests
+      # A module using one algorithm carries that algorithm's table, not all
+      # fifty, even without LTO: one 32 KiB table plus code. It was 718 KiB
+      # when every call linked every table.
+      - name: Module size, one algorithm, no LTO
+        if: matrix.target == 'wasm32-unknown-unknown'
+        working-directory: wasm-size
+        run: |
+          cargo build --locked --release --target wasm32-unknown-unknown
+          wasm=target/wasm32-unknown-unknown/release/crc_turbo_wasm_size.wasm
+          size=$(stat -c %s "$wasm")
+          echo "CRC-64/NVME module: $size bytes"
+          test "$size" -le 65536
+          node check.mjs "$wasm"
 
   # The test suite compiled for WebAssembly and run there: WASI 0.1 and 0.2
   # under wasmtime, Emscripten under Node. WebAssembly has no CRC instructions,
@@ -547,10 +560,49 @@ jobs:
         if: runner.os != 'Windows'
         run: make capi-test
 
+  # What the compiler made of the hot paths, against codegen/<target>.snap:
+  # exact on the pinned toolchain, and within the snapshot's margin as a
+  # dependent crate would build it and on the oldest supported compiler. The
+  # inline assembly has to be the same in all three.
+  codegen:
+    name: codegen-${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: x86_64
+            runner: ubuntu-26.04
+          - platform: aarch64
+            runner: ubuntu-26.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Read rust-version from the crate manifest
+        id: msrv
+        run: |
+          version="$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "MSRV=$version" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: The pinned build matches the snapshot
+        run: cargo xtask codegen check
+      - name: As a dependent crate builds it by default
+        run: cargo xtask codegen check --profile consumer
+      - name: The oldest supported compiler
+        run: cargo "+$MSRV" xtask codegen check
+
   ci-complete:
     name: ci-complete
     if: always()
-    needs: [hygiene, fmt, clippy, docs, test, test-x86-linux, test-x86-windows, test-software, miri, no-std, wasm, wasm-test, fuzz, msrv, package, capi]
+    needs: [hygiene, fmt, clippy, docs, test, test-x86-linux, test-x86-windows, test-software, miri, no-std, wasm, wasm-test, fuzz, msrv, package, capi, codegen]
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:

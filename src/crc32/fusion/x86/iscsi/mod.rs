@@ -7,5 +7,6 @@
 
 pub(crate) mod avx512_pclmulqdq;
 pub(crate) mod avx512_vpclmulqdq;
+pub(crate) mod avx512_vpclmulqdq_streams;
 pub(crate) mod sse_pclmulqdq;
 pub(crate) mod sse_pclmulqdq_far;
