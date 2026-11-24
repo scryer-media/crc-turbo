@@ -1475,6 +1475,26 @@ own changelog up to the fork point continues below, unchanged.
   it reads as CRC-32/ISCSI at 0.88x to 0.93x of 1.11.0 at 2 KiB aligned and
   at 8 and 16 KiB three bytes off; timed alone those are 0.99x, 0.98x and
   1.08x.
+- Open on Sapphire Rapids (Xeon 8488C): CRC-32/ISO-HDLC from an aligned
+  start is 0.90x to 0.99x of libdeflate 1.26 at lengths from 1100 to 3900
+  bytes that are not on the bench grid, and 0.95x at 2 KiB, while 1 KiB
+  and 4 KiB are level or ahead. Four things were tried there and changed
+  nothing: the four-accumulator loop in fast-crc32's `v4` instruction
+  order, as Ice Lake takes it, from 1 KiB and from 256 bytes; and
+  libdeflate's eight-accumulator loop, which this CPU takes from 4 KiB,
+  from 1 KiB and from 2 KiB. Each timed within 0.1% of the unchanged path
+  at almost every length, though running the fold twice halved the
+  throughput, so the fold is what is being timed. Timing this crate in
+  libdeflate's place in the bench order and libdeflate in this crate's,
+  and timing over 80 MiB in place of 4 MiB, did not move either. The cause
+  is not known.
+- Open on Sapphire Rapids: CRC-32/ISCSI from an aligned start at 192 to
+  272 bytes is 0.92x to 0.96x of fast-crc32's `sse_crc32c_v4`, which is
+  itself 0.75x to 0.95x of this crate from three bytes off. Handing over
+  from the CRC32 instruction loop to the vector kernel at 128 bytes in
+  place of 256 ran at 0.73x to 0.99x of the loop from 128 to 256 bytes,
+  and was not taken. In one run, 384 bytes aligned was 0.76x of
+  `avx512_vpclmulqdq_crc32c_v3x2` and 448 bytes three bytes off 0.90x.
 
 ## 1.11.0 - 2026-10-20
 
