@@ -9,7 +9,15 @@ pub(crate) mod consts;
 mod contract;
 pub(crate) mod enums;
 mod future_proof_tests;
+mod params_placement;
 mod structs;
+
+#[cfg(feature = "std")]
+std::thread_local! {
+    /// The address of the last `CrcParams` the accelerated calculator was handed on this thread,
+    /// for [`params_placement`].
+    pub(crate) static PARAMS_SEEN: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
 
 use proptest::test_runner::Config as ProptestConfig;
 

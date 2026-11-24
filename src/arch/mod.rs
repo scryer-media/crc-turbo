@@ -431,10 +431,11 @@ fn choose_iso_hdlc() -> (IsoHdlcChecksum, IsoHdlcUpdate) {
 #[cfg(all(feature = "std", target_arch = "x86_64"))]
 use crate::arch::iso_hdlc_mid_x86_sse_avx as iso_hdlc_mid_x86_64_avx2_ecore;
 
-/// The E-core parts' checksum entry: the tier's ladder in line, then the 128-bit fold for 256
-/// bytes to [`MID_END`] in place of the tier's mid fold, and the tier's long fold after that.
+/// The E-core parts' checksum entry: libdeflate's 128-bit shape in assembly from 16 bytes to
+/// [`x86_64::iso_hdlc_ecore::ASM_END`], then the 128-bit fold to [`MID_END`] in place of the
+/// tier's mid fold, and the tier's long fold after that.
 #[cfg(all(feature = "std", target_arch = "x86_64"))]
-use crate::arch::x86::short_asm::iso_hdlc_checksum_avx2_ecore as iso_hdlc_checksum_x86_64_avx2_ecore;
+use x86_64::iso_hdlc_ecore::iso_hdlc_checksum_ecore as iso_hdlc_checksum_x86_64_avx2_ecore;
 
 /// [`iso_hdlc_x86_64_avx2_vpclmulqdq`] on Intel's E-core parts: the same entry, with the
 /// 128-bit fold for 256 bytes to [`MID_END`].

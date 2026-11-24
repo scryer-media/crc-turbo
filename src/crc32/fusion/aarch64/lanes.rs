@@ -43,6 +43,39 @@ unsafe fn fold_pair(x: uint64x2_t, k: uint64x2_t, data: uint64x2_t) -> uint64x2_
     clmul_hi_and_xor(x, k, y)
 }
 
+/// [`fold_pair`] with each product and its EOR written as one adjacent pair in assembly, as
+/// fast-crc32's `v3s4x2e_v2` writes them (its `clmul_lo_e` and `clmul_hi_e`), on every target:
+/// the compiler's own schedule of [`fold_pair`] may move the EOR away from its product. The
+/// stream kernels' fold.
+#[inline]
+#[target_feature(enable = "aes")]
+unsafe fn fold_pair_adjacent(x: uint64x2_t, k: uint64x2_t, data: uint64x2_t) -> uint64x2_t {
+    let y: uint64x2_t;
+    let r: uint64x2_t;
+    // SAFETY: `pmull` and `pmull2` need the `aes` feature this function is compiled with; the
+    // pairs touch registers only
+    unsafe {
+        core::arch::asm!(
+            "pmull {y:v}.1q, {x:v}.1d, {k:v}.1d",
+            "eor {y:v}.16b, {y:v}.16b, {d:v}.16b",
+            y = out(vreg) y,
+            x = in(vreg) x,
+            k = in(vreg) k,
+            d = in(vreg) data,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+        core::arch::asm!(
+            "pmull2 {x:v}.1q, {x:v}.2d, {k:v}.2d",
+            "eor {x:v}.16b, {x:v}.16b, {y:v}.16b",
+            x = inout(vreg) x => r,
+            k = in(vreg) k,
+            y = in(vreg) y,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+    }
+    r
+}
+
 /// [`fold_pair`] with one EOR3 for the two products and the data.
 #[cfg(not(target_vendor = "apple"))]
 #[inline]
@@ -286,9 +319,9 @@ macro_rules! stream_kernel {
                 let word = |p: *const u8| (p as *const u64).read();
                 let k = load_key(&K_48);
                 for _ in 1..blk {
-                    x0 = fold_pair(x0, k, load(buf2));
-                    x1 = fold_pair(x1, k, load(buf2.add(16)));
-                    x2 = fold_pair(x2, k, load(buf2.add(32)));
+                    x0 = fold_pair_adjacent(x0, k, load(buf2));
+                    x1 = fold_pair_adjacent(x1, k, load(buf2.add(16)));
+                    x2 = fold_pair_adjacent(x2, k, load(buf2.add(32)));
                     crc0 = $crc_d(crc0, word(buf));
                     crc1 = $crc_d(crc1, word(buf.add(klen)));
                     crc2 = $crc_d(crc2, word(buf.add(2 * klen)));
@@ -302,8 +335,8 @@ macro_rules! stream_kernel {
                 }
 
                 let k = load_key(&K_16);
-                x0 = fold_pair(x0, k, x1);
-                x0 = fold_pair(x0, k, x2);
+                x0 = fold_pair_adjacent(x0, k, x1);
+                x0 = fold_pair_adjacent(x0, k, x2);
 
                 crc0 = $crc_d(crc0, word(buf));
                 crc1 = $crc_d(crc1, word(buf.add(klen)));

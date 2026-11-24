@@ -75,6 +75,8 @@ pub(crate) struct Calculator {}
 impl CrcCalculator for Calculator {
     #[inline(always)]
     fn calculate(state: u64, data: &[u8], params: &CrcParams) -> u64 {
+        #[cfg(all(test, feature = "std"))]
+        crate::test::PARAMS_SEEN.with(|seen| seen.set(params as *const CrcParams as usize));
         unsafe { arch::update(state, data, params) }
     }
 }

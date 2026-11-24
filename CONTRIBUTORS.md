@@ -53,3 +53,11 @@ author.
 - **cemeyer**: the reports that CRC-32/ISCSI ran feature detection on every
   call (crc-turbo#3) and that its SSE kernel fell well short of
   fast-crc32's on Sierra Forest, with the measurements (crc-turbo#4).
+
+## Code followed from other projects
+
+- **libdeflate**, by **Eric Biggers** (MIT,
+  <https://github.com/ebiggers/libdeflate>): the E-core CRC-32/ISO-HDLC
+  entry in `src/arch/x86_64/iso_hdlc_ecore.rs` follows the compiled code
+  of its `crc32_pclmul_avx` (1.19, the Ubuntu 24.04 package's build), and
+  carries its copyright and permission notice.

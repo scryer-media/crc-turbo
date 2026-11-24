@@ -1621,18 +1621,6 @@ iso_hdlc_checksum!(
     iso_hdlc_fold_x86_64_avx2_vpclmulqdq,
     crate::arch::x86_64::avx2_vpclmulqdq::X86_64Avx2VpclmulqdqOps::new()
 );
-// Intel's E-core parts: the same ladder, and the SSE tier's 128-bit fold from 256 bytes, see
-// `crate::arch::choose_iso_hdlc`
-#[cfg(all(feature = "std", target_arch = "x86_64"))]
-iso_hdlc_checksum!(
-    "avx2,vpclmulqdq,sse4.1,pclmulqdq",
-    avx,
-    w256,
-    iso_hdlc_checksum_avx2_ecore,
-    iso_hdlc_mid_x86_64_avx2_ecore,
-    iso_hdlc_fold_x86_64_avx2_vpclmulqdq,
-    crate::arch::x86_64::avx2_vpclmulqdq::X86_64Avx2VpclmulqdqOps::new()
-);
 // Sapphire Rapids: the 512-bit ladder, and the 512-bit cascade from 256 bytes, see
 // `crate::arch::choose_iso_hdlc`
 #[cfg(all(feature = "std", target_arch = "x86_64"))]

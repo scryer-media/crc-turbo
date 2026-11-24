@@ -8,5 +8,7 @@ pub mod avx2_vpclmulqdq;
 pub mod avx512;
 pub mod avx512_vpclmulqdq;
 #[cfg(feature = "std")]
+pub(crate) mod iso_hdlc_ecore;
+#[cfg(feature = "std")]
 pub(crate) mod iso_hdlc_fold512;
 pub(crate) mod iso_hdlc_xmm;

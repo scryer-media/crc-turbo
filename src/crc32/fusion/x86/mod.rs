@@ -1204,6 +1204,36 @@ mod tests {
         }
     }
 
+    /// CRC-32/ISO-HDLC's E-core entry on the `x86_64-avx2-vpclmulqdq` tier, libdeflate's
+    /// 128-bit shape in assembly, is chosen by [`CpuId::is_intel_ecore`]: the four E-core-only
+    /// models take it, and the hybrid parts, the same model numbers in another family and other
+    /// vendors keep the tier's entry.
+    #[test]
+    fn iso_hdlc_ecore_entry_selection() {
+        const INTEL: &[u8; 12] = b"GenuineIntel";
+        const AMD: &[u8; 12] = b"AuthenticAMD";
+        for model in [0xaf, 0xb6, 0xdd, 0xbe] {
+            assert!(cpu(INTEL, 6, model).is_intel_ecore(), "model {model:#x}");
+        }
+        let others = [
+            cpu(INTEL, 6, 0x97),
+            cpu(INTEL, 6, 0x9a),
+            cpu(INTEL, 6, 0xaa),
+            cpu(INTEL, 6, 0xb7),
+            cpu(INTEL, 6, 0xc6),
+            cpu(INTEL, 6, 0x8f),
+            cpu(INTEL, 6, 0xad),
+            cpu(INTEL, 6, 0x3c),
+            cpu(INTEL, 0xf, 0xaf),
+            cpu(INTEL, 0x13, 0x01),
+            cpu(AMD, 0x19, 0xaf),
+            cpu(AMD, 0x17, 0x31),
+        ];
+        for c in others {
+            assert!(!c.is_intel_ecore(), "{c:?}");
+        }
+    }
+
     /// CRC-32/ISO-HDLC's 512-bit cascade on the `x86_64-avx512-vpclmulqdq` tier is chosen by
     /// [`CpuId::is_sapphire_rapids`]: Sapphire Rapids and Emerald Rapids take it, and the CPUs
     /// on either side of them on the tier, Ice Lake servers, Granite Rapids and Zen 4 and 5,

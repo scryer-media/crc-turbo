@@ -127,6 +127,12 @@ own changelog up to the fork point continues below, unchanged.
   CRC-32/ISO-HDLC plan under the SHA3 tier: fast-crc32's `neon_eor3_*_v4`
   and `*_v8` shapes in assembly, finished by the CRC32 instruction. See
   1.11.1.
+- The built-in parameter sets `checksum` hands the kernels are aligned to
+  512 bytes, so none spans a page and no key load is split across two. See
+  1.11.1.
+- The aarch64 PMULL tier's stream kernel writes each carry-less product and
+  its XOR as one adjacent pair in assembly, as fast-crc32's `v3s4x2e_v2`
+  does, where crc-fast has no such kernel. See 1.11.1.
 
 ### digest 0.11
 
@@ -202,6 +208,10 @@ own changelog up to the fork point continues below, unchanged.
   fold in the AVX encoding, as libdeflate 1.19's `crc32_pclmul_avx` does
   on these parts, instead of this tier's 256-bit fold; crc-fast has the
   generic fold there.
+- On the same parts a CRC-32/ISO-HDLC `checksum` of 16 bytes up to 1 KiB
+  is inline assembly following the compiled code of libdeflate 1.19's
+  `crc32_pclmul_avx` (Eric Biggers, MIT; the file carries its notice).
+  crc-fast has the generic fold there.
 - On x86_64 CPUs with PCLMULQDQ and AVX but no VPCLMULQDQ, CRC-32/ISO-HDLC
   checksums of 16 bytes up to 1 KiB (up to 128 bytes on the
   `x86_64-avx512-pclmulqdq` tier) take the shape of libdeflate 1.19's
@@ -1220,13 +1230,58 @@ own changelog up to the fork point continues below, unchanged.
   | 2048 | 19.3 | 23.9 | 24.3 | 24.2 | 1.00 |
   | 4096 | 21.7 | 24.3 | 24.3 | 24.5 | 0.99 |
 
-  Open below 256 bytes: libdeflate leads at 16 and 32 bytes (0.86x) and
-  at 96, 128 and 192 bytes (0.92x to 0.96x). Its 16-to-63-byte shape, one
-  128-bit accumulator taking each block in turn, measured 1.00x at 16 and
-  1.04x at 32 bytes, but entered through a separate function ahead of the
-  ladder it cost 7% to 14% from 48 to 192 bytes, so it is not taken; the
-  ladder's own path for 64 to 255 bytes in 128-bit registers measured
-  behind the 256-bit ladder except at 128 bytes.
+  Below 256 bytes libdeflate led this entry at 16 and 32 bytes (0.86x) and
+  at 96, 128 and 192 bytes (0.92x to 0.96x); the next entry is the change
+  that closes those.
+- On Intel's E-core parts on the `x86_64-avx2-vpclmulqdq` tier, a
+  CRC-32/ISO-HDLC `checksum` of 16 bytes up to 1 KiB runs libdeflate's
+  `crc32_pclmul_avx` shape as inline assembly
+  (`src/arch/x86_64/iso_hdlc_ecore.rs`): one 128-bit accumulator taking
+  each 16-byte block below 64 bytes, four accumulators from 64 bytes folded
+  four onto two and two onto one, the last partial block through a shuffle
+  table, and one Barrett reduction. It follows the instructions gcc gives
+  libdeflate 1.19 (the Ubuntu 24.04 package's build; libdeflate is Eric
+  Biggers's, MIT, and the file carries its notice), with the 16-to-63-byte
+  block placed on the fall-through side of the length test. Its constants
+  are checked equal to the generated keys at compile time. These cores
+  have no micro-op cache and decode in clusters, and the same instructions
+  compiled from intrinsics, or the same assembly behind one more call,
+  measured 0.70x to 0.89x of libdeflate at 16 to 192 bytes. A forced test
+  checks the assembly against the software path at every length from 16
+  to 1023 bytes from four starts and two states, and the entry at every
+  length from 0 to 1100; swapping a fold coefficient fails it. Measured on a
+  Xeon 6731E (Sierra Forest) against 1.11.0 and libdeflate 1.19, two
+  batches on different cores, four link layouts each, interleaved rounds,
+  checksums compared first, GB/s, aligned:
+
+  | bytes | 1.11.0 | 1.11.1 | libdeflate | 1.11.1 / best library |
+  |---:|---:|---:|---:|---:|
+  | 16 | 0.9 | 4.5 | 3.5 | 1.09 |
+  | 32 | 1.5 | 8.2 | 6.2 | 1.23 |
+  | 48 | 2.0 | 11.0 | 9.9 | 1.11 |
+  | 64 | 2.5 | 11.6 | 11.6 | 1.00 |
+  | 80 | 2.9 | 13.0 | 13.0 | 1.00 |
+  | 96 | 3.2 | 15.6 | 14.7 | 1.06 |
+  | 112 | 3.6 | 16.0 | 15.6 | 1.03 |
+  | 128 | 4.1 | 17.9 | 16.6 | 1.08 |
+  | 192 | 4.3 | 20.0 | 20.5 | 0.97 to 0.99 |
+  | 256 | 7.4 | 21.4 | 20.6 | 1.03 to 1.04 |
+
+  Three bytes off alignment the ratios are 1.27, 1.21, 1.11, 1.00, 1.00,
+  1.07, 1.03, 1.11, 0.97 to 0.98 and 1.05; the best library at 16 bytes
+  aligned is fast-crc32's `v4`, elsewhere libdeflate. The same source
+  through `checksum` for all 50 algorithms at 19 sizes from 16 bytes to
+  1 MiB, both alignments, has no cell below 0.99x of 1.11.0 in both
+  batches (1900 cells). Open: 192 bytes, 0.97x to 0.99x of libdeflate
+  across four batches of two runs, the same instructions one or two cycles
+  a call behind. The timing of these short calls moves in whole cycles
+  with the code around the call: called from a loop over all 50
+  algorithms, the entry measured 0.84x of the previous shape at 16, 96 and
+  112 bytes and 1.12x to 1.15x at 64 and 128 bytes, at 3x or more of
+  1.11.0 everywhere. `Digest::update` keeps the path it had. Also open on
+  this CPU: CRC-32/ISCSI at 112 bytes from a 16-byte aligned start, 0.95x
+  of fast-crc32's `v4` called directly, the cost of reaching the same
+  kernel through the dispatch entry.
 - On Sapphire Rapids (Intel family 6, models 0x8f and 0xcf) on the
   `x86_64-avx512-vpclmulqdq` tier, CRC-32/ISO-HDLC from 256 bytes to 16 KiB
   takes a cascade of 512-bit folds, the shape of fast-crc32's
@@ -1302,6 +1357,38 @@ own changelog up to the fork point continues below, unchanged.
   pinned toolchain (exact), on the MSRV and under the profile a dependent
   crate gets by default, and weekly on beta and nightly as an early warning.
   It counts instructions and never times anything.
+
+- The parameter set `checksum` hands the kernels for a built-in algorithm
+  now never spans a page boundary. The linker packed the 272-byte constants
+  8-byte aligned one after another, so in any build one of them could sit
+  across a page, and each key pair the fold read from its far side was a
+  load split across two pages. On an Apple M5 Max (16 KiB pages) it was
+  CRC-64/MS in one build, at 0.35x to 0.49x of 1.11.0's speed from 64 to
+  192 bytes while CRC-64/XZ ran the same code at full speed. Each is now
+  kept in a copy aligned to 512 bytes. Measured against 1.11.0 on the
+  M5 Max, all 50 algorithms through `checksum` at 19 sizes from 16 bytes to
+  1 MiB, aligned and 3 bytes off, median of seven interleaved rounds, two
+  runs, checksums compared first: no cell below 0.99x; CRC-64/MS at 64, 112
+  and 192 bytes is 1.64x, 1.68x and 2.08x (10.6, 16.0, 23.9 to 17.4, 26.9,
+  49.6 GB/s). A test checks the address `checksum` passes for every
+  algorithm.
+  Open on the M5 Max against fast-crc32's eight-lane kernels: CRC-32/ISCSI
+  and CRC-32/ISO-HDLC at 256 bytes aligned (0.91x to 0.97x; the loop is
+  the same instruction for instruction and the difference is one cycle a
+  call) and at exactly 2 KiB aligned (0.93x), where the large kernel
+  leaves a 128-byte tail. Running `neon_crc32_v8` from 2 KiB to 4 KiB
+  instead measured 1.03x at 2048 bytes and 0.80x to 0.93x at ten other
+  lengths from 2200 to 4095 bytes, so it is not taken.
+
+- The stream kernel of the aarch64 PMULL tier (Graviton2) folds with each
+  PMULL and its EOR written as one adjacent pair in assembly, the way
+  fast-crc32's `neon_*_v3s4x2e_v2` writes them (Corsix, MIT); from
+  intrinsics the compiler was free to schedule the EOR away from its
+  product. On a Graviton2 (c6g.large), one run of six interleaved rounds,
+  checksums compared first, at 1 MiB: CRC-32/ISCSI 1.05x of
+  `neon_crc32c_v3s4x2e_v2` aligned and 1.03x 3 bytes off, CRC-32/ISO-HDLC
+  1.03x of `neon_crc32_v3s4x2e_v2` both ways, and 1.75x to 1.77x of 1.11.0.
+  Graviton3 and Graviton4 do not run this kernel and measured unchanged.
 
 ## 1.11.0 - 2026-10-20
 

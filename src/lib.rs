@@ -465,8 +465,31 @@ macro_rules! calculator {
     }};
 }
 
-/// Runs a built-in algorithm's calculator; see [`calculator!`].
+/// A built-in parameter set where the kernels read it: aligned to a power of two no smaller
+/// than itself, so it never spans a page boundary and no load from it is split across two
+/// pages. Left to the linker, the statics are packed 8-byte aligned one after another, and the
+/// one that lands across a page takes a split load on every key pair the fold reads from the far
+/// side. On an Apple M5 Max (16 KiB pages) that was CRC-64/MS in one build: 3.7 GB/s at 64
+/// bytes and 11.7 at 192, against 17 and 48 for CRC-64/XZ, with the same code running.
+#[repr(align(512))]
+struct PageSafeParams(CrcParams);
+
+const _: () = assert!(size_of::<CrcParams>() <= align_of::<PageSafeParams>());
+
+/// The `&'static CrcParams` the kernels get for a built-in constant; see [`PageSafeParams`].
+macro_rules! page_safe {
+    ($params:path) => {{
+        static PARAMS: PageSafeParams = PageSafeParams($params);
+        &PARAMS.0
+    }};
+}
+
+/// Runs a built-in algorithm's calculator; see [`calculator!`]. A built-in constant, written
+/// `&CONST`, is handed over from a [`page_safe!`] copy.
 macro_rules! calculate {
+    ($alg:ident, $state:expr, $data:expr, & $params:path $(,)?) => {
+        calculate!($alg, $state, $data, page_safe!($params))
+    };
     ($alg:ident, $state:expr, $data:expr, $params:expr $(,)?) => {{
         #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
         let crc = Calculator::calculate($state, $data, $params);
@@ -1035,12 +1058,13 @@ fn checksum_by_table(algorithm: CrcAlgorithm, buf: &[u8]) -> u64 {
             calculate!(Crc32Cksum, CRC32_CKSUM.init, buf, &CRC32_CKSUM) ^ CRC32_CKSUM.xorout
         }
         CrcAlgorithm::Crc32Custom => missing_params(algorithm),
-        CrcAlgorithm::Crc32Iscsi => {
-            crc32_iscsi_xorout::<{ CRC32_ISCSI.xorout as u32 }>(CRC32_ISCSI.init, buf, &CRC32_ISCSI)
-                as u64
-        }
+        CrcAlgorithm::Crc32Iscsi => crc32_iscsi_xorout::<{ CRC32_ISCSI.xorout as u32 }>(
+            CRC32_ISCSI.init,
+            buf,
+            page_safe!(CRC32_ISCSI),
+        ) as u64,
         CrcAlgorithm::Crc32IsoHdlc => {
-            crc32_iso_hdlc_calculator(CRC32_ISO_HDLC.init, buf, &CRC32_ISO_HDLC)
+            crc32_iso_hdlc_calculator(CRC32_ISO_HDLC.init, buf, page_safe!(CRC32_ISO_HDLC))
                 ^ CRC32_ISO_HDLC.xorout
         }
         CrcAlgorithm::Crc32Jamcrc => {
@@ -1374,7 +1398,11 @@ pub fn get_calculator_target(_algorithm: CrcAlgorithm) -> String {
 /// ```
 #[inline(always)]
 pub fn crc32_iscsi(data: &[u8]) -> u32 {
-    crc32_iscsi_xorout::<{ CRC32_ISCSI.xorout as u32 }>(CRC32_ISCSI.init, data, &CRC32_ISCSI)
+    crc32_iscsi_xorout::<{ CRC32_ISCSI.xorout as u32 }>(
+        CRC32_ISCSI.init,
+        data,
+        page_safe!(CRC32_ISCSI),
+    )
 }
 
 /// Calculates the CRC-32/ISO-HDLC checksum (commonly called "crc32" in many, but not all,
@@ -1411,7 +1439,7 @@ pub fn crc32_iso_hdlc(data: &[u8]) -> u32 {
 
     #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
     {
-        crc32_iso_hdlc_calculator(CRC32_ISO_HDLC.init, data, &CRC32_ISO_HDLC) as u32
+        crc32_iso_hdlc_calculator(CRC32_ISO_HDLC.init, data, page_safe!(CRC32_ISO_HDLC)) as u32
             ^ CRC32_ISO_HDLC.xorout as u32
     }
 }
