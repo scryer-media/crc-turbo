@@ -1495,6 +1495,37 @@ own changelog up to the fork point continues below, unchanged.
   place of 256 ran at 0.73x to 0.99x of the loop from 128 to 256 bytes,
   and was not taken. In one run, 384 bytes aligned was 0.76x of
   `avx512_vpclmulqdq_crc32c_v3x2` and 448 bytes three bytes off 0.90x.
+- Four faults in this release's own unreleased changes, found by the
+  first CI run of the whole branch and fixed before publishing. None gave
+  a wrong checksum.
+  - The crate did not build for `x86_64-pc-windows-msvc`. The
+    Ice Lake CRC-32/ISO-HDLC loop is inline assembly with four scratch
+    `zmm` operands written `out(zmm_reg) _`; an operand with no type that
+    the allocator places in `zmm16` to `zmm31` is printed as a register
+    name that does not assemble, and on Windows, where `xmm6` to `xmm15`
+    are callee-saved, that is where two of them went. They are typed
+    outputs now. The Linux builds never placed them there, and the code
+    generation snapshot for both Linux targets is unchanged.
+  - An unoptimized build needed 1.7 MiB of stack for one checksum on
+    aarch64 and 1.2 MiB on x86_64, against 67 KiB and 87 KiB in 1.11.0, and
+    overflowed the 1 MiB main thread of a Windows process: the CLI and a
+    doctest crashed on `i686-pc-windows-msvc` and `aarch64-pc-windows-msvc`.
+    The kernels' size classes are `#[inline(always)]`, and without
+    optimization every temporary of every one, in each width and bit
+    order's copy, had its own slot in a single frame. Built with
+    `debug_assertions` they now stay out of line, which takes it to 51 KiB
+    and 63 KiB; optimized builds inline them as before and needed 7 KiB
+    throughout. A new test runs every algorithm, over the lengths that
+    reach each kernel, on a thread with a 256 KiB stack.
+  - The crate did not build with Rust 1.89, its minimum: `__cpuid` is an
+    unsafe function there, and the CPU identification added for the
+    per-CPU kernels called it as the safe function it is in current
+    compilers.
+  - A test added with the per-CPU kernels compared two casts of one
+    function to a pointer, which are equal in a compiled build and not
+    under Miri, and failed the Miri lane. The comparison is skipped
+    there; the rest of that test and of the suite runs under Miri as
+    before.
 
 ## 1.11.0 - 2026-10-20
 

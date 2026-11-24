@@ -137,6 +137,10 @@ unsafe fn v4_loop(v: [__m512i; 4], p: *const u8, rest: usize) -> ([__m512i; 4], 
     {
         let [mut v0, mut v1, mut v2, mut v3] = v;
         let (mut p, mut rest) = (p, rest);
+        // The four low products are scratch, but are typed outputs rather than `out(..) _`: an
+        // untyped operand that the allocator places in zmm16-zmm31, as it does on Windows where
+        // xmm6-xmm15 are callee-saved, is printed as a register that does not assemble.
+        let (y0, y1, y2, y3): (__m512i, __m512i, __m512i, __m512i);
         // SAFETY: each step reads the 256 bytes at `p`, and runs only while `rest`, the bytes
         // readable from `p`, is at least 256.
         core::arch::asm!(
@@ -148,19 +152,19 @@ unsafe fn v4_loop(v: [__m512i; 4], p: *const u8, rest: usize) -> ([__m512i; 4], 
             "and {n}, 255",
             ".p2align 4",
             "2:",
-            "vpclmulqdq {y0}, {v0}, {k}, 0x00",
+            "vpclmulqdq {y0:z}, {v0:z}, {k:z}, 0x00",
             "add {p}, 256",
-            "vpclmulqdq {y1}, {v1}, {k}, 0x00",
-            "vpclmulqdq {y2}, {v2}, {k}, 0x00",
-            "vpclmulqdq {y3}, {v3}, {k}, 0x00",
-            "vpclmulqdq {v0}, {v0}, {k}, 0x11",
-            "vpclmulqdq {v1}, {v1}, {k}, 0x11",
-            "vpclmulqdq {v2}, {v2}, {k}, 0x11",
-            "vpclmulqdq {v3}, {v3}, {k}, 0x11",
-            "vpternlogq {v0}, {y0}, zmmword ptr [{p} - 256], 0x96",
-            "vpternlogq {v1}, {y1}, zmmword ptr [{p} - 192], 0x96",
-            "vpternlogq {v2}, {y2}, zmmword ptr [{p} - 128], 0x96",
-            "vpternlogq {v3}, {y3}, zmmword ptr [{p} - 64], 0x96",
+            "vpclmulqdq {y1:z}, {v1:z}, {k:z}, 0x00",
+            "vpclmulqdq {y2:z}, {v2:z}, {k:z}, 0x00",
+            "vpclmulqdq {y3:z}, {v3:z}, {k:z}, 0x00",
+            "vpclmulqdq {v0:z}, {v0:z}, {k:z}, 0x11",
+            "vpclmulqdq {v1:z}, {v1:z}, {k:z}, 0x11",
+            "vpclmulqdq {v2:z}, {v2:z}, {k:z}, 0x11",
+            "vpclmulqdq {v3:z}, {v3:z}, {k:z}, 0x11",
+            "vpternlogq {v0:z}, {y0:z}, zmmword ptr [{p} - 256], 0x96",
+            "vpternlogq {v1:z}, {y1:z}, zmmword ptr [{p} - 192], 0x96",
+            "vpternlogq {v2:z}, {y2:z}, zmmword ptr [{p} - 128], 0x96",
+            "vpternlogq {v3:z}, {y3:z}, zmmword ptr [{p} - 64], 0x96",
             "cmp {p}, {e}",
             "jne 2b",
             "3:",
@@ -168,16 +172,17 @@ unsafe fn v4_loop(v: [__m512i; 4], p: *const u8, rest: usize) -> ([__m512i; 4], 
             v1 = inout(zmm_reg) v1,
             v2 = inout(zmm_reg) v2,
             v3 = inout(zmm_reg) v3,
-            y0 = out(zmm_reg) _,
-            y1 = out(zmm_reg) _,
-            y2 = out(zmm_reg) _,
-            y3 = out(zmm_reg) _,
+            y0 = out(zmm_reg) y0,
+            y1 = out(zmm_reg) y1,
+            y2 = out(zmm_reg) y2,
+            y3 = out(zmm_reg) y3,
             k = in(zmm_reg) k,
             p = inout(reg) p,
             n = inout(reg) rest,
             e = out(reg) _,
             options(pure, readonly, nostack),
         );
+        let _ = (y0, y1, y2, y3);
         ([v0, v1, v2, v3], p, rest)
     }
 }

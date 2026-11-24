@@ -239,7 +239,11 @@ pub(crate) struct CpuId {
 impl CpuId {
     /// This CPU, from CPUID leaves 0 and 1.
     pub(crate) fn detect() -> Self {
-        let (vendor_leaf, version) = (__cpuid(0), __cpuid(1));
+        // SAFETY: CPUID is present on every CPU of the targets this crate builds for, x86_64
+        // and 32-bit x86 from the Pentium, which is why current compilers declare `__cpuid`
+        // safe. Rust 1.89, the minimum, still declares it unsafe.
+        #[allow(unused_unsafe)]
+        let (vendor_leaf, version) = unsafe { (__cpuid(0), __cpuid(1)) };
 
         let mut vendor = [0u8; 12];
         vendor[..4].copy_from_slice(&vendor_leaf.ebx.to_le_bytes());
@@ -1631,7 +1635,10 @@ mod tests {
                     }
                 }
             }
-            // The E-cores' window is the dispatch entry's, and their plan's kernel the default
+            // The E-cores' window is the dispatch entry's, and their plan's kernel the default.
+            // Which function a plan names is compared by address, here and below; Miri gives
+            // each cast of a function to a pointer its own address, so not there.
+            #[cfg(not(miri))]
             if v4_end != 0 {
                 assert_eq!(
                     iscsi_plan(kernel, tier, id).kernel as usize,
@@ -1642,6 +1649,7 @@ mod tests {
             if mid_max != 0 && v4_end == 0 {
                 let plan = iscsi_plan(kernel, tier, id);
                 assert!(plan.direct_max < mid_max, "{id:?} {kernel:?}");
+                #[cfg(not(miri))]
                 assert_ne!(
                     plan.kernel as usize,
                     iscsi_kernel_fn(kernel) as usize,

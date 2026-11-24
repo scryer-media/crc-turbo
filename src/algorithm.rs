@@ -74,12 +74,19 @@ where
     update_with::<T, W, false>(state, bytes, params, ops)
 }
 
+// The functions below that carry `inline(always)` only without `debug_assertions` are the
+// kernels' size classes. Optimized, they inline into the tier's function as before. Unoptimized
+// they stay out of line: inlined, every temporary of every one of them, in each width and bit
+// order's copy, had its own slot in one frame, 1.7 MiB of stack on aarch64 against 67 KiB in
+// 1.11.0, and a debug build overflowed a Windows main thread. `test::stack_use` holds that.
+
 /// [`update`], on x86 with `ALIGN_HEAD` choosing whether a buffer of `X86_ALIGN_MIN` bytes or
 /// more is first taken to a 64-byte boundary. Only a tier whose fold loads 64 bytes at a time
 /// asks for it: on the tiers with 16- and 32-byte loads it measured no faster at 64 KiB and
 /// 1 MiB from an unaligned start on a Xeon E5-2666 v3, an EPYC 7R32, an EPYC 7R13 and a Xeon
 /// 8275CL, and it made those tiers' folds larger.
-#[inline(always)]
+#[cfg_attr(not(debug_assertions), inline(always))]
+#[cfg_attr(debug_assertions, inline(never))]
 pub(crate) unsafe fn update_with<T: ArchOps, W: EnhancedCrcWidth, const ALIGN_HEAD: bool>(
     state: W::Value,
     bytes: &[u8],
@@ -167,7 +174,8 @@ where
 /// # Safety
 ///
 /// `bytes` must be shorter than 128 bytes.
-#[inline(always)]
+#[cfg_attr(not(debug_assertions), inline(always))]
+#[cfg_attr(debug_assertions, inline(never))]
 pub(crate) unsafe fn update_short<T: ArchOps, W: EnhancedCrcWidth>(
     state: W::Value,
     bytes: &[u8],
@@ -212,7 +220,8 @@ where
 /// # Safety
 ///
 /// `bytes` must be at least 128 bytes long.
-#[inline(always)]
+#[cfg_attr(not(debug_assertions), inline(always))]
+#[cfg_attr(debug_assertions, inline(never))]
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub(crate) unsafe fn update_mid<T: ArchOps, W: EnhancedCrcWidth, const OPAQUE_KEYS: bool>(
     state: W::Value,
@@ -250,7 +259,8 @@ where
 /// # Safety
 ///
 /// `bytes` must be shorter than 128 bytes.
-#[inline(always)]
+#[cfg_attr(not(debug_assertions), inline(always))]
+#[cfg_attr(debug_assertions, inline(never))]
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub(crate) unsafe fn update_short_ladder<T: ArchOps, W: EnhancedCrcWidth>(
     state: W::Value,
@@ -397,7 +407,8 @@ const X86_ALIGN_MIN: usize = 64 << 10;
 /// # Safety
 ///
 /// `data` must be at least 128 bytes long.
-#[inline(always)]
+#[cfg_attr(not(debug_assertions), inline(always))]
+#[cfg_attr(debug_assertions, inline(never))]
 unsafe fn process_unaligned<T: ArchOps, W: EnhancedCrcWidth>(
     data: &[u8],
     state: &CrcState<T::Vector>,
@@ -487,7 +498,8 @@ where
 /// # Safety
 ///
 /// `ptr` must be valid for reads of `blocks * 16` bytes.
-#[inline(always)]
+#[cfg_attr(not(debug_assertions), inline(always))]
+#[cfg_attr(debug_assertions, inline(never))]
 #[allow(clippy::too_many_arguments)]
 unsafe fn fold_tail_blocks<T: ArchOps, W: EnhancedCrcWidth>(
     res: T::Vector,
@@ -574,7 +586,8 @@ where
 
 /// [`process_unaligned`]'s 128-bit fold: eight 16-byte lanes over each whole 128-byte chunk of
 /// `data`, folded into one. Returns that and the bytes it covered.
-#[inline(always)]
+#[cfg_attr(not(debug_assertions), inline(always))]
+#[cfg_attr(debug_assertions, inline(never))]
 unsafe fn fold_lanes<T: ArchOps, W: EnhancedCrcWidth>(
     data: &[u8],
     state: &CrcState<T::Vector>,
@@ -657,7 +670,8 @@ where
 }
 
 /// Process data with the selected strategy
-#[inline(always)]
+#[cfg_attr(not(debug_assertions), inline(always))]
+#[cfg_attr(debug_assertions, inline(never))]
 unsafe fn process_by_strategy<T: ArchOps, W: EnhancedCrcWidth>(
     strategy: DataChunkProcessor,
     data: &[u8],
@@ -689,7 +703,8 @@ where
 }
 
 /// Process large inputs with proper SIMD alignment
-#[inline(always)]
+#[cfg_attr(not(debug_assertions), inline(always))]
+#[cfg_attr(debug_assertions, inline(never))]
 unsafe fn process_large_aligned<T: ArchOps, W: EnhancedCrcWidth>(
     bytes: &[u8],
     state: &mut CrcState<T::Vector>,
@@ -737,7 +752,8 @@ where
 }
 
 /// Process SIMD-aligned chunks of 128 bytes
-#[inline(always)]
+#[cfg_attr(not(debug_assertions), inline(always))]
+#[cfg_attr(debug_assertions, inline(never))]
 unsafe fn process_simd_chunks<T: ArchOps, W: EnhancedCrcWidth>(
     state: &mut CrcState<T::Vector>,
     first: &[T::Vector; 8],
@@ -813,7 +829,8 @@ unsafe fn process_simd_chunks<T: ArchOps, W: EnhancedCrcWidth>(
 }
 
 /// Process exactly 16 bytes
-#[inline(always)]
+#[cfg_attr(not(debug_assertions), inline(always))]
+#[cfg_attr(debug_assertions, inline(never))]
 unsafe fn process_exactly_16<T: ArchOps, W: EnhancedCrcWidth>(
     data: &[u8],
     state: &mut CrcState<T::Vector>,
@@ -893,7 +910,8 @@ where
 
 /// Process inputs between 17 and 31 bytes
 /// This implementation works for both CRC-32 and CRC-64 using the width-specific traits
-#[inline(always)]
+#[cfg_attr(not(debug_assertions), inline(always))]
+#[cfg_attr(debug_assertions, inline(never))]
 unsafe fn process_17_to_31<T: ArchOps, W: EnhancedCrcWidth>(
     data: &[u8],
     state: &mut CrcState<T::Vector>,
@@ -942,7 +960,8 @@ where
 /// # Safety
 ///
 /// `data` must be readable for `blocks * 16` bytes, and `blocks` at least 2.
-#[inline(always)]
+#[cfg_attr(not(debug_assertions), inline(always))]
+#[cfg_attr(debug_assertions, inline(never))]
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 unsafe fn fold_blocks_onto_last<T: ArchOps, W: EnhancedCrcWidth>(
     blocks: usize,
@@ -994,7 +1013,8 @@ where
 
 // Process inputs between 32 and 255 bytes
 /// This implementation works for both CRC-32 and CRC-64 using the width-specific traits
-#[inline(always)]
+#[cfg_attr(not(debug_assertions), inline(always))]
+#[cfg_attr(debug_assertions, inline(never))]
 unsafe fn process_32_to_255<T: ArchOps, W: EnhancedCrcWidth>(
     data: &[u8],
     state: &mut CrcState<T::Vector>,

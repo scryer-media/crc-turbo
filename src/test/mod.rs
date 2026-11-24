@@ -10,6 +10,7 @@ mod contract;
 pub(crate) mod enums;
 mod future_proof_tests;
 mod params_placement;
+mod stack_use;
 mod structs;
 
 #[cfg(feature = "std")]
