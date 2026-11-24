@@ -202,6 +202,14 @@ impl ArchOps for Aarch64AesSha3Ops {
     ) -> Self::Vector {
         // SHA3 tier always uses EOR3 instruction
         // Feature detection is handled at the dispatch level
-        veor3q_u8(a, b, c)
+        #[cfg(not(miri))]
+        {
+            veor3q_u8(a, b, c)
+        }
+        // Miri does not implement EOR3; two EORs give the same value
+        #[cfg(miri)]
+        {
+            veorq_u8(veorq_u8(a, b), c)
+        }
     }
 }

@@ -261,10 +261,32 @@ jobs:
       - name: Test
         run: cross test --locked --all-features --target ${{ matrix.target }} --no-fail-fast
 
+  # Miri interprets the suite and checks every load, pointer and reference
+  # against the allocation it came from. It runs no inline assembly, so each
+  # assembly kernel has a compiled path that is built under `cfg(miri)`.
+  #
+  # The aarch64 lane is interpreted on the x86_64 runner. Miri's aarch64 CPU
+  # reports no features and its isolation hides the files run-time detection
+  # reads, so the features are enabled at build time, which is where
+  # `is_aarch64_feature_detected!` looks first. Miri has no EOR3, so under
+  # `cfg(miri)` the SHA3 kernels take two EORs in its place.
   miri:
-    name: miri-x86_64
+    name: miri-${{ matrix.platform }}
     runs-on: ubuntu-26.04
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: x86_64
+            target: x86_64-unknown-linux-gnu
+            rustflags: ""
+          - platform: aarch64
+            target: aarch64-unknown-linux-gnu
+            rustflags: "-C target-feature=+crc,+aes,+sha3"
+    env:
+      TARGET: ${{ matrix.target }}
+      RUSTFLAGS: ${{ matrix.rustflags }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -277,9 +299,9 @@ jobs:
         with:
           tool: cargo-nextest@0.9.143
       - name: Set up Miri
-        run: cargo "+$NIGHTLY_TOOLCHAIN" miri setup
+        run: cargo "+$NIGHTLY_TOOLCHAIN" miri setup --target "$TARGET"
       - name: Miri
-        run: cargo "+$NIGHTLY_TOOLCHAIN" miri nextest run --locked --all-features -j "$(nproc)"
+        run: cargo "+$NIGHTLY_TOOLCHAIN" miri nextest run --locked --all-features --target "$TARGET" -j "$(nproc)"
 
   no-std:
     name: no-std-${{ matrix.target }}
@@ -574,8 +596,22 @@ jobs:
         include:
           - platform: x86_64
             runner: ubuntu-26.04
+            target: x86_64-unknown-linux-gnu
           - platform: aarch64
             runner: ubuntu-26.04-arm
+            target: aarch64-unknown-linux-gnu
+          # The Windows listings are cross-built: emitting assembly for a
+          # library needs the target's standard library and no linker. Windows
+          # keeps xmm6 to xmm15 across a call, so the code around the assembly
+          # differs from Linux's and has its own snapshot.
+          - platform: x86_64-windows
+            runner: ubuntu-26.04
+            target: x86_64-pc-windows-msvc
+          - platform: aarch64-windows
+            runner: ubuntu-26.04
+            target: aarch64-pc-windows-msvc
+    env:
+      TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -589,15 +625,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
+          targets: ${{ matrix.target }}
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
       - name: The pinned build matches the snapshot
-        run: cargo xtask codegen check
+        run: cargo xtask codegen check --target "$TARGET"
       - name: As a dependent crate builds it by default
-        run: cargo xtask codegen check --profile consumer
+        run: cargo xtask codegen check --target "$TARGET" --profile consumer
       - name: The oldest supported compiler
-        run: cargo "+$MSRV" xtask codegen check
+        run: cargo "+$MSRV" xtask codegen check --target "$TARGET"
 
   ci-complete:
     name: ci-complete

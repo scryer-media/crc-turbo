@@ -16,6 +16,10 @@
 //! toolchain or profile they may not grow past a small margin: that is the
 //! early warning that a compiler has started treating the glue differently.
 //! Nothing here measures time.
+//!
+//! `check` first reads the crate's own source for an `asm!` operand the
+//! compiler cannot be trusted with, whatever the target: see
+//! [`untyped_zmm_scratch`].
 
 use std::{
     collections::BTreeMap,
@@ -91,6 +95,9 @@ pub fn codegen(mut args: impl Iterator<Item = String>) -> ExitCode {
     let pinned = on_pinned_toolchain(&root);
     match task.as_deref() {
         Some("check") => {
+            if !source_rules_hold(&root) {
+                return ExitCode::FAILURE;
+            }
             let Some(found) = build_and_measure(&root, &target, &profile, &snap_text) else {
                 return ExitCode::FAILURE;
             };
@@ -113,6 +120,85 @@ pub fn codegen(mut args: impl Iterator<Item = String>) -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// The 1-based lines of `text` that declare a `zmm_reg` scratch operand with
+/// no type: `out(zmm_reg) _` or `lateout(zmm_reg) _`.
+///
+/// rustc prints such an operand as a register name that does not assemble
+/// when the allocator places it in `zmm16` to `zmm31`, and a `:z` modifier
+/// does not help. Where it is placed is the allocator's choice, so a build
+/// that passes shows only that this compiler, for this target, did not choose
+/// one of them: 1.11.1 built for Linux and not for Windows, where `xmm6` to
+/// `xmm15` are callee-saved and the upper registers are taken first. A typed
+/// output (`out(zmm_reg) y`, with `y: __m512i` dropped afterwards) assembles
+/// wherever it is placed. `xmm_reg` and `ymm_reg` operands are never placed
+/// above register 15, so they are not held to this.
+fn untyped_zmm_scratch(text: &str) -> Vec<usize> {
+    // Comments may name the form; whitespace and line breaks may split it.
+    let mut code = String::new();
+    let mut line_of = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let line = line.split("//").next().unwrap_or_default();
+        for c in line.chars().filter(|c| !c.is_whitespace()) {
+            code.push(c);
+            line_of.push(index + 1);
+        }
+    }
+    const FORM: &str = "out(zmm_reg)_";
+    let mut lines = Vec::new();
+    let mut from = 0;
+    while let Some(at) = code[from..].find(FORM) {
+        let at = from + at;
+        from = at + FORM.len();
+        // `_` alone is the discard; `_scratch` names a variable.
+        let named = code[from..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        if !named {
+            lines.push(line_of[at]);
+        }
+    }
+    lines
+}
+
+/// Runs the source rules over every file under `src/`, printing each breach.
+fn source_rules_hold(root: &Path) -> bool {
+    let mut files = Vec::new();
+    let mut dirs = vec![root.join("src")];
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            eprintln!("xtask codegen: cannot read {}", dir.display());
+            return false;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    let mut ok = true;
+    for path in files {
+        let Ok(text) = fs::read_to_string(&path) else {
+            eprintln!("xtask codegen: cannot read {}", path.display());
+            return false;
+        };
+        for line in untyped_zmm_scratch(&text) {
+            let shown = path.strip_prefix(root).unwrap_or(&path);
+            eprintln!(
+                "xtask codegen: {}:{line}: a `zmm_reg` scratch operand with no type does not \
+                 assemble when it is placed in zmm16-zmm31; make it a typed output",
+                shown.display()
+            );
+            ok = false;
+        }
+    }
+    ok
 }
 
 fn host_triple() -> Option<String> {
@@ -289,7 +375,14 @@ fn measure(listing: &str, paths: &[String]) -> BTreeMap<String, Vec<Shape>> {
             continue;
         }
         let (_, shape) = current.as_mut().expect("checked above");
-        if line.starts_with(".cfi_endproc") || line.starts_with(".size") {
+        // ELF and Mach-O close a function with one of the first two. COFF has
+        // no such directive: a function with unwind data ends at
+        // `.seh_endproc`, and a leaf without it where the next symbol's
+        // `.def` begins.
+        if [".cfi_endproc", ".size", ".seh_endproc", ".def"]
+            .iter()
+            .any(|end| line.starts_with(end))
+        {
             let (path, mut shape) = current.take().expect("checked above");
             if shape.asm == 0 {
                 shape.asm_hash = 0;
@@ -524,6 +617,75 @@ _RNvNtCs1234_9crc_turbo4arch4fold:
         };
         let parsed = parse_snapshot(&format!("# note\n\n{}\n", shape.line("a::b")));
         assert_eq!(parsed, vec![("a::b".to_owned(), shape)]);
+    }
+
+    #[test]
+    fn coff_functions_end_at_seh_endproc_or_the_next_def() {
+        let listing = "\
+\t.def\t_RNvNtCs1234_9crc_turbo4arch4leaf;
+\t.scl\t2;
+\t.endef
+_RNvNtCs1234_9crc_turbo4arch4leaf:
+\t#APP
+\tcrc32q\t(%rcx), %rax
+\t#NO_APP
+\tretq
+\t.def\t_RNvNtCs1234_9crc_turbo4arch5frame;
+\t.endef
+_RNvNtCs1234_9crc_turbo4arch5frame:
+.seh_proc _RNvNtCs1234_9crc_turbo4arch5frame
+\tsubq\t$40, %rsp
+\tcallq\tmemcpy
+\taddq\t$40, %rsp
+\tretq
+\t.seh_endproc
+\t.def\t_RNvNtCs1234_9crc_turbo4arch5other;
+\t.endef
+_RNvNtCs1234_9crc_turbo4arch5other:
+\tretq
+";
+        let paths = [
+            "crc_turbo::arch::leaf".to_owned(),
+            "crc_turbo::arch::frame".to_owned(),
+        ];
+        let found = measure(listing, &paths);
+        let leaf = &found["crc_turbo::arch::leaf"];
+        assert_eq!((leaf.len(), leaf[0].asm, leaf[0].glue), (1, 1, 1));
+        let frame = &found["crc_turbo::arch::frame"];
+        assert_eq!(
+            (frame.len(), frame[0].asm, frame[0].glue, frame[0].calls),
+            (1, 0, 4, 1)
+        );
+    }
+
+    #[test]
+    fn an_untyped_zmm_scratch_operand_is_found() {
+        let text = "\
+asm!(
+    \"vpxorq {a}, {a}, {a}\",
+    a = out(zmm_reg) _,
+    b = lateout(zmm_reg)
+        _,
+    c = out( zmm_reg )_ ,
+);";
+        assert_eq!(untyped_zmm_scratch(text), vec![3, 4, 6]);
+    }
+
+    #[test]
+    fn typed_and_narrower_operands_pass() {
+        let text = "\
+// an `out(zmm_reg) _` in a comment is not an operand
+asm!(
+    \"vpxorq {a}, {a}, {a}\",
+    a = out(zmm_reg) y0, // was out(zmm_reg) _
+    b = out(zmm_reg) _scratch,
+    c = inout(zmm_reg) v => _,
+    d = in(zmm_reg) k,
+    e = out(xmm_reg) _,
+    f = out(ymm_reg) _,
+    g = out(reg) _,
+);";
+        assert_eq!(untyped_zmm_scratch(text), Vec::<usize>::new());
     }
 
     #[test]

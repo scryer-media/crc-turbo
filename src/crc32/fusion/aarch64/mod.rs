@@ -22,6 +22,19 @@ use core::arch::aarch64::*;
 
 use crate::feature_detection::PerformanceTier;
 
+#[cfg(not(miri))]
+pub(crate) use core::arch::aarch64::veor3q_u64;
+
+/// The XOR of three vectors, for the kernels' `veor3q_u64`. Miri does not implement the EOR3
+/// instruction, so there it is two EORs, which give the same value: what Miri checks in the
+/// SHA3 kernels is their loads and pointer arithmetic, which are unchanged.
+#[cfg(miri)]
+#[inline]
+#[target_feature(enable = "sha3")]
+pub(crate) unsafe fn veor3q_u64(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint64x2_t {
+    veorq_u64(veorq_u64(a, b), c)
+}
+
 use iscsi::crc_pmull_sha3::crc32_iscsi_eor3_v9s3x2e_s3;
 use iso_hdlc::crc_pmull_sha3::crc32_iso_hdlc_eor3_v9s3x2e_s3;
 use lanes::{
@@ -46,6 +59,7 @@ macro_rules! entry_points {
         mod $module {
             #[cfg(all(
                 target_endian = "little",
+                not(miri),
                 any(target_os = "linux", target_os = "android")
             ))]
             mod imp {
@@ -136,6 +150,7 @@ macro_rules! entry_points {
 
             #[cfg(not(all(
                 target_endian = "little",
+                not(miri),
                 any(target_os = "linux", target_os = "android")
             )))]
             mod imp {
@@ -224,6 +239,7 @@ entry_points!(
 
 #[cfg(all(
     target_endian = "little",
+    not(miri),
     any(target_os = "linux", target_os = "android")
 ))]
 use asm::{
@@ -235,6 +251,7 @@ use asm::{
 };
 #[cfg(not(all(
     target_endian = "little",
+    not(miri),
     any(target_os = "linux", target_os = "android")
 )))]
 use {
@@ -268,6 +285,7 @@ const SHA3_SMALL_END: usize = if cfg!(target_vendor = "apple") {
     SMALL_BUFFER_END
 } else if cfg!(all(
     target_endian = "little",
+    not(miri),
     any(target_os = "linux", target_os = "android")
 )) {
     96
@@ -337,6 +355,7 @@ impl Core {
 /// built for little-endian Linux and Android.
 const HAS_V2_PLAN: bool = cfg!(all(
     target_endian = "little",
+    not(miri),
     any(target_os = "linux", target_os = "android")
 ));
 
@@ -518,7 +537,7 @@ unsafe fn clmul_scalar(a: u32, b: u32) -> uint64x2_t {
 ///
 /// Graviton 2 and 3 run the pair 10-15% slower than the intrinsics LLVM schedules, so the pair
 /// is Apple's alone.
-#[cfg(target_vendor = "apple")]
+#[cfg(all(target_vendor = "apple", not(miri)))]
 #[inline]
 #[target_feature(enable = "aes")]
 unsafe fn clmul_lo_and_xor(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint64x2_t {
@@ -540,7 +559,7 @@ unsafe fn clmul_lo_and_xor(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint6
 }
 
 /// The high-half form of [`clmul_lo_and_xor`].
-#[cfg(target_vendor = "apple")]
+#[cfg(all(target_vendor = "apple", not(miri)))]
 #[inline]
 #[target_feature(enable = "aes")]
 unsafe fn clmul_hi_and_xor(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint64x2_t {
@@ -562,7 +581,7 @@ unsafe fn clmul_hi_and_xor(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint6
 }
 
 /// The low product of `a` and `b`, plus `c`.
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(any(not(target_vendor = "apple"), miri))]
 #[inline]
 #[target_feature(enable = "aes")]
 unsafe fn clmul_lo_and_xor(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint64x2_t {
@@ -570,7 +589,7 @@ unsafe fn clmul_lo_and_xor(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint6
 }
 
 /// The high product of `a` and `b`, plus `c`.
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(any(not(target_vendor = "apple"), miri))]
 #[inline]
 #[target_feature(enable = "aes")]
 unsafe fn clmul_hi_and_xor(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint64x2_t {
@@ -652,6 +671,7 @@ pub unsafe fn crc32_iscsi_small_fast(mut crc: u32, data: &[u8]) -> u32 {
 /// `asm` instead, which fixes where the loop sits.
 #[cfg(not(all(
     target_endian = "little",
+    not(miri),
     any(target_os = "linux", target_os = "android")
 )))]
 #[inline]
@@ -671,6 +691,7 @@ pub unsafe fn crc32_iso_hdlc_small_fast(mut crc: u32, data: &[u8]) -> u32 {
 /// [`crc32_iscsi_short`] for CRC-32/ISO-HDLC.
 #[cfg(not(all(
     target_endian = "little",
+    not(miri),
     any(target_os = "linux", target_os = "android")
 )))]
 #[inline]
@@ -878,9 +899,11 @@ mod tests {
     /// would never reach them.
     #[test]
     fn held_kernels_agree_with_the_reference() {
-        let mut data = vec![0u8; 1_048_577 + 3];
+        // Miri interprets a megabyte in minutes; 64 KiB runs the same stream loop.
+        let long = if cfg!(miri) { 65_536 } else { 1_048_576 };
+        let mut data = vec![0u8; long + 1 + 3];
         rng().fill(&mut data[..]);
-        for len in (0..=PMULL_STREAM_THRESHOLD + 128).chain(1_048_575..=1_048_577) {
+        for len in (0..=PMULL_STREAM_THRESHOLD + 128).chain(long - 1..=long + 1) {
             for offset in [0, 3] {
                 let slice = &data[offset..offset + len];
                 assert_eq!(

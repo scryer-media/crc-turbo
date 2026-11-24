@@ -83,14 +83,15 @@ fn choose_aarch64_kernel() {
 #[cold]
 #[cfg(all(feature = "std", target_arch = "aarch64"))]
 fn read_midr() -> u64 {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    // Miri's isolation has no files: there the core is unknown, as on a kernel without the file
+    #[cfg(all(any(target_os = "linux", target_os = "android"), not(miri)))]
     {
         std::fs::read_to_string("/sys/devices/system/cpu/cpu0/regs/identification/midr_el1")
             .ok()
             .and_then(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
             .unwrap_or(0)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(not(all(any(target_os = "linux", target_os = "android"), not(miri))))]
     {
         0
     }

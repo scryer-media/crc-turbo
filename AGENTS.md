@@ -57,8 +57,15 @@ major version and a reason, not convenience.
   when it is reached only through a value that is set after detection of the
   feature, is compiled out under `cfg(miri)` in favour of an intrinsics path,
   and has an oracle test that a mutation of the asm fails.
-- Miri runs the whole suite on x86_64. A change that makes a test
-  Miri-incompatible ignores that one test under `cfg(miri)`, never the lane.
+- Miri runs the whole suite on x86_64 and on aarch64. The aarch64 lane
+  builds with `crc`, `aes` and `sha3` enabled, since Miri's aarch64 CPU
+  reports no features, and takes two EORs for EOR3, which Miri lacks. A
+  change that makes a test Miri-incompatible ignores that one test under
+  `cfg(miri)`, never the lane.
+- An `asm!` scratch operand of class `zmm_reg` is a typed output, never
+  `out(zmm_reg) _`: placed in `zmm16` to `zmm31` the untyped form does not
+  assemble, and where it is placed is the allocator's choice. `cargo xtask
+  codegen check` refuses the untyped form in `src/`.
 
 ## Performance rules
 
