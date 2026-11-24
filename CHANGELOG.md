@@ -462,7 +462,7 @@ own changelog up to the fork point continues below, unchanged.
 - New `checksum_zeros` and `checksum_zeros_with_params`: the CRC of `len`
   zero bytes in O(log len), without touching memory.
 
-## 1.11.1 - 2026-11-23
+## 1.11.1 - 2026-11-24
 
 - CRC-32/ISCSI is faster on x86 CPUs without AVX-512: the
   `x86_64-avx2-vpclmulqdq`, `x86_64-sse-pclmulqdq` and `x86-sse-pclmulqdq`
