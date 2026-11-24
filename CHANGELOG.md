@@ -227,6 +227,10 @@ own changelog up to the fork point continues below, unchanged.
   CRC-32/ISO-HDLC from 256 bytes to 16 KiB takes a cascade of 512-bit
   folds (four accumulators to 4 KiB, eight from there, then halving onto
   one) instead of this tier's own fold; crc-fast has the generic fold there.
+- On Sapphire Rapids on the `x86_64-avx512-vpclmulqdq` tier, CRC-32/ISCSI
+  past the short window takes fast-crc32's `v3x2` kernel at every length,
+  as crc-fast and 1.11.0 do; other AVX-512 CPUs hand 4 KiB to 8 KiB (16 KiB
+  on Ice Lake server parts) to the 512-bit fold.
 - CRC-32/ISCSI buffers up to the plan's limit (256 bytes on the AVX-512
   tiers) are checksummed with the CRC32 instruction over unaligned words,
   written as inline assembly inside the caller on x86_64, ahead of the
@@ -269,6 +273,19 @@ own changelog up to the fork point continues below, unchanged.
   seven blocks is folded straight onto the last with the generated key for
   its distance, so those multiplies run side by side, the method of the
   Linux kernel's x86 CRC template (Eric Biggers); no kernel code is taken.
+
+- x86_64, Ice Lake server (family 6, models 0x6a and 0x6c): CRC-32/ISO-HDLC
+  `checksum` folds 1024 to 4095 bytes with fast-crc32's
+  `avx512_vpclmulqdq_crc32_v4` loop (Corsix, MIT) in inline assembly, in
+  the instruction order gcc gives that kernel: the four low products, the
+  pointer step, the four high products, then the four three-way XORs with
+  the loads. crc-fast and the generic 512-bit tier interleave the low
+  product, high product and XOR of each accumulator. Other CPUs on the
+  tier, Sapphire Rapids among them, keep their path.
+- x86_64, AMD family 0x17 (Zen, Zen+, Zen 2) on the SSE PCLMULQDQ tier with
+  AVX: CRC-32/ISO-HDLC `checksum` runs libdeflate's `crc32_pclmul_avx`
+  entry (Eric Biggers, MIT) for 16 to 1023 bytes, the entry the 512-bit
+  tier already takes, built without VPCLMULQDQ.
 
 ### aarch64 performance
 
@@ -704,7 +721,12 @@ own changelog up to the fork point continues below, unchanged.
     a buffer whose 64-byte loads split cache lines ran at 0.80x to 0.85x of
     an aligned one.
   - CRC-32/ISCSI on the `x86_64-avx512-vpclmulqdq` tier takes the 512-bit
-    fold from 4 KiB up to 8 KiB (16 KiB on Ice Lake server parts), and on
+    fold from 4 KiB up to 8 KiB (16 KiB on Ice Lake server parts), except on
+    Sapphire Rapids, where the `v3x2` kernel, now folding its leftover
+    64-byte blocks, keeps every length past the short window as in 1.11.0:
+    timed alone on a Xeon 8488C it ran 1.16x to 1.30x of that fold at nine
+    lengths from 4096 to 8000 bytes three bytes off a boundary, and 1.04x
+    to 1.12x aligned; and on
     Ice Lake and AMD family 0x19 a new kernel from 16 KiB and 64 KiB: four
     512-bit folding streams beside five CRC32-instruction streams, the
     streams shifted together with multipliers built at compile time. On
@@ -1379,6 +1401,11 @@ own changelog up to the fork point continues below, unchanged.
   leaves a 128-byte tail. Running `neon_crc32_v8` from 2 KiB to 4 KiB
   instead measured 1.03x at 2048 bytes and 0.80x to 0.93x at ten other
   lengths from 2200 to 4095 bytes, so it is not taken.
+  Folding the large kernel's leftover 16-byte blocks in the vector unit
+  instead of its three-stream tail measured 1.01x to 1.06x at most lengths
+  from 2048 to 4096 bytes but 0.975x at 3072 aligned, 0.97x at 3300 three
+  bytes off and 0.99x at 5000 and 10000, and moved 2048 by 1% to 2%; it is
+  not taken either.
 
 - The stream kernel of the aarch64 PMULL tier (Graviton2) folds with each
   PMULL and its EOR written as one adjacent pair in assembly, the way
@@ -1389,6 +1416,65 @@ own changelog up to the fork point continues below, unchanged.
   `neon_crc32c_v3s4x2e_v2` aligned and 1.03x 3 bytes off, CRC-32/ISO-HDLC
   1.03x of `neon_crc32_v3s4x2e_v2` both ways, and 1.75x to 1.77x of 1.11.0.
   Graviton3 and Graviton4 do not run this kernel and measured unchanged.
+
+- On Ice Lake server (family 6, models 0x6a and 0x6c), CRC-32/ISO-HDLC
+  `checksum` folds 1024 to 4095 bytes with fast-crc32's
+  `avx512_vpclmulqdq_crc32_v4` loop (Corsix, MIT), written in inline
+  assembly in the order gcc compiles it: all four low products, then all
+  four high products, then the four XORs with the next 256 bytes. The tier's
+  own loop interleaved the three per accumulator and ran about 4.5 cycles
+  an iteration slower. On a Xeon 8375C (m6i.large), checksums compared
+  first, median of interleaved rounds over four link layouts, aligned
+  against `avx512_vpclmulqdq_crc32_v4`, two runs: 1 KiB 0.935x to 1.013x
+  and 1.005x, 2 KiB 0.846x to 1.005x and 1.003x; 1.57x and 1.27x of
+  1.11.0. Off-grid, 21
+  lengths from 20 to 4000 bytes aligned and 3 bytes off: at or above the
+  previous path at every length from 1100 to 4000 bytes, unchanged below
+  1024. The same loop in fast-crc32's source order measured no gain (1 KiB
+  0.907x, 2 KiB 0.838x), so the order is the change. A test runs the Ice
+  Lake entry against the software oracle at every length to 4200 bytes at
+  three offsets, a selection test pins the model gate, and changing one
+  load offset in the loop fails both tests. Sapphire Rapids and other
+  CPUs on the tier select what they did, and every function they run
+  compiles to the same release assembly as before.
+- On AMD family 0x17 (Zen 2 measured) with AVX, CRC-32/ISO-HDLC `checksum`
+  runs libdeflate's `crc32_pclmul_avx` entry (Eric Biggers, MIT) for 16
+  to 1023 bytes, built for AVX, SSE4.1 and PCLMULQDQ. On an EPYC 7R32
+  (c5a.large), one run, against libdeflate: 80, 96 and 112 bytes aligned
+  0.961x, 0.979x, 0.966x to 0.969x, 0.983x, 0.987x, and 3 bytes off
+  0.977x, 0.979x, 0.967x to 0.977x, 0.989x, 0.995x; 2.8x to 3.0x of
+  1.11.0. Off-grid, 20 to 4000 bytes: 20, 40 and 200 bytes gain 5 to 15
+  percent, 88 and 120 bytes are 1 percent lower, the rest is within 3
+  percent. 80 bytes aligned stays just under 0.97x. A test runs the entry
+  against the software oracle from 0 to 1100 and 4095 to 4200 bytes at
+  four offsets, a selection test pins the family gate, and changing one
+  load offset in the assembly fails it.
+
+- Open, found off the bench grid on a Graviton4 (c8g.large): from 256 to
+  2047 bytes the eight-lane kernel of the SHA3 tier folds whole 128-byte
+  strides and runs the remainder through the CRC32 instruction, as
+  fast-crc32's `neon_eor3_*_v8` does. With 64 bytes or more left over,
+  fast-crc32's four-lane `v4`, which leaves at most 63, is ahead: 448 bytes
+  0.63x, 480 bytes 0.72x to 0.84x, 576 bytes 0.75x to 0.82x, 992 bytes
+  0.81x to 0.85x of the best reference, against 0.88x to 1.06x where the
+  remainder is under 48 bytes. The bench sizes in that range are multiples
+  of 128 and do not show it. Folding such a remainder as one four-lane
+  stride lifted 448 bytes to 0.81x to 0.83x aligned and 576 to 0.96x to
+  1.04x but ran 336 and 496 bytes at 0.73x to 0.93x of the unchanged
+  kernel, and was not taken. The other aarch64 cores were not measured at
+  these lengths.
+- Open on Sapphire Rapids (Xeon 8488C): a 512-bit kernel run on unaligned
+  data within a few milliseconds of a large call into this release's
+  generic 512-bit fold runs 7% to 13% slower than the same pairing in
+  1.11.0; fast-crc32's own `avx512_vpclmulqdq_crc32c_v3x2` shows it too.
+  Aligned data shows nothing, clearing every vector and mask register in
+  between changes nothing, and a 10 ms scalar gap removes it, so it is a
+  power state of the core and not register state; the fold has 56 512-bit
+  carry-less multiplies in its loop where 1.11.0's had 30, and is 1.2x to
+  2.8x faster than it. In the bench, which times the kernels back to back,
+  it reads as CRC-32/ISCSI at 0.88x to 0.93x of 1.11.0 at 2 KiB aligned and
+  at 8 and 16 KiB three bytes off; timed alone those are 0.99x, 0.98x and
+  1.08x.
 
 ## 1.11.0 - 2026-10-20
 

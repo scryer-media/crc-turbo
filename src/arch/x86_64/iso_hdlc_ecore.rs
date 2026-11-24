@@ -321,6 +321,43 @@ pub(crate) unsafe fn iso_hdlc_checksum_ecore(bytes: &[u8]) -> u64 {
     short(bytes)
 }
 
+/// AMD family 0x17's (Zen 2's) CRC-32/ISO-HDLC checksum entry on the SSE tier with AVX: the
+/// same [`update`] from 16 bytes up to [`ASM_END`], built with the features that tier has
+/// (AVX, SSE4.1, PCLMULQDQ; [`update`] needs no more), then the SSE tier's 128-bit folds in the
+/// AVX encoding, as [`crate::arch::iso_hdlc_checksum_x86_sse_avx`] takes them.
+///
+/// # Safety
+///
+/// The CPU must have AVX, SSE4.1 and PCLMULQDQ.
+#[inline(never)]
+#[target_feature(enable = "avx,sse4.1,pclmulqdq")]
+pub(crate) unsafe fn iso_hdlc_checksum_zen2(bytes: &[u8]) -> u64 {
+    let len = bytes.len();
+    if len.wrapping_sub(16) < ASM_END - 16 {
+        return !update(!0, bytes) as u64;
+    }
+    if len >= ASM_END {
+        if len >= crate::arch::MID_END {
+            return crate::arch::iso_hdlc_fold_x86_sse_avx(0, bytes);
+        }
+        return crate::arch::iso_hdlc_mid_x86_sse_avx(0, bytes);
+    }
+    short_sse(bytes)
+}
+
+/// Below 16 bytes on the SSE tier, out of the entry's way.
+#[cold]
+#[inline(never)]
+#[target_feature(enable = "avx,sse4.1,pclmulqdq")]
+unsafe fn short_sse(bytes: &[u8]) -> u64 {
+    !crate::algorithm::update_short::<_, crate::structs::Width32>(
+        !0,
+        bytes,
+        &crate::crc32::consts::CRC32_ISO_HDLC,
+        &crate::arch::x86::sse::X86SsePclmulqdqOps,
+    ) as u64
+}
+
 /// Below 16 bytes, out of the entry's way.
 #[cold]
 #[inline(never)]
@@ -372,6 +409,33 @@ mod tests {
                 let data = &buf[off..off + len];
                 let want = !(crate::arch::software::update(!0, data, params) as u32);
                 let got = unsafe { iso_hdlc_checksum_ecore(data) } as u32;
+                assert_eq!(got, want, "checksum len {len} off {off}");
+            }
+        }
+    }
+
+    /// Zen 2's checksum entry, forced onto it, against the software path over every length
+    /// from 0 to 1100 from four starts, and across the hand-over to the long fold.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn zen2_entry_tier_matches_software() {
+        if !(is_x86_feature_detected!("avx")
+            && is_x86_feature_detected!("pclmulqdq")
+            && is_x86_feature_detected!("sse4.1"))
+        {
+            eprintln!("skipping Zen 2's CRC-32/ISO-HDLC entry: the CPU lacks AVX or PCLMULQDQ");
+            return;
+        }
+        let params = &crate::crc32::consts::CRC32_ISO_HDLC;
+        let buf: Vec<u8> = (0..4300u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let lens = (0..=1100).chain([4095, 4096, 4097, 4200]);
+        for len in lens {
+            for off in [0usize, 1, 15, 33] {
+                let data = &buf[off..off + len];
+                let want = !(crate::arch::software::update(!0, data, params) as u32);
+                let got = unsafe { iso_hdlc_checksum_zen2(data) } as u32;
                 assert_eq!(got, want, "checksum len {len} off {off}");
             }
         }

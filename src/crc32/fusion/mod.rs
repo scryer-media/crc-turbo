@@ -32,6 +32,22 @@ pub(crate) fn is_sapphire_rapids() -> bool {
     x86::CpuId::detect().is_sapphire_rapids()
 }
 
+/// Whether this CPU is an Ice Lake server, Intel family 6 models 0x6a and 0x6c: the CPUs whose
+/// `x86_64-avx512-vpclmulqdq` tier takes fast-crc32's `v4` loop for CRC-32/ISO-HDLC from 1 KiB,
+/// see `crate::arch::choose_iso_hdlc`.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn is_ice_lake_server() -> bool {
+    x86::CpuId::detect().is_ice_lake_server()
+}
+
+/// Whether this CPU is AMD family 0x17 (Zen, Zen+, Zen 2): the CPUs whose SSE tier with AVX takes
+/// the assembly of libdeflate's `crc32_pclmul_avx` for CRC-32/ISO-HDLC checksums from 16 bytes
+/// to 1 KiB, see `crate::arch::choose_iso_hdlc`.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn is_amd_family_17() -> bool {
+    x86::CpuId::detect().is_amd_family_17()
+}
+
 /// The aarch64 fusion kernel's choice, kept in one byte and read with a relaxed load: 0 before
 /// it is made, then 1 for none, 2 for the PMULL kernel, 3 for the EOR3 one and 4 for the EOR3
 /// one with Neoverse V2's plan ([`aarch64::Core`]). The byte carries

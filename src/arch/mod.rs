@@ -387,6 +387,15 @@ fn choose_iso_hdlc() -> (IsoHdlcChecksum, IsoHdlcUpdate) {
                 iso_hdlc_x86_64_avx512_spr,
             )
         }
+        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        ArchOpsInstance::X86_64Avx512Vpclmulqdq(_)
+            if crate::crc32::fusion::is_ice_lake_server() =>
+        {
+            (
+                iso_hdlc_checksum_x86_64_avx512_icl,
+                iso_hdlc_x86_64_avx512_icl,
+            )
+        }
         #[cfg(target_arch = "x86_64")]
         ArchOpsInstance::X86_64Avx512Vpclmulqdq(_) => (
             iso_hdlc_checksum_x86_64_avx512_vpclmulqdq,
@@ -407,6 +416,12 @@ fn choose_iso_hdlc() -> (IsoHdlcChecksum, IsoHdlcUpdate) {
             iso_hdlc_checksum_x86_64_avx2_vpclmulqdq,
             iso_hdlc_x86_64_avx2_vpclmulqdq,
         ),
+        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        ArchOpsInstance::X86SsePclmulqdq(_)
+            if sse_tier_has_avx() && crate::crc32::fusion::is_amd_family_17() =>
+        {
+            (iso_hdlc_checksum_x86_64_zen2, iso_hdlc_x86_sse_avx)
+        }
         ArchOpsInstance::X86SsePclmulqdq(_) if sse_tier_has_avx() => {
             (iso_hdlc_checksum_x86_sse_avx, iso_hdlc_x86_sse_avx)
         }
@@ -508,6 +523,52 @@ unsafe fn iso_hdlc_x86_64_avx512_spr(crc: u32, bytes: &[u8]) -> u32 {
         128
     )
 }
+
+/// Ice Lake servers' CRC-32/ISO-HDLC on the `x86_64-avx512-vpclmulqdq` tier from
+/// [`ICL_V4_START`] up to [`MID_END`]: fast-crc32's `avx512_vpclmulqdq_crc32_v4`, four 512-bit
+/// accumulators over 256-byte steps, with its loop in `v4`'s own instruction order as inline
+/// assembly, [`x86_64::iso_hdlc_fold512`]. Below that the tier's own mid fold.
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[inline(never)]
+#[target_feature(enable = "avx512vl,avx512bw,vpclmulqdq")]
+unsafe fn iso_hdlc_mid_x86_64_avx512_icl(crc: u32, bytes: &[u8]) -> u64 {
+    if bytes.len() >= ICL_V4_START {
+        return x86_64::iso_hdlc_fold512::iso_hdlc_fold512_v4(crc, bytes);
+    }
+    iso_hdlc_mid_x86_64_avx512_vpclmulqdq(crc, bytes)
+}
+
+/// Where Ice Lake servers' CRC-32/ISO-HDLC hands over from the tier's mid fold to `v4`'s loop.
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+const ICL_V4_START: usize = 1024;
+
+/// Ice Lake servers' checksum entry: the tier's ladder in line, then
+/// [`iso_hdlc_mid_x86_64_avx512_icl`] and the tier's long fold.
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+use crate::arch::x86::short_asm::iso_hdlc_checksum_avx512_icl as iso_hdlc_checksum_x86_64_avx512_icl;
+
+/// [`iso_hdlc_x86_64_avx512_vpclmulqdq`] on Ice Lake servers: the same entry, with `v4`'s loop
+/// from [`ICL_V4_START`].
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[inline]
+#[target_feature(enable = "avx512vl,vpclmulqdq")]
+unsafe fn iso_hdlc_x86_64_avx512_icl(crc: u32, bytes: &[u8]) -> u32 {
+    x86_iso_hdlc_body!(
+        crc,
+        bytes,
+        iso_hdlc_mid_x86_64_avx512_icl,
+        iso_hdlc_fold_x86_64_avx512_vpclmulqdq,
+        crate::arch::x86_64::avx512_vpclmulqdq::X86_64Avx512VpclmulqdqOps::new(),
+        crate::arch::x86::short_asm::iso_hdlc_short128_avx,
+        128
+    )
+}
+
+/// AMD family 0x17's (Zen 2's) checksum entry on the SSE tier with AVX: the E-core parts'
+/// assembly of libdeflate's `crc32_pclmul_avx` from 16 bytes up to 1 KiB, built with the AVX
+/// this tier has, see [`x86_64::iso_hdlc_ecore::iso_hdlc_checksum_zen2`].
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+use x86_64::iso_hdlc_ecore::iso_hdlc_checksum_zen2 as iso_hdlc_checksum_x86_64_zen2;
 
 /// Whether a CPU on the SSE tier has AVX, so that CRC-32/ISO-HDLC takes the SSE tier's entries
 /// built with AVX's three-operand encoding: the same 128-bit operations, without the register

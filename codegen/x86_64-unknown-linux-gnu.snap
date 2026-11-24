@@ -30,3 +30,6 @@ crc_turbo::arch::x86_64::iso_hdlc_ecore::iso_hdlc_checksum_ecore asm=403684c6286
 crc_turbo::arch::x86::short_asm::iso_hdlc_checksum_avx512_pclmulqdq asm=0000000000000000/0 glue=151 calls=0
 crc_turbo::arch::x86::short_asm::iso_hdlc_checksum_avx512_vpclmulqdq asm=0c532c176986b12c/99 glue=96 calls=0
 crc_turbo::arch::x86::short_asm::iso_hdlc_checksum_avx512_spr asm=0c532c176986b12c/99 glue=96 calls=0
+crc_turbo::arch::x86::short_asm::iso_hdlc_checksum_avx512_icl asm=0c532c176986b12c/99 glue=96 calls=0
+crc_turbo::arch::x86_64::iso_hdlc_fold512::iso_hdlc_fold512_v4 asm=901747080eab15e2/21 glue=101 calls=0 body=compiler
+crc_turbo::arch::x86_64::iso_hdlc_ecore::iso_hdlc_checksum_zen2 asm=403684c62861d8ae/104 glue=17 calls=0

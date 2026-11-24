@@ -66,7 +66,11 @@ const ZEN4_STREAMS_MIN: usize = 64 << 10;
 #[cfg(target_arch = "x86_64")]
 const AVX512_FOLD_END: usize = 8192;
 
-/// [`IscsiPlan::fold_min`] on the AVX-512 VPCLMULQDQ tier where it was measured.
+/// [`IscsiPlan::fold_min`] on the AVX-512 VPCLMULQDQ tier where it was measured, Sapphire Rapids
+/// excepted: there the kernel takes every length past its window, as in 1.11.0. Its 64-byte
+/// blocks after the 384-byte steps are folded, not run through the CRC32 instruction as in
+/// 1.11.0, which is what had made 1.11.0 slow at 4 KiB; with them folded the kernel was level
+/// with the folding path at 4 KiB and ahead of it at lengths between (see `iscsi_limits`).
 #[cfg(target_arch = "x86_64")]
 const AVX512_FOLD_MIN: usize = 4096;
 
@@ -281,7 +285,7 @@ impl CpuId {
 
     /// Ice Lake servers, models 0x6a and 0x6c.
     #[cfg(target_arch = "x86_64")]
-    fn is_ice_lake_server(&self) -> bool {
+    pub(crate) fn is_ice_lake_server(&self) -> bool {
         self.is_intel_family_6() && matches!(self.model, 0x6a | 0x6c)
     }
 
@@ -295,6 +299,12 @@ impl CpuId {
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn is_sapphire_rapids(&self) -> bool {
         self.is_intel_family_6() && matches!(self.model, 0x8f | 0xcf)
+    }
+
+    /// AMD's family 0x17: Zen, Zen+ and Zen 2.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn is_amd_family_17(&self) -> bool {
+        self.is_amd() && self.family == 0x17
     }
 
     /// AMD's family 0x19, whose AVX-512 parts are Zen 4.
@@ -555,7 +565,9 @@ fn iscsi_limits(kernel: IscsiKernel, tier: PerformanceTier, cpu: CpuId) -> (usiz
     match kernel {
         #[cfg(target_arch = "x86_64")]
         IscsiKernel::Avx512Vpclmulqdq => {
-            let fold_min = if cpu.is_intel_family_6() || cpu.is_amd_family_19() {
+            let fold_min = if (cpu.is_intel_family_6() && !cpu.is_sapphire_rapids())
+                || cpu.is_amd_family_19()
+            {
                 AVX512_FOLD_MIN
             } else {
                 usize::MAX
@@ -1259,6 +1271,100 @@ mod tests {
         }
     }
 
+    /// Sapphire and Emerald Rapids take the AVX-512 VPCLMULQDQ kernel at every length past its
+    /// window, as 1.11.0 did; Ice Lake servers, Granite Rapids, another Intel family 6 part on
+    /// the tier and Zen 4 keep their window of the folding path.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn sapphire_rapids_has_no_iscsi_fold_window() {
+        const INTEL: &[u8; 12] = b"GenuineIntel";
+        const AMD: &[u8; 12] = b"AuthenticAMD";
+        let tier = PerformanceTier::X86_64Avx512Vpclmulqdq;
+        for (id, window) in [
+            (cpu(INTEL, 6, 0x8f), None),
+            (cpu(INTEL, 6, 0xcf), None),
+            (
+                cpu(INTEL, 6, 0x6a),
+                Some((AVX512_FOLD_MIN, ICE_LAKE_STREAMS_MIN)),
+            ),
+            (
+                cpu(INTEL, 6, 0x6c),
+                Some((AVX512_FOLD_MIN, ICE_LAKE_STREAMS_MIN)),
+            ),
+            (
+                cpu(INTEL, 6, 0xad),
+                Some((AVX512_FOLD_MIN, AVX512_FOLD_END)),
+            ),
+            (
+                cpu(INTEL, 6, 0x8c),
+                Some((AVX512_FOLD_MIN, AVX512_FOLD_END)),
+            ),
+            (
+                cpu(AMD, 0x19, 0x11),
+                Some((AVX512_FOLD_MIN, AVX512_FOLD_END)),
+            ),
+            (cpu(AMD, 6, 0x8f), None),
+        ] {
+            let plan = iscsi_plan(IscsiKernel::Avx512Vpclmulqdq, tier, id);
+            let got = (plan.fold_min != usize::MAX).then_some((plan.fold_min, plan.fold_end));
+            assert_eq!(got, window, "{id:?}");
+            assert_eq!(plan.direct_max, SMALL_BUFFER_MAX, "{id:?}");
+        }
+    }
+
+    /// Fast-crc32's `v4` loop for CRC-32/ISO-HDLC on the `x86_64-avx512-vpclmulqdq` tier is chosen
+    /// by [`CpuId::is_ice_lake_server`]: models 0x6a and 0x6c take it, and the CPUs on either
+    /// side of them on the tier, Ice Lake client parts, Tiger Lake, Sapphire Rapids, Granite
+    /// Rapids and Zen 4 and 5, keep their own paths.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn ice_lake_server_selects_the_iso_hdlc_v4_loop() {
+        const INTEL: &[u8; 12] = b"GenuineIntel";
+        const AMD: &[u8; 12] = b"AuthenticAMD";
+        for (id, takes) in [
+            (cpu(INTEL, 6, 0x6a), true),
+            (cpu(INTEL, 6, 0x6c), true),
+            (cpu(INTEL, 6, 0x7d), false),
+            (cpu(INTEL, 6, 0x7e), false),
+            (cpu(INTEL, 6, 0x8c), false),
+            (cpu(INTEL, 6, 0x8f), false),
+            (cpu(INTEL, 6, 0xcf), false),
+            (cpu(INTEL, 6, 0xad), false),
+            (cpu(INTEL, 6, 0x55), false),
+            (cpu(INTEL, 0xf, 0x6a), false),
+            (cpu(AMD, 0x19, 0x11), false),
+            (cpu(AMD, 0x1a, 0x02), false),
+            (cpu(AMD, 6, 0x6a), false),
+        ] {
+            assert_eq!(id.is_ice_lake_server(), takes, "{id:?}");
+        }
+    }
+
+    /// The assembly of libdeflate's `crc32_pclmul_avx` for CRC-32/ISO-HDLC on the SSE tier is
+    /// chosen by [`CpuId::is_amd_family_17`]: Zen, Zen+ and Zen 2 take it, and family 0x19
+    /// (Zen 3, whose VPCLMULQDQ puts it on another tier anyway), family 0x18 (Hygon) and Intel
+    /// parts on the SSE tier keep the tier's entry.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn amd_family_17_selects_the_iso_hdlc_avx_asm() {
+        const INTEL: &[u8; 12] = b"GenuineIntel";
+        const AMD: &[u8; 12] = b"AuthenticAMD";
+        const HYGON: &[u8; 12] = b"HygonGenuine";
+        for (id, takes) in [
+            (cpu(AMD, 0x17, 0x31), true),
+            (cpu(AMD, 0x17, 0x01), true),
+            (cpu(AMD, 0x17, 0x71), true),
+            (cpu(AMD, 0x16, 0x30), false),
+            (cpu(AMD, 0x19, 0x01), false),
+            (cpu(HYGON, 0x18, 0x01), false),
+            (cpu(INTEL, 6, 0x3f), false),
+            (cpu(INTEL, 6, 0x55), false),
+            (cpu(INTEL, 0x17, 0x31), false),
+        ] {
+            assert_eq!(id.is_amd_family_17(), takes, "{id:?}");
+        }
+    }
+
     /// Each CPU measured, and its neighbours either side of the rules, gets the limits measured
     /// for it; the AVX-512 kernels keep theirs on every CPU.
     #[test]
@@ -1354,7 +1460,8 @@ mod tests {
                 ),
             ] {
                 let folds = kernel == IscsiKernel::Avx512Vpclmulqdq
-                    && (id.is_intel_family_6() || id.is_amd_family_19());
+                    && ((id.is_intel_family_6() && !id.is_sapphire_rapids())
+                        || id.is_amd_family_19());
                 let fold_end = if id.is_ice_lake_server() {
                     ICE_LAKE_STREAMS_MIN
                 } else {

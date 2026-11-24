@@ -60,4 +60,11 @@ author.
   <https://github.com/ebiggers/libdeflate>): the E-core CRC-32/ISO-HDLC
   entry in `src/arch/x86_64/iso_hdlc_ecore.rs` follows the compiled code
   of its `crc32_pclmul_avx` (1.19, the Ubuntu 24.04 package's build), and
-  carries its copyright and permission notice.
+  carries its copyright and permission notice. AMD family 0x17 (Zen 2)
+  takes the same entry, built for the SSE tier with AVX.
+- **fast-crc32**, by **Peter Cawley** (Corsix; MIT or zlib,
+  <https://github.com/corsix/fast-crc32>): the Ice Lake server
+  CRC-32/ISO-HDLC loop in `src/arch/x86_64/iso_hdlc_fold512.rs`
+  (`v4_loop`) is written in the instruction order of its generated
+  `avx512_vpclmulqdq_crc32_v4`, and the 512-bit cascades there follow the
+  shape of its `v4` and `v8` kernels.

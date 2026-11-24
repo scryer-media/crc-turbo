@@ -1634,6 +1634,19 @@ iso_hdlc_checksum!(
     crate::arch::x86_64::avx512_vpclmulqdq::X86_64Avx512VpclmulqdqOps::new()
 );
 
+// Ice Lake servers: the 512-bit ladder, and fast-crc32's `v4` loop from 1 KiB, see
+// `crate::arch::choose_iso_hdlc`
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+iso_hdlc_checksum!(
+    "avx512vl,vpclmulqdq",
+    avx,
+    w512,
+    iso_hdlc_checksum_avx512_icl,
+    iso_hdlc_mid_x86_64_avx512_icl,
+    iso_hdlc_fold_x86_64_avx512_vpclmulqdq,
+    crate::arch::x86_64::avx512_vpclmulqdq::X86_64Avx512VpclmulqdqOps::new()
+);
+
 /// The wide ladders' bodies from a carried CRC, for the tests: the checksum entries are the
 /// only callers in the library, and they start from no CRC.
 #[cfg(all(test, feature = "std", target_arch = "x86_64"))]
@@ -1850,5 +1863,7 @@ mod tests {
         check_checksum(iso_hdlc_checksum_avx512_vpclmulqdq);
         #[cfg(feature = "std")]
         check_checksum(iso_hdlc_checksum_avx512_spr);
+        #[cfg(feature = "std")]
+        check_checksum(iso_hdlc_checksum_avx512_icl);
     }
 }
