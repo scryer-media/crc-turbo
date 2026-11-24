@@ -12,6 +12,14 @@ pub(crate) mod width32_ops;
 ))]
 pub(crate) mod fusion;
 
+/// Powers of x modulo the CRC-32 polynomials, at compile time. Outside `fusion` because the
+/// x86 short folds derive their keys from it without `std`.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[path = "fusion/powers.rs"]
+// Without `std` only the short folds use it, and only `x_to_the`
+#[cfg_attr(not(feature = "std"), allow(dead_code))]
+pub(crate) mod powers;
+
 #[cfg(test)]
 mod property_tests {
     use crate::test::miri_compatible_proptest_config;

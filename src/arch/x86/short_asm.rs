@@ -90,7 +90,7 @@ fn iso_hdlc_keys() -> &'static [u64; 23] {
 /// that a lane of the last block multiplies to nothing.
 #[cfg(all(target_arch = "x86_64", not(miri)))]
 const fn iso_hdlc_pair(distance: usize) -> [u64; 2] {
-    use crate::crc32::fusion::powers::x_to_the;
+    use crate::crc32::powers::x_to_the;
     if distance == 0 {
         return [0, 0];
     }
@@ -1493,7 +1493,7 @@ macro_rules! iso_hdlc_update {
 /// bytes and its folds from there.
 macro_rules! iso_hdlc_checksum {
     ($features:literal, $e:ident, $v:ident, $checksum:ident, $mid:ident, $fold:ident,
-     $ops:expr) => {
+     $ops:expr $(, xmm: $xmm_end:expr)?) => {
         /// The CRC-32/ISO-HDLC checksum entry: the ladder in line from no CRC, so that the
         /// initial state is a constant, and from the ladder's end a jump to the tier's folds.
         ///
@@ -1506,6 +1506,12 @@ macro_rules! iso_hdlc_checksum {
             let params = &crate::crc32::consts::CRC32_ISO_HDLC;
             let len = bytes.len();
             if len >= 16 {
+                $(
+                    #[cfg(target_arch = "x86_64")]
+                    if len < $xmm_end {
+                        return crate::arch::x86_64::iso_hdlc_xmm::iso_hdlc_xmm(0, bytes);
+                    }
+                )?
                 if len < short_end!($v) {
                     return !short_body!(
                         $e,
@@ -1565,7 +1571,8 @@ iso_hdlc_checksum!(
     iso_hdlc_checksum_avx,
     iso_hdlc_mid_x86_sse_avx,
     iso_hdlc_fold_x86_sse_avx,
-    X86SsePclmulqdqOps
+    X86SsePclmulqdqOps,
+    xmm: 1024
 );
 
 #[cfg(target_arch = "x86_64")]
@@ -1601,7 +1608,8 @@ iso_hdlc_checksum!(
     iso_hdlc_checksum_avx512_pclmulqdq,
     iso_hdlc_mid_x86_64_avx512_pclmulqdq,
     iso_hdlc_fold_x86_64_avx512_pclmulqdq,
-    crate::arch::x86_64::avx512::X86_64Avx512PclmulqdqOps::new()
+    crate::arch::x86_64::avx512::X86_64Avx512PclmulqdqOps::new(),
+    xmm: 128
 );
 #[cfg(target_arch = "x86_64")]
 iso_hdlc_checksum!(
@@ -1613,7 +1621,7 @@ iso_hdlc_checksum!(
     iso_hdlc_fold_x86_64_avx2_vpclmulqdq,
     crate::arch::x86_64::avx2_vpclmulqdq::X86_64Avx2VpclmulqdqOps::new()
 );
-// Intel's E-core parts: the same ladder, and libdeflate's cascade from 256 bytes, see
+// Intel's E-core parts: the same ladder, and the SSE tier's 128-bit fold from 256 bytes, see
 // `crate::arch::choose_iso_hdlc`
 #[cfg(all(feature = "std", target_arch = "x86_64"))]
 iso_hdlc_checksum!(

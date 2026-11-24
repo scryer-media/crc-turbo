@@ -423,18 +423,21 @@ fn choose_iso_hdlc() -> (IsoHdlcChecksum, IsoHdlcUpdate) {
 }
 
 /// The `x86_64-avx2-vpclmulqdq` tier's CRC-32/ISO-HDLC from 256 bytes up to [`MID_END`] on
-/// Intel's E-core parts: libdeflate's cascade, [`x86_64::iso_hdlc_cascade`], in place of the
-/// tier's `iso_hdlc_mid`. Below 256 bytes the tier's ladder stays ahead of it there.
+/// Intel's E-core parts: the SSE tier's 128-bit fold in the AVX encoding, in place of the
+/// tier's 256-bit `iso_hdlc_mid`. These cores split each 256-bit operation in two, and the
+/// libdeflate build on them (1.19, the distribution package's) is 128-bit throughout; on a
+/// Xeon 6731E the 128-bit fold was ahead of libdeflate's 256-bit cascade from 256 bytes to
+/// 2 KiB, which this used to take.
 #[cfg(all(feature = "std", target_arch = "x86_64"))]
-use x86_64::iso_hdlc_cascade::iso_hdlc_cascade as iso_hdlc_mid_x86_64_avx2_ecore;
+use crate::arch::iso_hdlc_mid_x86_sse_avx as iso_hdlc_mid_x86_64_avx2_ecore;
 
-/// The E-core parts' checksum entry: the tier's ladder in line, then the cascade for 256 bytes
-/// to [`MID_END`] in place of the tier's mid fold, and the tier's long fold after that.
+/// The E-core parts' checksum entry: the tier's ladder in line, then the 128-bit fold for 256
+/// bytes to [`MID_END`] in place of the tier's mid fold, and the tier's long fold after that.
 #[cfg(all(feature = "std", target_arch = "x86_64"))]
 use crate::arch::x86::short_asm::iso_hdlc_checksum_avx2_ecore as iso_hdlc_checksum_x86_64_avx2_ecore;
 
 /// [`iso_hdlc_x86_64_avx2_vpclmulqdq`] on Intel's E-core parts: the same entry, with the
-/// cascade for 256 bytes to [`MID_END`].
+/// 128-bit fold for 256 bytes to [`MID_END`].
 #[cfg(all(feature = "std", target_arch = "x86_64"))]
 #[inline]
 #[target_feature(enable = "avx2,vpclmulqdq,sse4.1,pclmulqdq")]

@@ -22,7 +22,7 @@ use crate::traits::EnhancedCrcWidth;
 /// low key first: `x^(128 * distance - 32)` and `x^(128 * distance + 32)` mod P, reflected and
 /// shifted left by one, the pairs of the generated key table.
 pub(crate) const fn pair(distance: usize) -> [u64; 2] {
-    use crate::crc32::fusion::powers::x_to_the;
+    use crate::crc32::powers::x_to_the;
     let poly = (crate::crc32::consts::CRC32_ISO_HDLC.poly as u32).reverse_bits();
     let bits = 128 * distance as u64;
     [

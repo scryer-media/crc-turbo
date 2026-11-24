@@ -198,10 +198,21 @@ own changelog up to the fork point continues below, unchanged.
   bytes when the start is 16-byte aligned); on Zen 2 buffers from 32 KiB take three
   CRC32 streams alone (fast-crc32's `s3`). crc-fast has neither.
 - On Intel's E-core parts on the `x86_64-avx2-vpclmulqdq` tier,
-  CRC-32/ISO-HDLC from 256 bytes to 4 KiB takes libdeflate's cascade of
-  256-bit folds (eight accumulators, then four onto four, two onto two and
-  one onto one) instead of this tier's own fold; crc-fast has the generic
+  CRC-32/ISO-HDLC from 256 bytes to 4 KiB takes the SSE tier's 128-bit
+  fold in the AVX encoding, as libdeflate 1.19's `crc32_pclmul_avx` does
+  on these parts, instead of this tier's 256-bit fold; crc-fast has the
+  generic fold there.
+- On x86_64 CPUs with PCLMULQDQ and AVX but no VPCLMULQDQ, CRC-32/ISO-HDLC
+  checksums of 16 bytes up to 1 KiB (up to 128 bytes on the
+  `x86_64-avx512-pclmulqdq` tier) take the shape of libdeflate 1.19's
+  `crc32_pclmul_avx` (reimplemented from it; no code is taken): one
+  128-bit accumulator below 64 bytes, four from 64 bytes, folded four onto
+  two and two onto one, with the coefficient pairs computed at compile
+  time and checked equal to the generated keys. crc-fast has the generic
   fold there.
+- The x86_64 build without the `std` feature compiles again: the short
+  folds took a compile-time helper from a module that only exists with
+  `std`. The break was never released.
 - On Sapphire Rapids on the `x86_64-avx512-vpclmulqdq` tier,
   CRC-32/ISO-HDLC from 256 bytes to 16 KiB takes a cascade of 512-bit
   folds (four accumulators to 4 KiB, eight from there, then halving onto
@@ -1189,34 +1200,33 @@ own changelog up to the fork point continues below, unchanged.
   and 512 bytes aligned, and gcc's `v4` at 192 and 224 bytes, which runs
   the same instructions from inside one function.
 - On Intel's E-core parts on the `x86_64-avx2-vpclmulqdq` tier,
-  CRC-32/ISO-HDLC from 256 bytes to 4 KiB takes the shape of libdeflate's
-  `crc32_x86_vpclmulqdq_avx2` (`crc32_pclmul_template.h`, reimplemented
-  from it; no code is taken): eight 256-bit accumulators over 256-byte
-  steps, folded four onto four, two onto two and one onto one, each
-  halving taking the next piece of the buffer the length calls for, then
-  256 bits onto 128, a 16-byte block, the last bytes by one overlapping
-  read and the 96-bit Barrett reduction. Every fold is onto the
-  accumulator a fixed distance ahead, so five coefficient pairs serve every
-  length; they are computed at compile time from powers of x and checked
-  equal to the generated keys where the table has them. The checksum
-  entry is the tier's ladder with the cascade in place of its middle fold,
-  so lengths below 256 bytes take exactly the path they took. Measured on
-  the same Xeon 6731E and runs, GB/s, aligned (unaligned within 1%):
+  CRC-32/ISO-HDLC from 256 bytes to 4 KiB takes the SSE tier's 128-bit
+  fold in the AVX encoding in place of the tier's 256-bit middle fold.
+  These cores split each 256-bit operation in two, and the libdeflate on
+  them (1.19, the distribution package's) runs `crc32_pclmul_avx`, 128-bit
+  throughout, at every length. The checksum entry is the tier's ladder
+  with this fold in place of its middle one, so lengths below 256 bytes
+  take exactly the path they took. It replaces a reimplementation of
+  libdeflate's 256-bit cascade (`crc32_x86_vpclmulqdq_avx2`), which the
+  128-bit fold beat from 256 bytes to 2 KiB. Measured on a Xeon 6731E
+  (Sierra Forest), two runs of four link layouts with interleaved rounds,
+  GB/s, aligned (unaligned within 1%):
 
-  | bytes | 1.11.0 | without | with | libdeflate | with / libdeflate |
+  | bytes | 1.11.0 | cascade | 128-bit fold | libdeflate | fold / libdeflate |
   |---:|---:|---:|---:|---:|---:|
-  | 256 | 7.4 | 18.8 | 19.6 | 20.8 | 0.94 |
-  | 320 | 6.7 | 18.3 | 20.4 | 21.5 | 0.95 |
-  | 384 | 9.5 | 20.6 | 21.1 | 22.0 | 0.96 |
-  | 512 | 11.5 | 21.6 | 21.9 | 22.2 | 0.98 |
-  | 1024 | 15.7 | 23.0 | 23.2 | 23.6 | 0.98 |
-  | 2048 | 19.3 | 23.8 | 23.9 | 24.2 | 0.99 |
+  | 256 | 7.5 | 19.6 | 20.1 | 20.6 | 0.98 |
+  | 512 | 11.5 | 21.8 | 22.9 | 22.2 | 1.03 |
+  | 1024 | 15.7 | 23.2 | 23.8 | 23.6 | 1.01 |
+  | 2048 | 19.3 | 23.9 | 24.3 | 24.2 | 1.00 |
+  | 4096 | 21.7 | 24.3 | 24.3 | 24.5 | 0.99 |
 
-  Below 256 bytes the cascade measured behind the ladder (0.70x to 0.96x at
-  48 to 224 bytes, ahead only at 32 and 128), so the ladder keeps them;
-  libdeflate leads there at 32, 96, 128 and 192 bytes (0.92x to 0.94x).
-  The cascade is a candidate for every CPU on the tier, measured so far on
-  this one alone.
+  Open below 256 bytes: libdeflate leads at 16 and 32 bytes (0.86x) and
+  at 96, 128 and 192 bytes (0.92x to 0.96x). Its 16-to-63-byte shape, one
+  128-bit accumulator taking each block in turn, measured 1.00x at 16 and
+  1.04x at 32 bytes, but entered through a separate function ahead of the
+  ladder it cost 7% to 14% from 48 to 192 bytes, so it is not taken; the
+  ladder's own path for 64 to 255 bytes in 128-bit registers measured
+  behind the 256-bit ladder except at 128 bytes.
 - On Sapphire Rapids (Intel family 6, models 0x8f and 0xcf) on the
   `x86_64-avx512-vpclmulqdq` tier, CRC-32/ISO-HDLC from 256 bytes to 16 KiB
   takes a cascade of 512-bit folds, the shape of fast-crc32's

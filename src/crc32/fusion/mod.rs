@@ -13,7 +13,8 @@
 //! detection of its own.
 
 mod aarch64;
-pub(crate) mod powers;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub(crate) use super::powers;
 mod x86;
 
 /// Whether this CPU is one of Intel's E-core parts, [`x86::CpuId::is_intel_ecore`]: the CPUs
