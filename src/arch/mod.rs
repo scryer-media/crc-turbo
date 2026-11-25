@@ -202,6 +202,142 @@ macro_rules! x86_iso_hdlc_body {
     }};
 }
 
+/// The body of a tier's fold from 128 bytes: its own fold, except in the
+/// `x86_64-avx2-vpclmulqdq` tier, where it is a test of the E-core plan and a jump, either to
+/// [`fold_x86_64_avx2_ecore`] or to the tier's fold, which is a function of its own. The test
+/// is here, past the short paths, so that the tier's entry and everything below 128 bytes
+/// compile as they do without the plan: on a Xeon 6731E any change to that entry, even one
+/// that is never taken, moved single algorithms by 15% either way below 128 bytes. And the
+/// fold is out of line so that the test comes before any frame is set up: with the fold's
+/// body here the plan paid for six saved registers on the way in and out, 5% to 13% of a
+/// call from 128 to 256 bytes.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+macro_rules! x86_fold_plan {
+    (fold_x86_64_avx2_vpclmulqdq, $features:literal, $state:ident, $bytes:ident,
+     $params:ident, $ops:ident, $ops_type:ty, $head:literal) => {{
+        // The tier's own fold, out of line: this function is then a test and two jumps, with
+        // no frame of its own for the E-core plan to pay for
+        #[inline(never)]
+        #[target_feature(enable = $features)]
+        unsafe fn fold(state: u64, bytes: &[u8], params: &CrcParams, ops: $ops_type) -> u64 {
+            x86_by_order!(state, bytes, params, ops, $head)
+        }
+        if ecore_generic_plan() {
+            return fold_x86_64_avx2_ecore($state, $bytes, $params);
+        }
+        fold($state, $bytes, $params, $ops)
+    }};
+    ($fold:ident, $features:literal, $state:ident, $bytes:ident, $params:ident, $ops:ident,
+     $ops_type:ty, $head:literal) => {
+        x86_by_order!($state, $bytes, $params, $ops, $head)
+    };
+}
+
+/// Set once, by `feature_detection::create_arch_ops`, when the CPU is one of Intel's E-core
+/// parts and its tier is `x86_64-avx2-vpclmulqdq`.
+#[cfg(target_arch = "x86_64")]
+static ECORE_GENERIC_PLAN: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(target_arch = "x86_64")]
+#[cfg_attr(not(all(feature = "std", not(miri))), allow(dead_code))]
+pub(crate) fn set_ecore_generic_plan() {
+    ECORE_GENERIC_PLAN.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
+// A test's choice of the plan for its own thread, so that both sides of the tier's fold are
+// checked on every CPU with the tier's features, whichever of them that CPU takes.
+#[cfg(all(test, target_arch = "x86_64", feature = "std"))]
+thread_local! {
+    static ECORE_GENERIC_PLAN_FORCED: core::cell::Cell<Option<bool>> =
+        const { core::cell::Cell::new(None) };
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn ecore_generic_plan() -> bool {
+    #[cfg(all(test, feature = "std"))]
+    if let Some(forced) = ECORE_GENERIC_PLAN_FORCED.with(|forced| forced.get()) {
+        return forced;
+    }
+    ECORE_GENERIC_PLAN.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Below this the E-core plan takes the SSE tier's short path, 16 to 255 bytes in straight
+/// lines: on a Xeon 6731E it was ahead of the fold to 191 bytes and 6% to 9% behind it from
+/// 192 to 224.
+#[cfg(target_arch = "x86_64")]
+const ECORE_FOLD: usize = 192;
+
+/// From here the E-core plan is the tier's 256-bit fold again, with a prefetch in its loop
+/// ([`fold_x86_64_avx2_ecore_long`]). On a Xeon 6731E the 128-bit fold's lead was 10% at
+/// 2 KiB, 3% at 8 KiB and gone by 32 KiB, the prefetch cost nothing from here to 1 MiB, and
+/// at 16 MiB the 128-bit fold was 17% behind the plain 256-bit one for the algorithms that
+/// are not reflected.
+#[cfg(target_arch = "x86_64")]
+const ECORE_FOLD_END: usize = 64 << 10;
+
+/// The `x86_64-avx2-vpclmulqdq` tier's fold on Intel's E-core parts, for buffers from 128
+/// bytes of every algorithm without an entry of its own: three jumps, by length. These cores
+/// run each 256-bit operation as two 128-bit ones, so the tier's four 256-bit registers save
+/// them nothing over eight 128-bit ones, and its entry and tail cost more: crc-turbo#13,
+/// reported by cemeyer on a Sierra Forest part.
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+#[target_feature(enable = "avx2,vpclmulqdq,sse4.1,pclmulqdq")]
+unsafe fn fold_x86_64_avx2_ecore(state: u64, bytes: &[u8], params: &CrcParams) -> u64 {
+    if bytes.len() < ECORE_FOLD {
+        return crate::arch::x86::short_asm::short_sse(state, bytes, params);
+    }
+    if bytes.len() >= ECORE_FOLD_END {
+        return fold_x86_64_avx2_ecore_long(state, bytes, params);
+    }
+    fold_x86_sse_avx(
+        state,
+        bytes,
+        params,
+        crate::arch::x86::sse::X86SsePclmulqdqOps,
+    )
+}
+
+/// The SSE tier's fold from 128 bytes, eight 128-bit streams in eight registers, built with
+/// AVX's three-operand encoding: the same operations as [`fold_x86_sse_pclmulqdq`] without the
+/// register copies the two-operand forms need before each multiply.
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+#[target_feature(enable = "sse4.1,pclmulqdq,avx")]
+unsafe fn fold_x86_sse_avx(
+    state: u64,
+    bytes: &[u8],
+    params: &CrcParams,
+    ops: crate::arch::x86::sse::X86SsePclmulqdqOps,
+) -> u64 {
+    x86_by_order!(state, bytes, params, ops, false)
+}
+
+/// The E-core plan from [`ECORE_FOLD_END`]: the tier's 256-bit fold, with a prefetch in its
+/// loop, which these cores' own prefetchers leave it needing once the buffer is past the L2.
+/// See `X86_64Avx2VpclmulqdqOps::prefetching` for what it measured.
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+#[target_feature(enable = "avx2,vpclmulqdq,sse4.1,pclmulqdq")]
+unsafe fn fold_x86_64_avx2_ecore_long(state: u64, bytes: &[u8], params: &CrcParams) -> u64 {
+    let ops = crate::arch::x86_64::avx2_vpclmulqdq::X86_64Avx2VpclmulqdqOps::prefetching();
+    x86_by_order!(state, bytes, params, ops, false)
+}
+
+/// CRC-32/ISO-HDLC from [`ECORE_FOLD_END`] on the E-core parts, in its published form: the
+/// same prefetching fold, which takes the register. Out of line and returning what the
+/// checksum entry returns, so that entry reaches it by a jump.
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[inline(never)]
+#[target_feature(enable = "avx2,vpclmulqdq,sse4.1,pclmulqdq")]
+pub(crate) unsafe fn iso_hdlc_long_x86_64_avx2_ecore(crc: u32, bytes: &[u8]) -> u64 {
+    let register =
+        fold_x86_64_avx2_ecore_long(!crc as u64, bytes, &crate::crc32::consts::CRC32_ISO_HDLC);
+    !(register as u32) as u64
+}
+
 /// One x86 tier, built as [`aarch64_tier!`] is: buffers shorter than 128 bytes inline in the
 /// entry point, longer ones through an out-of-line fold with the tier's features, each bit
 /// order compiled apart. With the folds inlined into the entry point, every call saved six
@@ -248,7 +384,7 @@ macro_rules! x86_tier {
         #[inline(never)]
         #[target_feature(enable = $features)]
         unsafe fn $fold(state: u64, bytes: &[u8], params: &CrcParams, ops: $ops) -> u64 {
-            x86_by_order!(state, bytes, params, ops, $head)
+            x86_fold_plan!($fold, $features, state, bytes, params, ops, $ops, $head)
         }
 
         x86_iso_hdlc_tier!(
@@ -463,6 +599,9 @@ unsafe fn iso_hdlc_x86_64_avx2_ecore(crc: u32, bytes: &[u8]) -> u32 {
     }
     if bytes.len() >= 256 && bytes.len() < MID_END {
         return iso_hdlc_mid_x86_64_avx2_ecore(crc, bytes) as u32;
+    }
+    if bytes.len() >= ECORE_FOLD_END {
+        return iso_hdlc_long_x86_64_avx2_ecore(crc, bytes) as u32;
     }
     iso_hdlc_x86_64_avx2_vpclmulqdq(crc, bytes)
 }
@@ -1073,13 +1212,16 @@ mod tests {
         checksum: impl Fn(&[u8]) -> u64,
     ) {
         let params = &crate::crc32::consts::CRC32_ISO_HDLC;
-        let mut data = vec![0u8; 8192 + 64];
+        // Long enough for the entries that change kernel at 64 KiB
+        const LONG: usize = 64 << 10;
+        let mut data = vec![0u8; LONG + 512];
         rng().fill(&mut data[..]);
         let init = params.init_algorithm;
         let carried = crate::arch::software::update(init, &data[8192..8192 + 7], params);
 
         let mut lengths: Vec<usize> = (0..=600).collect();
         lengths.extend([1023, 1024, 1025, 4095, 4096, 4097, 8192]);
+        lengths.extend([LONG - 1, LONG, LONG + 1, LONG + 129, LONG + 300]);
         for offset in [0usize, 1, 15, 33] {
             for &len in &lengths {
                 let input = &data[offset..offset + len];
@@ -1181,6 +1323,69 @@ mod tests {
         crate::arch::x86_64::avx2_vpclmulqdq::X86_64Avx2VpclmulqdqOps::default(),
         ["avx2", "vpclmulqdq", "sse4.1", "pclmulqdq"]
     );
+    /// The E-core plan of the `x86_64-avx2-vpclmulqdq` tier, forced on any CPU with the
+    /// tier's features, against the table-driven software path over every algorithm: the
+    /// tier's entry with the plan on and then off, whichever the CPU would take.
+    #[test]
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    #[cfg_attr(miri, ignore)]
+    fn test_avx2_ecore_tier_matches_software() {
+        if !(is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("vpclmulqdq")
+            && is_x86_feature_detected!("sse4.1")
+            && is_x86_feature_detected!("pclmulqdq"))
+        {
+            eprintln!("skipping test_avx2_ecore_tier_matches_software: the CPU lacks VPCLMULQDQ");
+            return;
+        }
+        // Through the tier's entry with the plan forced each way: on a CPU that takes the plan
+        // the tier's own fold is otherwise never reached, and on one that does not, the plan
+        for plan in [true, false] {
+            ECORE_GENERIC_PLAN_FORCED.with(|forced| forced.set(Some(plan)));
+            check_x86_tier_matches_software(|state, bytes, params| unsafe {
+                update_x86_64_avx2_vpclmulqdq(
+                    state,
+                    bytes,
+                    params,
+                    crate::arch::x86_64::avx2_vpclmulqdq::X86_64Avx2VpclmulqdqOps::new(),
+                )
+            });
+        }
+        ECORE_GENERIC_PLAN_FORCED.with(|forced| forced.set(None));
+    }
+
+    /// The 128-bit fold in the AVX encoding, forced on any CPU with AVX: the plan above needs
+    /// VPCLMULQDQ to be called at all, which fewer CPUs have.
+    #[test]
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    #[cfg_attr(miri, ignore)]
+    fn test_sse_avx_fold_matches_software() {
+        if !(is_x86_feature_detected!("sse4.1")
+            && is_x86_feature_detected!("pclmulqdq")
+            && is_x86_feature_detected!("avx"))
+        {
+            eprintln!("skipping test_sse_avx_fold_matches_software: the CPU lacks AVX");
+            return;
+        }
+        check_x86_tier_matches_software(|state, bytes, params| unsafe {
+            if bytes.len() >= 128 {
+                fold_x86_sse_avx(
+                    state,
+                    bytes,
+                    params,
+                    crate::arch::x86::sse::X86SsePclmulqdqOps,
+                )
+            } else {
+                update_x86_sse_pclmulqdq(
+                    state,
+                    bytes,
+                    params,
+                    crate::arch::x86::sse::X86SsePclmulqdqOps,
+                )
+            }
+        });
+    }
+
     x86_tier_test!(
         #[cfg(target_arch = "x86_64")]
         test_avx512_pclmulqdq_tier_matches_software,

@@ -52,7 +52,9 @@ author.
 - NZB Man (maintainer)
 - **cemeyer**: the reports that CRC-32/ISCSI ran feature detection on every
   call (crc-turbo#3) and that its SSE kernel fell well short of
-  fast-crc32's on Sierra Forest, with the measurements (crc-turbo#4).
+  fast-crc32's on Sierra Forest, with the measurements (crc-turbo#4); and
+  the report, with cycle counts, that the 256-bit fold costs Sierra Forest
+  more than the 128-bit one for CRC-16/T10-DIF (crc-turbo#13).
 
 ## Code followed from other projects
 

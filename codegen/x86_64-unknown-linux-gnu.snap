@@ -26,7 +26,7 @@ crc_turbo::arch::x86::short_asm::iso_hdlc_short128_avx asm=084335501662b0f1/155 
 crc_turbo::arch::x86::short_asm::iso_hdlc_checksum_sse asm=dce057e8a8a243d1/456 glue=89 calls=0
 crc_turbo::arch::x86::short_asm::iso_hdlc_checksum_avx asm=0000000000000000/0 glue=182 calls=0
 crc_turbo::arch::x86::short_asm::iso_hdlc_checksum_avx2_vpclmulqdq asm=2ec76287e2631e48/382 glue=93 calls=0
-crc_turbo::arch::x86_64::iso_hdlc_ecore::iso_hdlc_checksum_ecore asm=403684c62861d8ae/104 glue=17 calls=0
+crc_turbo::arch::x86_64::iso_hdlc_ecore::iso_hdlc_checksum_ecore asm=403684c62861d8ae/104 glue=19 calls=0
 crc_turbo::arch::x86::short_asm::iso_hdlc_checksum_avx512_pclmulqdq asm=0000000000000000/0 glue=151 calls=0
 crc_turbo::arch::x86::short_asm::iso_hdlc_checksum_avx512_vpclmulqdq asm=0c532c176986b12c/99 glue=96 calls=0
 crc_turbo::arch::x86::short_asm::iso_hdlc_checksum_avx512_spr asm=0c532c176986b12c/99 glue=96 calls=0

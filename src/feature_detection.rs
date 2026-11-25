@@ -395,7 +395,24 @@ fn create_arch_ops() -> ArchOpsInstance {
     #[cfg(not(feature = "std"))]
     let forced: Option<&str> = None;
 
-    create_arch_ops_from_tier(choose_tier(&capabilities, forced))
+    let tier = choose_tier(&capabilities, forced);
+    // The CPU model is read with `std`, as for the other plans chosen by model. Miri does not
+    // run the CPUID instruction, and its CPU is not one of these parts.
+    #[cfg(all(feature = "std", target_arch = "x86_64", not(miri)))]
+    if ecore_generic_plan(tier, crate::crc32::fusion::is_intel_ecore()) {
+        crate::arch::set_ecore_generic_plan();
+    }
+
+    create_arch_ops_from_tier(tier)
+}
+
+/// Whether the generic fold takes the E-core plan, `crate::arch::fold_x86_64_avx2_ecore`: on
+/// Intel's E-core parts, and only when the tier is `x86_64-avx2-vpclmulqdq`. The tier itself
+/// does not change, and neither does anything below 128 bytes.
+#[cfg(target_arch = "x86_64")]
+#[cfg_attr(not(all(feature = "std", not(miri))), allow(dead_code))]
+pub(crate) fn ecore_generic_plan(tier: PerformanceTier, intel_ecore: bool) -> bool {
+    intel_ecore && tier == PerformanceTier::X86_64Avx2Vpclmulqdq
 }
 
 /// The environment variable that pins the performance tier, read once when the first CRC is
@@ -1469,6 +1486,30 @@ mod forced_tier_tests {
             choose_tier(&NONE, Some("aarch64-neon-pmull-sha3")),
             PerformanceTier::SoftwareTable
         );
+    }
+
+    /// The E-core plan is taken on the `x86_64-avx2-vpclmulqdq` tier and nowhere else: not by
+    /// the CPUs beside it on that tier (Zen 3, a hybrid part's P-cores), and not by an E-core
+    /// part on another tier (Alder Lake-N has no VPCLMULQDQ; a forced tier stays forced).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn the_ecore_plan_is_the_avx2_tier_on_ecore_parts_only() {
+        assert!(ecore_generic_plan(
+            PerformanceTier::X86_64Avx2Vpclmulqdq,
+            true
+        ));
+        assert!(!ecore_generic_plan(
+            PerformanceTier::X86_64Avx2Vpclmulqdq,
+            false
+        ));
+        for tier in [
+            PerformanceTier::X86_64SsePclmulqdq,
+            PerformanceTier::X86_64Avx512Pclmulqdq,
+            PerformanceTier::X86_64Avx512Vpclmulqdq,
+            PerformanceTier::SoftwareTable,
+        ] {
+            assert!(!ecore_generic_plan(tier, true), "{tier:?}");
+        }
     }
 
     #[test]
