@@ -212,6 +212,12 @@ own changelog up to the fork point continues below, unchanged.
   fold in the AVX encoding, as libdeflate 1.19's `crc32_pclmul_avx` does
   on these parts, instead of this tier's 256-bit fold; crc-fast has the
   generic fold there.
+- On the same parts and tier, every other algorithm takes the SSE tier's
+  128-bit kernels from 128 bytes up to 64 KiB (its short path to 191
+  bytes, then its fold in the AVX encoding), and from 64 KiB every
+  algorithm but CRC-32/ISCSI runs the 256-bit fold with a software
+  prefetch 4 KiB ahead. crc-fast's 256-bit tier (and this crate through
+  1.11.1) runs its plain 256-bit fold throughout.
 - On the same parts a CRC-32/ISO-HDLC `checksum` of 16 bytes up to 1 KiB
   is inline assembly following the compiled code of libdeflate 1.19's
   `crc32_pclmul_avx` (Eric Biggers, MIT; the file carries its notice).
@@ -466,11 +472,77 @@ own changelog up to the fork point continues below, unchanged.
 - New `checksum_zeros` and `checksum_zeros_with_params`: the CRC of `len`
   zero bytes in O(log len), without touching memory.
 
-## 1.11.2 - 2026-11-24
+## 1.11.2 - 2026-11-25
 
-No checksum, kernel or dispatch choice changes in this release: a build
-outside Miri compiles the same code as 1.11.1, and the code generation
-snapshots for both Linux targets are unchanged. It adds three checks.
+Intel's E-core parts (family 6, models 0xaf, 0xb6, 0xdd and 0xbe) on the
+`x86_64-avx2-vpclmulqdq` tier. Measured on a Xeon 6731E (Sierra Forest),
+one pinned core, against 1.11.1 unless it says otherwise; the other three
+models take the same plan and were not measured.
+
+- Every algorithm without a kernel of its own (all but CRC-32/ISO-HDLC and
+  CRC-32/ISCSI) takes the SSE tier's 128-bit kernels for buffers of 128
+  bytes up to 64 KiB, instead of the tier's four 256-bit registers: its
+  straight-line short path up to 191 bytes, and from 192 bytes its eight
+  128-bit streams in the AVX encoding. These cores run each 256-bit
+  operation as two 128-bit ones, so the 256-bit fold saves them no work
+  and its entry and tail cost more. Reported by cemeyer in crc-turbo#13,
+  CRC-16/T10-DIF over a 4 KiB sector: about 564 cycles on the 256-bit
+  fold against about 528 on this crate's own `x86_64-sse-pclmulqdq` tier.
+  Median over the 48 algorithms: 1.53x at 128 bytes, 1.48x at 160, 1.39x
+  at 192, 1.52x at 256, 1.30x at 512, 1.22x at 1 KiB, 1.11x at 2 KiB,
+  1.06x at 4 KiB, 1.10x at 4152 bytes (a sector and its 56 bytes of
+  protection information), 1.03x at 8 KiB, level from 32 KiB. CRC-16/T10-DIF
+  at 4096 bytes: 22.7 to 24.0 GB/s, and 21.4 to 23.8 at 4152. The tier's
+  fold from 128 bytes is now a test of the plan and a jump, made before
+  any register is saved, so the plan does not pay for the 256-bit fold's
+  frame. Below 128 bytes the tier's code is unchanged and the median of
+  the 48 is 1.00 at every length, but three of them (CRC-32/AIXM,
+  CRC-32/XFER, CRC-32/MPEG-2) run 96 bytes at 10.6 GB/s where 1.11.1 ran
+  them at 11.5: 10.6 to 10.9 is what the other CRC-32s that are not
+  reflected run it at in both releases.
+- From 64 KiB those algorithms and CRC-32/ISO-HDLC run the tier's 256-bit
+  fold with a software prefetch 4 KiB ahead of it. The hardware prefetchers
+  of these cores do not keep up with the fold once the buffer is past the
+  L2: no change from 64 KiB to 1 MiB, 1.13x at 4 MiB and at 16 MiB (1.32x
+  for CRC-32/ISO-HDLC, 18.4 to 24.3 GB/s), and 1.4x at 64 MiB with the
+  core to itself, more with a second stream competing for memory.
+  CRC-32/ISCSI's kernel is not changed.
+- Fixed: on these parts a CRC-32/ISO-HDLC `checksum` of 16 bytes to 1 KiB
+  whose length is not a multiple of 16 read its tail-shift table across a
+  cache line, and across a page in about one build in 64, depending on
+  where the linker put the table. In a build where it did, a 24-byte
+  checksum ran at 1.5 GB/s where it should run at 4.7. The table now
+  starts on a cache line, held by a compile-time assertion. The value was
+  never wrong.
+- No other CPU's choice changes: the plan is taken only when the selected
+  tier is `x86_64-avx2-vpclmulqdq` and the CPU is one of those models,
+  decided once when the tier is chosen. The tier still reports itself as
+  `x86_64-avx2-vpclmulqdq`, and `CRC_TURBO_TIER=x86_64-sse-pclmulqdq`
+  still selects the two-operand SSE tier. The other CPUs of that tier
+  (Zen 3, the P-cores of the hybrid parts) gain one load, an untaken
+  branch and a jump per call from 128 bytes. That was not timed on them;
+  on the Xeon with the plan left off it cost a median 1% from 128 bytes to
+  1 KiB (3% at 129 bytes) and nothing from 2 KiB.
+- Not closed by this release, on the same Xeon: the forced
+  `x86_64-sse-pclmulqdq` tier is still ahead of the default from 128 to
+  191 bytes (median 0.90 at 128, 0.84 at 160, 0.94 at 192) and at some
+  lengths below 128 (0.87 at 56, 0.90 at 24), because its short path is
+  chosen in the tier's entry, ahead of the call to the fold. Choosing it
+  there for these parts closed that (1.6x to 1.77x of 1.11.1 from 128 to
+  191 bytes), but any change to that entry, even one never taken, moved
+  single algorithms by 15% either way below 128 bytes, and a tier of
+  their own for these parts lost 3% to 14% there; neither was taken.
+- The 1.11.1 benchmark matrix compared these algorithms on Sierra Forest
+  only with 1.11.0, which runs the same 256-bit fold, so it could not show
+  any of this.
+- `codegen/x86_64-unknown-linux-gnu.snap` and
+  `codegen/x86_64-pc-windows-msvc.snap` re-blessed for
+  `iso_hdlc_checksum_ecore`: its 64 KiB handoff adds a compare and a jump
+  (2 instructions on Linux, 6 on Windows), no call, same assembly.
+
+Apart from the E-core change above, no checksum, kernel or dispatch choice
+changes in this release: a build outside Miri compiles the same code as
+1.11.1 on every other CPU. It also adds three checks.
 
 - `cargo xtask codegen check` refuses an `asm!` scratch operand of class
   `zmm_reg` with no type (`out(zmm_reg) _` or `lateout(zmm_reg) _`) anywhere

@@ -67,8 +67,11 @@ const fn pair(distance: usize) -> [u64; 2] {
     ]
 }
 
-/// The entry's constants, one 64-byte line for the coefficient pairs and the reduction, and
-/// libdeflate's shift table after them.
+/// The entry's constants: the coefficient pairs and the reduction, then libdeflate's shift
+/// table on a 64-byte line of its own. The tail reads 16 bytes of it at 1 to 31, so anywhere
+/// else those reads cross a line, and in one link layout in 64 a page: in a build where the
+/// table straddled a page a Xeon 6731E took about 25 cycles more for every length that is
+/// not a multiple of 16, three times as long for 24 bytes.
 #[cfg(not(miri))]
 #[repr(C, align(64))]
 struct Consts {
@@ -79,7 +82,7 @@ struct Consts {
     fold96: [u64; 2],
     /// The 96-bit Barrett quotient constant in the low word and P in the high.
     barrett: [u64; 2],
-    _pad: [u64; 2],
+    _pad: [u64; 6],
     /// Sixteen 0xff, the indices 0 to 15, sixteen 0xff: read at `r` it moves the low `r` bytes
     /// of a register to its top, read at `r + 16` it moves the rest down and marks the top `r`
     /// bytes for the blend.
@@ -98,7 +101,7 @@ static CONSTS: Consts = Consts {
     k1: pair(1),
     fold96: [KEYS[5], 0],
     barrett: [KEYS[0], KEYS[8]],
-    _pad: [0; 2],
+    _pad: [0; 6],
     shift: {
         let mut t = [0xffu8; 48];
         let mut i = 0;
@@ -131,6 +134,8 @@ const FOLD96: usize = core::mem::offset_of!(Consts, fold96);
 const BARRETT: usize = core::mem::offset_of!(Consts, barrett);
 #[cfg(not(miri))]
 const SHIFT: usize = core::mem::offset_of!(Consts, shift);
+#[cfg(not(miri))]
+const _: () = assert!(SHIFT & 63 == 0 && core::mem::align_of::<Consts>() == 64);
 
 /// The CRC-32/ISO-HDLC register after `bytes` from `state`, the register before them (not the
 /// published CRC), for 16 bytes up to 1023, in line in the checksum entry: the 16 to 63 byte
@@ -314,6 +319,9 @@ pub(crate) unsafe fn iso_hdlc_checksum_ecore(bytes: &[u8]) -> u64 {
     }
     if len >= ASM_END {
         if len >= crate::arch::MID_END {
+            if len >= crate::arch::ECORE_FOLD_END {
+                return crate::arch::iso_hdlc_long_x86_64_avx2_ecore(0, bytes);
+            }
             return crate::arch::iso_hdlc_fold_x86_64_avx2_vpclmulqdq(0, bytes);
         }
         return crate::arch::iso_hdlc_mid_x86_sse_avx(0, bytes);

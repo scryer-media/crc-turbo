@@ -18,8 +18,15 @@ use core::arch::x86_64::*;
 
 /// Implements the ArchOps trait using 256-bit AVX2 and VPCLMULQDQ instructions.
 /// Delegates to X86SsePclmulqdqOps for standard 128-bit operations
+///
+/// `PREFETCH` has the fold loop ask for the data `PREFETCH_AHEAD` bytes on, for the CPUs
+/// whose own prefetchers do not keep up with it: see [`Self::prefetching`].
 #[derive(Debug, Copy, Clone)]
-pub struct X86_64Avx2VpclmulqdqOps(X86SsePclmulqdqOps);
+pub struct X86_64Avx2VpclmulqdqOps<const PREFETCH: bool = false>(X86SsePclmulqdqOps);
+
+/// How far ahead of the fold the prefetching loop asks for its data: on a Xeon 6731E 2 KiB
+/// to 8 KiB were level up to 32 MiB, and at 64 MiB 4 KiB was about a fifth ahead of 2 KiB.
+const PREFETCH_AHEAD: usize = 4096;
 
 impl Default for X86_64Avx2VpclmulqdqOps {
     fn default() -> Self {
@@ -30,6 +37,17 @@ impl Default for X86_64Avx2VpclmulqdqOps {
 impl X86_64Avx2VpclmulqdqOps {
     #[inline(always)]
     pub fn new() -> Self {
+        Self(X86SsePclmulqdqOps)
+    }
+}
+
+impl X86_64Avx2VpclmulqdqOps<true> {
+    /// The same fold with a software prefetch in its loop, for Intel's E-core parts, whose
+    /// hardware prefetchers do not keep up with it past the L2: on a Xeon 6731E it cost
+    /// nothing from 64 KiB to 1 MiB and was 6% ahead at 8 MiB, 10% at 16 MiB, about 20% at
+    /// 32 MiB and 1.4 to 2 times at 64 MiB, over all 50 algorithms.
+    #[inline(always)]
+    pub fn prefetching() -> Self {
         Self(X86SsePclmulqdqOps)
     }
 }
@@ -72,7 +90,7 @@ impl Simd256 {
     }
 }
 
-impl X86_64Avx2VpclmulqdqOps {
+impl<const PREFETCH: bool> X86_64Avx2VpclmulqdqOps<PREFETCH> {
     /// Folds `chunks` 128-byte blocks from `data`, which need not be aligned, with 4 x 256-bit
     /// registers, into one 128-bit vector ready for the final reduction.
     ///
@@ -121,6 +139,13 @@ impl X86_64Avx2VpclmulqdqOps {
 
         for chunk in 1..chunks {
             let block_ptr = data.add(chunk * 128);
+
+            if PREFETCH {
+                // Two lines per 128-byte block; a prefetch past the end does not fault
+                let ahead = block_ptr.wrapping_add(PREFETCH_AHEAD) as *const i8;
+                _mm_prefetch::<_MM_HINT_T0>(ahead);
+                _mm_prefetch::<_MM_HINT_T0>(ahead.wrapping_add(64));
+            }
 
             x[0] = x[0].fold_32(
                 &coeff,
@@ -360,7 +385,7 @@ unsafe fn shuffle_bytes256(data: Simd256, mask: Simd256) -> Simd256 {
 }
 
 // Delegate all ArchOps methods to the inner X86SsePclmulqdqOps instance
-impl ArchOps for X86_64Avx2VpclmulqdqOps {
+impl<const PREFETCH: bool> ArchOps for X86_64Avx2VpclmulqdqOps<PREFETCH> {
     type Vector = __m128i;
 
     #[inline(always)]
