@@ -40,6 +40,12 @@ static CACHE: OnceLock<RwLock<HashMap<CrcParamsCacheKey, [u64; 23]>>> = OnceLock
 #[cfg(all(not(feature = "std"), feature = "cache"))]
 static CACHE: Once<RwLock<HashMap<CrcParamsCacheKey, [u64; 23]>>> = Once::new();
 
+/// The most parameter sets whose keys the cache holds: 1024, about 200 KiB. Keys for a set
+/// beyond that are generated on each call and not stored, so a program that builds parameters
+/// from untrusted or ever-changing input does not grow the cache without bound.
+#[cfg(any(feature = "std", feature = "cache"))]
+pub(crate) const MAX_CACHED_KEY_SETS: usize = 1024;
+
 /// Cache key for storing CRC parameters that affect key generation
 ///
 /// Only includes parameters that directly influence the mathematical computation
@@ -133,9 +139,11 @@ pub fn get_or_generate_keys(width: u8, poly: u64, reflected: bool) -> [u64; 23] 
 
         // Try to cache the result (best effort - if this fails, we still return valid keys)
         // Lock poisoning or write failure doesn't affect functionality
-        let _ = get_cache()
-            .write()
-            .map(|mut cache| cache.insert(cache_key, keys));
+        let _ = get_cache().write().map(|mut cache| {
+            if cache.len() < MAX_CACHED_KEY_SETS {
+                cache.insert(cache_key, keys);
+            }
+        });
 
         keys
     }
@@ -159,7 +167,9 @@ pub fn get_or_generate_keys(width: u8, poly: u64, reflected: bool) -> [u64; 23] 
         // Cache the result - spin::RwLock doesn't use Result wrapper
         {
             let mut cache = get_cache().write();
-            cache.insert(cache_key, keys);
+            if cache.len() < MAX_CACHED_KEY_SETS {
+                cache.insert(cache_key, keys);
+            }
         }
 
         keys
@@ -202,10 +212,43 @@ pub(crate) fn clear_cache() {
     }
 }
 
+/// The number of parameter sets the cache holds.
+#[cfg(all(test, feature = "std"))]
+pub(crate) fn cached_key_sets() -> usize {
+    get_cache().read().map(|cache| cache.len()).unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    /// Past the cap, keys are still right but no longer stored. Other tests may clear the cache
+    /// at any moment, so only the bound is asserted, never an exact count.
+    ///
+    /// Skipped under Miri for time, like the allocation stress test: it generates over a
+    /// thousand key sets.
+    #[test]
+    #[cfg(feature = "std")]
+    #[cfg_attr(miri, ignore)]
+    fn the_key_cache_stops_growing_at_its_cap() {
+        let extra = 64;
+        // Polynomials no other test uses, all distinct, all within 32 bits.
+        for i in 0..(MAX_CACHED_KEY_SETS + extra) as u64 {
+            let poly = 0x8000_0001 | (i << 1);
+            let keys = get_or_generate_keys(32, poly, false);
+            if i % 97 == 0 {
+                assert_eq!(keys, generate::keys(32, poly, false));
+            }
+            assert!(cached_key_sets() <= MAX_CACHED_KEY_SETS);
+        }
+        let poly = 0x8000_0001 | (((MAX_CACHED_KEY_SETS + extra) as u64) << 1);
+        assert_eq!(
+            get_or_generate_keys(32, poly, false),
+            generate::keys(32, poly, false)
+        );
+        assert!(cached_key_sets() <= MAX_CACHED_KEY_SETS);
+    }
 
     #[test]
     fn test_cache_key_creation() {

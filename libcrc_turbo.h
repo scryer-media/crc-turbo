@@ -54,6 +54,15 @@ typedef enum CrcTurboError {
    * `refin` and `refout` differ, which the library does not support
    */
   MismatchedReflection = 9,
+  /**
+   * The polynomial has a bit set at or above bit `width`
+   */
+  PolyOutsideWidth = 10,
+  /**
+   * The library already holds the most distinct key sets it keeps for C callers (1024); the
+   * parameters are returned without keys
+   */
+  KeyStorageFull = 11,
 } CrcTurboError;
 
 /**
@@ -138,6 +147,13 @@ typedef struct CrcTurboDigestHandle {
 
 /**
  * Custom CRC parameters
+ *
+ * Take these from crc_turbo_get_custom_params() and pass them on unmodified. The library does
+ * not check, on each call, that algorithm, width, poly, refin and keys belong together: keys
+ * must be the ones the library generated for that width, poly and bit order, and algorithm
+ * must be the custom variant it returned (or a built-in whose catalogued parameters these are).
+ * A struct whose fields were changed can abort the process or give results that differ between
+ * CPUs. This is by design, so that checksumming pays for no validation.
  */
 typedef struct CrcTurboParams {
   enum CrcTurboAlgorithm algorithm;
@@ -248,6 +264,8 @@ uint64_t crc_turbo_checksum(enum CrcTurboAlgorithm algorithm, const char *data, 
  * Helper method to calculate a CRC checksum directly for data using custom parameters
  * Returns 0 if parameters are invalid or data is null
  * Call crc_turbo_get_last_error() to get the specific error code
+ * params must be as crc_turbo_get_custom_params() returned them: their keys are not checked
+ * against width and poly on each call (see CrcTurboParams)
  */
 uint64_t crc_turbo_checksum_with_params(struct CrcTurboParams params,
                                         const char *data,
@@ -291,8 +309,14 @@ uint64_t crc_turbo_checksum_combine_with_params(struct CrcTurboParams params,
 
 /**
  * Returns the custom CRC parameters for a given set of Rocksoft CRC parameters
- * If width is not 16, 32 or 64, sets error to UnsupportedWidth and returns parameters without
- * keys, which every _with_params function rejects
+ *
+ * If width is not 16, 32 or 64, sets error to UnsupportedWidth; if poly has a bit set at or
+ * above bit width, sets error to PolyOutsideWidth; if the library already holds the most key
+ * sets it keeps, sets error to KeyStorageFull. In each of those cases the parameters are
+ * returned without keys, which every _with_params function rejects.
+ *
+ * The name is not stored or returned; a name that is not UTF-8 sets InvalidUtf8, and the
+ * parameters are still returned with their keys.
  */
 struct CrcTurboParams crc_turbo_get_custom_params(const char *name_ptr,
                                                   uint8_t width,

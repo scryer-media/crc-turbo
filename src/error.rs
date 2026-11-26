@@ -25,6 +25,14 @@ pub enum CrcError {
     /// placeholders that [`CrcParams`](crate::CrcParams) carries, and only the `*_with_params`
     /// functions accept them.
     MissingParams(CrcAlgorithm),
+    /// The polynomial has a bit set at or above bit `width`, so it is not a polynomial of that
+    /// width.
+    PolyOutsideWidth {
+        /// The width the polynomial was given for.
+        width: u8,
+        /// The polynomial as given.
+        poly: u64,
+    },
 }
 
 impl fmt::Display for CrcError {
@@ -39,6 +47,10 @@ impl fmt::Display for CrcError {
             Self::MissingParams(algorithm) => write!(
                 f,
                 "{algorithm:?} is a placeholder for custom parameters: build a CrcParams and use the *_with_params functions"
+            ),
+            Self::PolyOutsideWidth { width, poly } => write!(
+                f,
+                "polynomial {poly:#x} does not fit in a {width}-bit CRC: it has bits set at or above bit {width}"
             ),
         }
     }
@@ -64,6 +76,14 @@ mod tests {
         assert!(CrcError::MissingParams(CrcAlgorithm::CrcCustom)
             .to_string()
             .starts_with("CrcCustom is a placeholder"));
+        assert_eq!(
+            CrcError::PolyOutsideWidth {
+                width: 16,
+                poly: 0x1_1021
+            }
+            .to_string(),
+            "polynomial 0x11021 does not fit in a 16-bit CRC: it has bits set at or above bit 16"
+        );
     }
 
     #[test]

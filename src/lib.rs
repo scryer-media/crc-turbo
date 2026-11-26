@@ -427,10 +427,20 @@ impl PartialEq<CrcKeysStorage> for [u64; 23] {
 }
 
 /// Parameters for CRC computation, including polynomial, initial value, and other settings.
+///
+/// Build these with [`CrcParams::new`] or [`CrcParams::try_new`], or take a built-in set, and
+/// pass them on unmodified. The fields are public, but they are not checked again when a
+/// checksum is computed: the folding keys, the software table and the field values must agree,
+/// and only the constructors make them agree. A set whose fields were edited afterwards (for
+/// example `width` set to a value other than 16, 32 or 64, or `poly` changed without new keys)
+/// can panic or give results that differ between CPUs. This is by design, so that checksumming
+/// pays for no validation.
 #[derive(Clone, Copy, Debug)]
 pub struct CrcParams {
     pub algorithm: CrcAlgorithm,
     pub name: &'static str,
+    /// The CRC width in bits: 16, 32 or 64. Set by the constructors; changing it afterwards, in
+    /// particular to any other value, can panic or give CPU-dependent results.
     pub width: u8,
     pub poly: u64,
     pub init: u64,
@@ -736,6 +746,10 @@ impl Digest {
     ///
     /// assert_eq!(checksum, 0xcbf43926);
     /// ```
+    ///
+    /// `params` must come from [`CrcParams::new`] or [`CrcParams::try_new`] (or be a built-in
+    /// set), unmodified: the fields are not validated here, and edited fields can panic or give
+    /// CPU-dependent results. See [`CrcParams`].
     #[inline(always)]
     pub fn new_with_params(params: CrcParams) -> Self {
         let calculator = Calculator::calculate as CalculatorFn;
@@ -778,9 +792,12 @@ impl Digest {
     }
 
     /// Combines the CRC state with a second `Digest` instance.
+    ///
+    /// The byte count [`Digest::get_amount`] reports wraps modulo 2^64 if the sum overflows; the
+    /// checksum does not depend on it.
     #[inline(always)]
     pub fn combine(&mut self, other: &Self) {
-        self.amount += other.amount;
+        self.amount = self.amount.wrapping_add(other.amount);
         let other_crc = other.finalize();
 
         // note the xorout for the input, since it's already been applied so it has to be removed,
@@ -1128,6 +1145,10 @@ fn checksum_by_table(algorithm: CrcAlgorithm, buf: &[u8]) -> u64 {
 ///
 /// assert_eq!(checksum, 0xcbf43926);
 /// ```
+///
+/// `params` must come from [`CrcParams::new`] or [`CrcParams::try_new`] (or be a built-in set),
+/// unmodified: the fields are not validated here, and edited fields can panic or give
+/// CPU-dependent results. See [`CrcParams`].
 pub fn checksum_with_params(params: CrcParams, buf: &[u8]) -> u64 {
     let calculator = Calculator::calculate as CalculatorFn;
 
@@ -1140,7 +1161,11 @@ pub fn checksum_with_params(params: CrcParams, buf: &[u8]) -> u64 {
 ///
 /// # Errors
 ///
-/// This function will return an error if the file cannot be read.
+/// Returns the error if the file cannot be opened or a read fails (an interrupted read is
+/// retried), and an `InvalidInput` error if `chunk_size` is `Some(0)`.
+///
+/// `chunk_size` is the read buffer size: 512 KiB when `None`, and at most 64 MiB, to which a
+/// larger value is clamped.
 ///
 /// # Examples
 /// ### checksum_file
@@ -1172,7 +1197,11 @@ pub fn checksum_file(
 ///
 /// # Errors
 ///
-/// This function will return an error if the file cannot be read.
+/// Returns the error if the file cannot be opened or a read fails (an interrupted read is
+/// retried), and an `InvalidInput` error if `chunk_size` is `Some(0)`.
+///
+/// `chunk_size` is the read buffer size: 512 KiB when `None`, and at most 64 MiB, to which a
+/// larger value is clamped.
 ///
 /// # Examples
 ///
@@ -1208,33 +1237,66 @@ pub fn checksum_file_with_params(
     checksum_file_with_digest(Digest::new_with_params(params), path, chunk_size)
 }
 
+/// The read buffer [`checksum_file`] and [`checksum_file_with_params`] use when `chunk_size` is
+/// `None`: 512 KiB.
+///
+/// Measured on an Apple M2 Ultra: 4 KiB ~7 GiB/s, 64 KiB ~22 GiB/s, 512 KiB ~24 GiB/s.
+#[cfg(feature = "std")]
+const DEFAULT_FILE_CHUNK_SIZE: usize = 512 * 1024;
+
+/// The largest read buffer [`checksum_file`] and [`checksum_file_with_params`] allocate: 64 MiB.
+/// A larger `chunk_size` is clamped down to it, since reads past this size gain nothing.
+#[cfg(feature = "std")]
+const MAX_FILE_CHUNK_SIZE: usize = 64 * 1024 * 1024;
+
 /// Computes the CRC checksum for the given file using the specified Digest.
 ///
 /// # Errors
 ///
-/// This function will return an error if the file cannot be read.
+/// This function will return an error if the file cannot be opened or read, or if `chunk_size`
+/// is `Some(0)`.
 #[cfg(feature = "std")]
 fn checksum_file_with_digest(
-    mut digest: Digest,
+    digest: Digest,
     path: &str,
     chunk_size: Option<usize>,
 ) -> Result<u64, std::io::Error> {
-    let mut file = File::open(path)?;
+    let chunk_size = file_chunk_size(chunk_size)?;
+    let file = File::open(path)?;
+    checksum_reader_with_digest(digest, file, chunk_size)
+}
 
-    // 512KiB KiB was fastest in my benchmarks on an Apple M2 Ultra
-    //
-    // 4KiB ~7GiB/s
-    // 64KiB ~22 GiB/s
-    // 512KiB ~24 GiB/s
-    let chunk_size = chunk_size.unwrap_or(524288);
+/// The read buffer size for a requested `chunk_size`: the default for `None`, an
+/// `InvalidInput` error for `Some(0)`, and at most [`MAX_FILE_CHUNK_SIZE`].
+#[cfg(feature = "std")]
+fn file_chunk_size(chunk_size: Option<usize>) -> Result<usize, std::io::Error> {
+    match chunk_size {
+        None => Ok(DEFAULT_FILE_CHUNK_SIZE),
+        Some(0) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "chunk_size must be greater than zero",
+        )),
+        Some(size) => Ok(size.min(MAX_FILE_CHUNK_SIZE)),
+    }
+}
 
+/// Feeds `reader` into `digest` until it reports end of input, retrying interrupted reads and
+/// returning any other read error.
+#[cfg(feature = "std")]
+fn checksum_reader_with_digest<R: Read>(
+    mut digest: Digest,
+    mut reader: R,
+    chunk_size: usize,
+) -> Result<u64, std::io::Error> {
     let mut buf = vec![0; chunk_size];
 
-    while let Ok(n) = file.read(&mut buf) {
-        if n == 0 {
-            break;
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => digest.update(&buf[..n]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
         }
-        digest.update(&buf[..n]);
     }
 
     Ok(digest.finalize())
@@ -1652,6 +1714,115 @@ mod lib {
     use cbindgen::Style::Both;
     use rand::{rng, RngExt};
     use std::fs::{read, write};
+
+    /// A reader that yields its bytes, then an interruption, then more bytes, then an error.
+    struct FailingReader {
+        steps: std::vec::IntoIter<std::io::Result<&'static [u8]>>,
+    }
+
+    impl Read for FailingReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.steps.next() {
+                Some(Ok(bytes)) => {
+                    buf[..bytes.len()].copy_from_slice(bytes);
+                    Ok(bytes.len())
+                }
+                Some(Err(error)) => Err(error),
+                None => Ok(0),
+            }
+        }
+    }
+
+    #[test]
+    fn a_read_error_after_some_bytes_is_returned() {
+        let reader = FailingReader {
+            steps: vec![
+                Ok(&b"1234"[..]),
+                Err(std::io::ErrorKind::Other.into()),
+                Ok(&b"56789"[..]),
+            ]
+            .into_iter(),
+        };
+        let error =
+            checksum_reader_with_digest(Digest::new(CrcAlgorithm::Crc32IsoHdlc), reader, 64)
+                .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+    }
+
+    #[test]
+    fn an_interrupted_read_is_retried() {
+        let reader = FailingReader {
+            steps: vec![
+                Ok(&b"1234"[..]),
+                Err(std::io::ErrorKind::Interrupted.into()),
+                Ok(&b"56789"[..]),
+            ]
+            .into_iter(),
+        };
+        let crc = checksum_reader_with_digest(Digest::new(CrcAlgorithm::Crc32IsoHdlc), reader, 64)
+            .expect("an interruption is not an error");
+        assert_eq!(crc, 0xcbf43926);
+    }
+
+    #[test]
+    fn a_zero_chunk_size_is_invalid_input() {
+        assert_eq!(
+            file_chunk_size(Some(0)).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert_eq!(file_chunk_size(None).unwrap(), DEFAULT_FILE_CHUNK_SIZE);
+        assert_eq!(file_chunk_size(Some(1)).unwrap(), 1);
+        assert_eq!(
+            file_chunk_size(Some(usize::MAX)).unwrap(),
+            MAX_FILE_CHUNK_SIZE
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // Miri's isolation forbids opening files
+    fn every_chunk_size_hashes_the_whole_file() {
+        let path = "crc-check.txt";
+        for chunk_size in [None, Some(1), Some(2), Some(4096), Some(usize::MAX)] {
+            assert_eq!(
+                checksum_file(CrcAlgorithm::Crc32IsoHdlc, path, chunk_size).unwrap(),
+                0xcbf43926,
+                "{chunk_size:?}"
+            );
+        }
+        let error = checksum_file(CrcAlgorithm::Crc32IsoHdlc, path, Some(0)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    /// A directory opens on Unix but every read of it fails, which used to be taken as the end
+    /// of the file.
+    #[test]
+    #[cfg_attr(miri, ignore)] // Miri's isolation forbids opening files
+    fn a_path_that_cannot_be_read_is_an_error() {
+        let dir = ".";
+        assert!(checksum_file(CrcAlgorithm::Crc32IsoHdlc, dir, None).is_err());
+        let params = CrcParams::new("custom", 32, 0x04c11db7, 0xffffffff, true, 0xffffffff, 0);
+        assert!(checksum_file_with_params(params, dir, None).is_err());
+    }
+
+    /// Combining a digest with itself doubles its byte count; the count wraps rather than
+    /// overflowing, and the checksum is still the combine of the two halves.
+    #[test]
+    fn combining_past_the_byte_count_wraps() {
+        let mut digest = Digest::new(CrcAlgorithm::Crc32IsoHdlc);
+        digest.update(b"1");
+        for _ in 0..64 {
+            let copy = digest;
+            let expected = checksum_combine(
+                CrcAlgorithm::Crc32IsoHdlc,
+                copy.finalize(),
+                copy.finalize(),
+                copy.get_amount(),
+            );
+            digest.combine(&copy);
+            assert_eq!(digest.finalize(), expected);
+        }
+        assert_eq!(digest.get_amount(), 0);
+    }
 
     #[test]
     fn test_checksum_check() {

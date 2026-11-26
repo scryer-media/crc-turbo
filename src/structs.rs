@@ -94,7 +94,8 @@ impl CrcParams {
     ///
     /// # Panics
     ///
-    /// If `width` is not 16, 32 or 64; [`CrcParams::try_new`] returns the error instead.
+    /// If `width` is not 16, 32 or 64, or `poly` has a bit set at or above bit `width`;
+    /// [`CrcParams::try_new`] returns the error instead.
     pub fn new(
         name: &'static str,
         width: u8,
@@ -110,7 +111,10 @@ impl CrcParams {
         }
     }
 
-    /// [`CrcParams::new`] that returns [`CrcError::UnsupportedWidth`] instead of panicking.
+    /// [`CrcParams::new`] that returns an error instead of panicking:
+    /// [`CrcError::UnsupportedWidth`] for a width other than 16, 32 or 64, and
+    /// [`CrcError::PolyOutsideWidth`] for a polynomial with a bit set at or above bit `width`
+    /// (the implicit top bit is not written).
     ///
     /// # Examples
     ///
@@ -123,6 +127,9 @@ impl CrcParams {
     ///
     /// let error = CrcParams::try_new("CRC-8/CUSTOM", 8, 0x07, 0, false, 0, 0xf4).unwrap_err();
     /// assert_eq!(error, CrcError::UnsupportedWidth(8));
+    ///
+    /// let error = CrcParams::try_new("CRC-16/CUSTOM", 16, 0x1_1021, 0, false, 0, 0).unwrap_err();
+    /// assert_eq!(error, CrcError::PolyOutsideWidth { width: 16, poly: 0x1_1021 });
     /// ```
     pub fn try_new(
         name: &'static str,
@@ -136,6 +143,11 @@ impl CrcParams {
         // Checked before the keys are generated, which the generator cannot do for another width.
         if !matches!(width, 16 | 32 | 64) {
             return Err(CrcError::UnsupportedWidth(width));
+        }
+        // A value with bits above the width is not a polynomial of that width; the tiers would
+        // drop those bits without notice.
+        if width < 64 && poly >> width != 0 {
+            return Err(CrcError::PolyOutsideWidth { width, poly });
         }
 
         let keys_array = cache::get_or_generate_keys(width, poly, reflected);
@@ -226,5 +238,24 @@ mod initial_state_tests {
         // The forward form starts from init as given.
         assert_eq!(initial_state(32, 0x12345678, false), 0x12345678);
         assert_eq!(initial_state(32, 0x12345678, true), 0x1e6a2c48);
+    }
+
+    #[test]
+    fn a_polynomial_outside_its_width_is_rejected() {
+        for (width, poly) in [(16u8, 0x1_1021u64), (16, 1 << 63), (32, 0x1_04c1_1db7)] {
+            assert_eq!(
+                CrcParams::try_new("custom", width, poly, 0, true, 0, 0).unwrap_err(),
+                CrcError::PolyOutsideWidth { width, poly }
+            );
+        }
+        assert!(CrcParams::try_new("custom", 16, 0xffff, 0, false, 0, 0).is_ok());
+        assert!(CrcParams::try_new("custom", 32, 0xffff_ffff, 0, false, 0, 0).is_ok());
+        assert!(CrcParams::try_new("custom", 64, u64::MAX, 0, false, 0, 0).is_ok());
+    }
+
+    #[test]
+    #[should_panic(expected = "does not fit in a 32-bit CRC")]
+    fn new_panics_on_a_polynomial_outside_its_width() {
+        CrcParams::new("custom", 32, 0x1_04c1_1db7, 0, false, 0, 0);
     }
 }
