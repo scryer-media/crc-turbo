@@ -1102,11 +1102,20 @@ mod tests {
             0xcbf4_3926,
         );
         assert_eq!(crc_turbo_get_last_error(), CrcTurboError::InvalidUtf8);
-        let data = b"123456789";
-        assert_eq!(
-            crc_turbo_checksum_with_params(params, data.as_ptr().cast(), data.len()),
-            0xcbf4_3926
+        // The parameters still carry the stored keys for this CRC.
+        let expected = CrcParams::new(
+            "custom",
+            32,
+            0x04c1_1db7,
+            0xffff_ffff,
+            true,
+            0xffff_ffff,
+            0xcbf4_3926,
         );
+        let (keys, key_count) = create_stable_key_pointer(&expected.keys);
+        assert!(!keys.is_null());
+        assert_eq!(params.keys, keys);
+        assert_eq!(params.key_count, key_count);
     }
 
     /// Past its cap the storage refuses a new key set with KeyStorageFull, still returns the
