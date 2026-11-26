@@ -13,14 +13,11 @@
 use crate::CrcAlgorithm;
 use crate::CrcParams;
 use crate::{get_calculator_target, Digest};
-use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::slice;
 use std::sync::{Mutex, OnceLock};
-
-static STRING_CACHE: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
 
 /// Error codes for FFI operations
 #[repr(C)]
@@ -47,6 +44,11 @@ pub enum CrcTurboError {
     UnsupportedAlgorithm = 8,
     /// `refin` and `refout` differ, which the library does not support
     MismatchedReflection = 9,
+    /// The polynomial has a bit set at or above bit `width`
+    PolyOutsideWidth = 10,
+    /// The library already holds the most distinct key sets it keeps for C callers (1024); the
+    /// parameters are returned without keys
+    KeyStorageFull = 11,
 }
 
 impl CrcTurboError {
@@ -69,6 +71,12 @@ impl CrcTurboError {
             CrcTurboError::MismatchedReflection => {
                 c"refin and refout differ (both must be true or both false)"
             }
+            CrcTurboError::PolyOutsideWidth => {
+                c"Polynomial has bits set at or above bit width (the top bit is implicit)"
+            }
+            CrcTurboError::KeyStorageFull => {
+                c"Too many distinct custom parameter sets: no more keys can be stored"
+            }
         }
     }
 }
@@ -88,33 +96,39 @@ fn clear_last_error() {
     LAST_ERROR.with(|e| e.set(CrcTurboError::Success));
 }
 
-// Global storage for stable key pointers to ensure they remain valid across FFI boundary
-static STABLE_KEY_STORAGE: OnceLock<Mutex<HashMap<u64, Box<[u64]>>>> = OnceLock::new();
+/// The keys handed to C callers. A pointer into this storage is held by the caller for as long
+/// as it likes, so an entry is never removed or moved; entries are keyed by the key values
+/// themselves, so the storage grows only with distinct key sets (one per distinct width,
+/// polynomial and bit order), never with repeated calls.
+static STABLE_KEY_STORAGE: OnceLock<Mutex<HashSet<Box<[u64]>>>> = OnceLock::new();
+
+/// The most distinct key sets [`STABLE_KEY_STORAGE`] holds: 1024, about 200 KiB. Past it, a new
+/// key set is not stored and the parameters are returned without keys, with `KeyStorageFull`;
+/// every pointer already returned stays valid.
+const MAX_STABLE_KEY_SETS: usize = 1024;
 
 /// Creates a stable pointer to the keys for FFI usage.
 /// The keys are stored in global memory to ensure the pointer remains valid.
-/// Returns (pointer, count) on success, or (null, 0) on error.
-/// Sets CrcTurboError::LockPoisoned on lock failure.
+/// Returns (pointer, count) on success, or (null, 0) on error, setting LockPoisoned on lock
+/// failure and KeyStorageFull when the storage holds [`MAX_STABLE_KEY_SETS`] other key sets.
 fn create_stable_key_pointer(keys: &crate::CrcKeysStorage) -> (*const u64, u32) {
-    let storage = STABLE_KEY_STORAGE.get_or_init(|| Mutex::new(HashMap::new()));
+    let storage = STABLE_KEY_STORAGE.get_or_init(|| Mutex::new(HashSet::new()));
+    stable_key_pointer_in(storage, keys, MAX_STABLE_KEY_SETS)
+}
 
-    // Create a unique hash for this key set to avoid duplicates
-    let key_hash = match keys {
-        crate::CrcKeysStorage::KeysFold256(keys) => {
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            use std::hash::{Hash, Hasher};
-            keys.hash(&mut hasher);
-            hasher.finish()
-        }
-        crate::CrcKeysStorage::KeysFutureTest(keys) => {
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            use std::hash::{Hash, Hasher};
-            keys.hash(&mut hasher);
-            hasher.finish()
-        }
+/// [`create_stable_key_pointer`] against a given storage and cap, so the cap can be tested
+/// without filling the process-wide storage.
+fn stable_key_pointer_in(
+    storage: &Mutex<HashSet<Box<[u64]>>>,
+    keys: &crate::CrcKeysStorage,
+    cap: usize,
+) -> (*const u64, u32) {
+    let key_slice: &[u64] = match keys {
+        crate::CrcKeysStorage::KeysFold256(keys) => keys,
+        crate::CrcKeysStorage::KeysFutureTest(keys) => keys,
     };
 
-    let mut storage_map = match storage.lock() {
+    let mut storage_set = match storage.lock() {
         Ok(guard) => guard,
         Err(_) => {
             set_last_error(CrcTurboError::LockPoisoned);
@@ -122,25 +136,21 @@ fn create_stable_key_pointer(keys: &crate::CrcKeysStorage) -> (*const u64, u32) 
         }
     };
 
-    // Check if we already have this key set stored
-    if let Some(stored_keys) = storage_map.get(&key_hash) {
+    // The boxed slice's heap allocation does not move when the set rehashes, so a pointer into
+    // it stays valid for the life of the process.
+    if let Some(stored_keys) = storage_set.get(key_slice) {
         return (stored_keys.as_ptr(), stored_keys.len() as u32);
     }
+    if storage_set.len() >= cap {
+        set_last_error(CrcTurboError::KeyStorageFull);
+        return (std::ptr::null(), 0);
+    }
 
-    // Store the keys in stable memory
-    let key_vec: Vec<u64> = match keys {
-        crate::CrcKeysStorage::KeysFold256(keys) => keys.to_vec(),
-        crate::CrcKeysStorage::KeysFutureTest(keys) => keys.to_vec(),
-    };
+    // The pointer is taken from the stored box, after the move into the set.
+    storage_set.insert(key_slice.into());
+    let stored_keys = storage_set.get(key_slice).expect("just inserted");
 
-    let boxed_keys = key_vec.into_boxed_slice();
-    let count = boxed_keys.len() as u32;
-
-    storage_map.insert(key_hash, boxed_keys);
-
-    let ptr = storage_map.get(&key_hash).expect("just inserted").as_ptr();
-
-    (ptr, count)
+    (stored_keys.as_ptr(), stored_keys.len() as u32)
 }
 
 /// A handle to the Digest object
@@ -295,6 +305,13 @@ pub extern "C" fn crc_turbo_error_message(error: CrcTurboError) -> *const c_char
 }
 
 /// Custom CRC parameters
+///
+/// Take these from crc_turbo_get_custom_params() and pass them on unmodified. The library does
+/// not check, on each call, that algorithm, width, poly, refin and keys belong together: keys
+/// must be the ones the library generated for that width, poly and bit order, and algorithm
+/// must be the custom variant it returned (or a built-in whose catalogued parameters these are).
+/// A struct whose fields were changed can abort the process or give results that differ between
+/// CPUs. This is by design, so that checksumming pays for no validation.
 #[repr(C)]
 pub struct CrcTurboParams {
     pub algorithm: CrcTurboAlgorithm,
@@ -683,6 +700,8 @@ pub extern "C" fn crc_turbo_checksum(
 /// Helper method to calculate a CRC checksum directly for data using custom parameters
 /// Returns 0 if parameters are invalid or data is null
 /// Call crc_turbo_get_last_error() to get the specific error code
+/// params must be as crc_turbo_get_custom_params() returned them: their keys are not checked
+/// against width and poly on each call (see CrcTurboParams)
 #[no_mangle]
 pub extern "C" fn crc_turbo_checksum_with_params(
     params: CrcTurboParams,
@@ -824,8 +843,14 @@ pub extern "C" fn crc_turbo_checksum_combine_with_params(
 }
 
 /// Returns the custom CRC parameters for a given set of Rocksoft CRC parameters
-/// If width is not 16, 32 or 64, sets error to UnsupportedWidth and returns parameters without
-/// keys, which every _with_params function rejects
+///
+/// If width is not 16, 32 or 64, sets error to UnsupportedWidth; if poly has a bit set at or
+/// above bit width, sets error to PolyOutsideWidth; if the library already holds the most key
+/// sets it keeps, sets error to KeyStorageFull. In each of those cases the parameters are
+/// returned without keys, which every _with_params function rejects.
+///
+/// The name is not stored or returned; a name that is not UTF-8 sets InvalidUtf8, and the
+/// parameters are still returned with their keys.
 #[no_mangle]
 pub extern "C" fn crc_turbo_get_custom_params(
     name_ptr: *const c_char,
@@ -836,49 +861,39 @@ pub extern "C" fn crc_turbo_get_custom_params(
     xorout: u64,
     check: u64,
 ) -> CrcTurboParams {
-    // An unsupported width would panic inside CrcParams::new; hand back parameters with no keys
-    // instead, which every _with_params function rejects with NullPointer.
-    if !matches!(width, 16 | 32 | 64) {
-        set_last_error(CrcTurboError::UnsupportedWidth);
-        return CrcTurboParams {
-            algorithm: CrcTurboAlgorithm::CrcCustom,
-            width,
-            poly,
-            init,
-            refin: reflected,
-            refout: reflected,
-            xorout,
-            check,
-            key_count: 0,
-            keys: std::ptr::null(),
-        };
-    }
-    clear_last_error();
-
-    let name = if name_ptr.is_null() {
-        "custom"
-    } else {
-        unsafe {
-            match CStr::from_ptr(name_ptr).to_str() {
-                Ok(s) => s,
-                Err(_) => {
-                    set_last_error(CrcTurboError::InvalidUtf8);
-                    "custom"
-                }
-            }
-        }
-    };
-
-    // Get the custom params from the library
-    let params = CrcParams::new(
-        get_or_leak_string(name), // ✅ Use cached leak
+    let without_keys = CrcTurboParams {
+        algorithm: CrcTurboAlgorithm::CrcCustom,
         width,
         poly,
         init,
-        reflected,
+        refin: reflected,
+        refout: reflected,
         xorout,
         check,
-    );
+        key_count: 0,
+        keys: std::ptr::null(),
+    };
+
+    // Parameters CrcParams::new would panic on are handed back with no keys instead, which every
+    // _with_params function rejects with NullPointer.
+    let params = match CrcParams::try_new("custom", width, poly, init, reflected, xorout, check) {
+        Ok(params) => params,
+        Err(error) => {
+            set_last_error(match error {
+                crate::CrcError::PolyOutsideWidth { .. } => CrcTurboError::PolyOutsideWidth,
+                crate::CrcError::MismatchedReflection => CrcTurboError::MismatchedReflection,
+                crate::CrcError::UnsupportedWidth(_) | crate::CrcError::MissingParams(_) => {
+                    CrcTurboError::UnsupportedWidth
+                }
+            });
+            return without_keys;
+        }
+    };
+    clear_last_error();
+
+    if !name_ptr.is_null() && unsafe { CStr::from_ptr(name_ptr) }.to_str().is_err() {
+        set_last_error(CrcTurboError::InvalidUtf8);
+    }
 
     // Create stable key pointer for FFI usage
     let (keys_ptr, key_count) = create_stable_key_pointer(&params.keys);
@@ -1012,21 +1027,6 @@ unsafe fn convert_to_string(data: *const u8, len: usize) -> String {
     }
 }
 
-fn get_or_leak_string(s: &str) -> &'static str {
-    let cache = STRING_CACHE.get_or_init(|| Mutex::new(HashSet::new()));
-    let mut cache = cache.lock().unwrap();
-
-    // Check if we already have this string
-    if let Some(&cached) = cache.get(s) {
-        return cached;
-    }
-
-    // Leak it and cache the result
-    let leaked: &'static str = Box::leak(s.to_string().into_boxed_str());
-    cache.insert(leaked);
-    leaked
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1071,5 +1071,88 @@ mod tests {
         let forward = try_params_from_ffi(&params(32, 0x1234_5678, false, false, &keys))
             .expect("valid parameters");
         assert_eq!(forward.init_algorithm, 0x1234_5678);
+    }
+
+    #[test]
+    fn a_polynomial_outside_its_width_returns_no_keys() {
+        let params = crc_turbo_get_custom_params(
+            std::ptr::null(),
+            32,
+            0x1_04c1_1db7,
+            0xffff_ffff,
+            true,
+            0xffff_ffff,
+            0,
+        );
+        assert_eq!(crc_turbo_get_last_error(), CrcTurboError::PolyOutsideWidth);
+        assert!(params.keys.is_null());
+        assert_eq!(params.key_count, 0);
+        let data = b"123456789";
+        assert_eq!(
+            crc_turbo_checksum_with_params(params, data.as_ptr().cast(), data.len()),
+            0
+        );
+        assert_eq!(crc_turbo_get_last_error(), CrcTurboError::NullPointer);
+    }
+
+    #[test]
+    fn a_name_that_is_not_utf8_is_reported_and_not_kept() {
+        let name = c"\xffcustom";
+        let params = crc_turbo_get_custom_params(
+            name.as_ptr(),
+            32,
+            0x04c1_1db7,
+            0xffff_ffff,
+            true,
+            0xffff_ffff,
+            0xcbf4_3926,
+        );
+        assert_eq!(crc_turbo_get_last_error(), CrcTurboError::InvalidUtf8);
+        let data = b"123456789";
+        assert_eq!(
+            crc_turbo_checksum_with_params(params, data.as_ptr().cast(), data.len()),
+            0xcbf4_3926
+        );
+    }
+
+    /// Past its cap the storage refuses a new key set with KeyStorageFull, still returns the
+    /// sets it holds, and never moves them. Uses its own storage, so the process-wide one other
+    /// tests use is left alone.
+    #[test]
+    fn the_key_storage_stops_growing_at_its_cap() {
+        let storage = Mutex::new(HashSet::new());
+        let cap = 4;
+        let key_set = |i: u64| crate::CrcKeysStorage::from_keys_fold_256([i; 23]);
+        let mut pointers = Vec::new();
+        for i in 0..cap as u64 {
+            let (ptr, count) = stable_key_pointer_in(&storage, &key_set(i), cap);
+            assert!(!ptr.is_null());
+            assert_eq!(count, 23);
+            pointers.push(ptr);
+        }
+        clear_last_error();
+        let (ptr, count) = stable_key_pointer_in(&storage, &key_set(99), cap);
+        assert!(ptr.is_null());
+        assert_eq!(count, 0);
+        assert_eq!(crc_turbo_get_last_error(), CrcTurboError::KeyStorageFull);
+        assert_eq!(storage.lock().unwrap().len(), cap);
+        for (i, &expected) in pointers.iter().enumerate() {
+            let (ptr, _) = stable_key_pointer_in(&storage, &key_set(i as u64), cap);
+            assert_eq!(ptr, expected);
+            assert_eq!(unsafe { *ptr.add(22) }, i as u64);
+        }
+    }
+
+    /// A path that opens but cannot be read (a directory, on Unix) reports IoError rather than
+    /// a checksum of what was read before the failure.
+    #[test]
+    #[cfg_attr(miri, ignore)] // Miri's isolation forbids opening files
+    fn a_read_failure_is_an_io_error() {
+        let dir = env!("CARGO_MANIFEST_DIR");
+        assert_eq!(
+            crc_turbo_checksum_file(CrcTurboAlgorithm::Crc32IsoHdlc, dir.as_ptr(), dir.len()),
+            0
+        );
+        assert_eq!(crc_turbo_get_last_error(), CrcTurboError::IoError);
     }
 }

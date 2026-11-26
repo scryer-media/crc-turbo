@@ -76,9 +76,13 @@ somewhere other than HEAD. It then runs the tests in release mode
 with `--publish`, which needs them here) and a
 `cargo publish --dry-run`, creates the signed tag `v<version>` and pushes it.
 
-The workflow then verifies the tag against the manifest, tests, publishes to
-crates.io and creates the GitHub release with the changelog section as its
-notes.
+The workflow then verifies the tag against the manifest, refuses a tagged
+commit that is not on `origin/main` or whose `ci-complete` is not green, tests,
+publishes to crates.io and creates the GitHub release with the changelog
+section as its notes. Wait for `ci` to go green on the commit before pushing
+the tag. With `--publish` the crate is already on crates.io by then, so a
+refused run leaves only the GitHub release to create, by rerunning the
+workflow once the commit's `ci-complete` is green.
 
 Upstream's tags (`1.0.0` … `1.10.0`, no `v`) are crc-fast's releases and
 stay in the history as they are; this crate's tags are `v1.11.0` onwards.

@@ -260,6 +260,8 @@ jobs:
         run: cross run --locked --features cli --bin arch-check --target ${{ matrix.target }}
       - name: Test
         run: cross test --locked --all-features --target ${{ matrix.target }} --no-fail-fast
+      - name: Test custom parameters without alloc
+        run: cross test --locked --no-default-features --target ${{ matrix.target }} --test no_alloc_tests
 
   # Miri interprets the suite and checks every load, pointer and reference
   # against the allocation it came from. It runs no inline assembly, so each
@@ -469,6 +471,8 @@ jobs:
             cargo test --locked --target "$TARGET" --no-fail-fast \
               --features cache,generated-tables,digest-0-11
           fi
+      - name: Test custom parameters without alloc
+        run: cargo test --locked --target "$TARGET" --no-default-features --test no_alloc_tests
 
   # A short run of every target on both architectures with accelerated tiers.
   # A crash fails the lane; the input is kept as an artifact.

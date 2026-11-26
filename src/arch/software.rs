@@ -77,7 +77,16 @@ const fn crc64_single(poly: u64, reflect: bool, mut value: u64) -> u64 {
 ///
 /// This function creates a table compatible with the `crc` crate's `Table<16>` format,
 /// enabling processing of 16 bytes at a time for improved performance.
+///
+/// # Panics
+///
+/// If `width` is 0 or greater than 16, in every build profile, and at compile time when
+/// evaluated in a constant.
 pub const fn generate_table_u16(width: u8, poly: u16, reflect: bool) -> [[u16; 256]; 16] {
+    assert!(
+        width >= 1 && width <= 16,
+        "generate_table_u16: width must be between 1 and 16"
+    );
     let mut table = [[0u16; 256]; 16];
     fill_table_u16(&mut table, width, poly, reflect);
     table
@@ -132,7 +141,16 @@ fn boxed_table_u16(width: u8, poly: u16, reflect: bool) -> alloc::boxed::Box<[[u
 ///
 /// This function creates a table compatible with the `crc` crate's `Table<16>` format,
 /// enabling processing of 16 bytes at a time for improved performance.
+///
+/// # Panics
+///
+/// If `width` is 0 or greater than 32, in every build profile, and at compile time when
+/// evaluated in a constant.
 pub const fn generate_table_u32(width: u8, poly: u32, reflect: bool) -> [[u32; 256]; 16] {
+    assert!(
+        width >= 1 && width <= 32,
+        "generate_table_u32: width must be between 1 and 32"
+    );
     let mut table = [[0u32; 256]; 16];
     fill_table_u32(&mut table, width, poly, reflect);
     table
@@ -187,7 +205,16 @@ fn boxed_table_u32(width: u8, poly: u32, reflect: bool) -> alloc::boxed::Box<[[u
 ///
 /// This function creates a table compatible with the `crc` crate's `Table<16>` format,
 /// enabling processing of 16 bytes at a time for improved performance.
+///
+/// # Panics
+///
+/// If `width` is 0 or greater than 64, in every build profile, and at compile time when
+/// evaluated in a constant.
 pub const fn generate_table_u64(width: u8, poly: u64, reflect: bool) -> [[u64; 256]; 16] {
+    assert!(
+        width >= 1 && width <= 64,
+        "generate_table_u64: width must be between 1 and 64"
+    );
     let mut table = [[0u64; 256]; 16];
     fill_table_u64(&mut table, width, poly, reflect);
     table
@@ -256,16 +283,26 @@ use hashbrown::HashMap;
 #[cfg(all(not(feature = "std"), feature = "cache"))]
 use spin::{Mutex, Once};
 
-// Cache key types for custom algorithms
+// Cache keys: the fields that determine a table, which are the polynomial and the bit order
+// (each cache holds one width). `init`, `xorout` and `check` do not change the table and are not
+// part of the key.
 #[cfg(feature = "alloc")]
 #[cfg(any(feature = "std", feature = "cache"))]
-type Crc16Key = (u16, u16, bool, bool, u16, u16);
+type Crc16Key = (u16, bool);
 #[cfg(feature = "alloc")]
 #[cfg(any(feature = "std", feature = "cache"))]
-type Crc32Key = (u32, u32, bool, bool, u32, u32);
+type Crc32Key = (u32, bool);
 #[cfg(feature = "alloc")]
 #[cfg(any(feature = "std", feature = "cache"))]
-type Crc64Key = (u64, u64, bool, bool, u64, u64);
+type Crc64Key = (u64, bool);
+
+/// The most custom tables each width's cache holds: 64, which is at most 512 KiB of CRC-16,
+/// 1 MiB of CRC-32 or 2 MiB of CRC-64 tables. Parameters beyond that get a table built for the
+/// call and freed when it returns, so a program that varies its parameters without end does not
+/// grow the cache without bound.
+#[cfg(feature = "alloc")]
+#[cfg(any(feature = "std", feature = "cache"))]
+pub(crate) const MAX_CACHED_CUSTOM_TABLES: usize = 64;
 
 // Cache value types for custom algorithms - stores the generated table
 #[cfg(feature = "alloc")]
@@ -503,6 +540,73 @@ pub(crate) fn update_sparse(
     update(0, &tail[..len], params)
 }
 
+/// The number of tables each width's custom-table cache holds, CRC-16, CRC-32 and CRC-64.
+#[cfg(all(test, feature = "std"))]
+pub(crate) fn cached_custom_tables() -> [usize; 3] {
+    fn len<K, V>(cache: &OnceLock<Mutex<HashMap<K, V>>>) -> usize {
+        cache
+            .get()
+            .map_or(0, |cache| cache.lock().map_or(0, |cache| cache.len()))
+    }
+    [
+        len(&CUSTOM_CRC16_CACHE),
+        len(&CUSTOM_CRC32_CACHE),
+        len(&CUSTOM_CRC64_CACHE),
+    ]
+}
+
+/// A CRC update through a 16-entry table built for the call, for custom parameters where no
+/// heap is available: 32, 64 or 128 bytes of stack and two lookups per byte. The state is held
+/// as the 256-entry table path holds it, so results match that path.
+macro_rules! nibble_update {
+    ($name:ident, $t:ty, $bits:literal) => {
+        #[cfg(any(test, not(feature = "alloc")))]
+        fn $name(mut crc: $t, poly: $t, reflect: bool, data: &[u8]) -> $t {
+            let mut table = [0 as $t; 16];
+            if reflect {
+                let poly = poly.reverse_bits();
+                let mut i = 0;
+                while i < 16 {
+                    let mut value = i as $t;
+                    let mut bit = 0;
+                    while bit < 4 {
+                        value = (value >> 1) ^ ((value & 1) * poly);
+                        bit += 1;
+                    }
+                    table[i] = value;
+                    i += 1;
+                }
+                for &byte in data {
+                    crc ^= byte as $t;
+                    crc = (crc >> 4) ^ table[(crc & 0xf) as usize];
+                    crc = (crc >> 4) ^ table[(crc & 0xf) as usize];
+                }
+            } else {
+                let mut i = 0;
+                while i < 16 {
+                    let mut value = (i as $t) << ($bits - 4);
+                    let mut bit = 0;
+                    while bit < 4 {
+                        value = (value << 1) ^ (((value >> ($bits - 1)) & 1) * poly);
+                        bit += 1;
+                    }
+                    table[i] = value;
+                    i += 1;
+                }
+                for &byte in data {
+                    crc ^= (byte as $t) << ($bits - 8);
+                    crc = (crc << 4) ^ table[(crc >> ($bits - 4)) as usize];
+                    crc = (crc << 4) ^ table[(crc >> ($bits - 4)) as usize];
+                }
+            }
+            crc
+        }
+    };
+}
+nibble_update!(nibble_update_u16, u16, 16);
+nibble_update!(nibble_update_u32, u32, 32);
+nibble_update!(nibble_update_u64, u64, 64);
+
 // ============================================================================
 // CRC-16 dispatch
 // ============================================================================
@@ -564,40 +668,28 @@ fn builtin_table_u16(algorithm: CrcAlgorithm) -> Option<(&'static [[u16; 256]; 1
 
 #[cfg(feature = "alloc")]
 fn update_crc16_custom(state: u16, data: &[u8], params: &CrcParams) -> u16 {
-    #[cfg(any(feature = "std", feature = "cache"))]
-    use alloc::boxed::Box;
-
     let refin = params.refin;
 
     #[cfg(any(feature = "std", feature = "cache"))]
     let table: &'static [[u16; 256]; 16] = {
-        let key: Crc16Key = (
-            params.poly as u16,
-            params.init as u16,
-            params.refin,
-            params.refout,
-            params.xorout as u16,
-            params.check as u16,
-        );
+        let key: Crc16Key = (params.poly as u16, params.refin);
 
         #[cfg(feature = "std")]
-        {
-            let cache = CUSTOM_CRC16_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-            let mut cache_guard = cache.lock().unwrap();
-
-            cache_guard.entry(key).or_insert_with(|| {
-                Box::leak(boxed_table_u16(params.width, params.poly as u16, refin))
-            })
-        }
-
+        let cache_guard = CUSTOM_CRC16_CACHE
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap();
         #[cfg(all(not(feature = "std"), feature = "cache"))]
-        {
-            let cache = CUSTOM_CRC16_CACHE.call_once(|| Mutex::new(HashMap::new()));
-            let mut cache_guard = cache.lock();
+        let cache_guard = CUSTOM_CRC16_CACHE
+            .call_once(|| Mutex::new(HashMap::new()))
+            .lock();
 
-            cache_guard.entry(key).or_insert_with(|| {
-                Box::leak(boxed_table_u16(params.width, params.poly as u16, refin))
-            })
+        match cache_guard.get(&key) {
+            Some(&table) => table,
+            None => {
+                drop(cache_guard);
+                return update_crc16_custom_miss(state, data, params);
+            }
         }
     };
 
@@ -616,9 +708,49 @@ fn update_crc16_custom(state: u16, data: &[u8], params: &CrcParams) -> u16 {
     )
 }
 
+/// A custom table that is not cached yet: built and cached while the cache has room, and past
+/// its cap built for the call and freed when it returns. Out of line, so the cached path holds
+/// only the lookup.
+#[cfg(feature = "alloc")]
+#[cfg(any(feature = "std", feature = "cache"))]
+#[cold]
+#[inline(never)]
+fn update_crc16_custom_miss(state: u16, data: &[u8], params: &CrcParams) -> u16 {
+    use alloc::boxed::Box;
+
+    let refin = params.refin;
+    let key: Crc16Key = (params.poly as u16, refin);
+    let kernel = runtime_kernel(16, params, refin, data.len());
+
+    #[cfg(feature = "std")]
+    let mut cache_guard = CUSTOM_CRC16_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap();
+    #[cfg(all(not(feature = "std"), feature = "cache"))]
+    let mut cache_guard = CUSTOM_CRC16_CACHE
+        .call_once(|| Mutex::new(HashMap::new()))
+        .lock();
+
+    if !cache_guard.contains_key(&key) && cache_guard.len() >= MAX_CACHED_CUSTOM_TABLES {
+        drop(cache_guard);
+        let owned = boxed_table_u16(params.width, params.poly as u16, refin);
+        return table_update_u16(state, &owned, refin, data, kernel);
+    }
+    let table: &'static [[u16; 256]; 16] = cache_guard
+        .entry(key)
+        .or_insert_with(|| Box::leak(boxed_table_u16(params.width, params.poly as u16, refin)));
+    drop(cache_guard);
+    table_update_u16(state, table, refin, data, kernel)
+}
+
+/// Custom parameters without the `alloc` feature: a 16-entry table built on the stack for the
+/// call, two lookups per byte. Out of line, as the panic it replaces was, so the built-in path
+/// through `update` is unchanged.
 #[cfg(not(feature = "alloc"))]
-fn update_crc16_custom(_state: u16, _data: &[u8], _params: &CrcParams) -> u16 {
-    panic!("Custom CRC parameters require the 'alloc' feature")
+#[inline(never)]
+fn update_crc16_custom(state: u16, data: &[u8], params: &CrcParams) -> u16 {
+    nibble_update_u16(state, params.poly as u16, params.refin, data)
 }
 
 // ============================================================================
@@ -664,40 +796,28 @@ fn builtin_table_u32(algorithm: CrcAlgorithm) -> Option<(&'static [[u32; 256]; 1
 
 #[cfg(feature = "alloc")]
 fn update_crc32_custom(state: u32, data: &[u8], params: &CrcParams) -> u32 {
-    #[cfg(any(feature = "std", feature = "cache"))]
-    use alloc::boxed::Box;
-
     let refin = params.refin;
 
     #[cfg(any(feature = "std", feature = "cache"))]
     let table: &'static [[u32; 256]; 16] = {
-        let key: Crc32Key = (
-            params.poly as u32,
-            params.init as u32,
-            params.refin,
-            params.refout,
-            params.xorout as u32,
-            params.check as u32,
-        );
+        let key: Crc32Key = (params.poly as u32, params.refin);
 
         #[cfg(feature = "std")]
-        {
-            let cache = CUSTOM_CRC32_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-            let mut cache_guard = cache.lock().unwrap();
-
-            cache_guard.entry(key).or_insert_with(|| {
-                Box::leak(boxed_table_u32(params.width, params.poly as u32, refin))
-            })
-        }
-
+        let cache_guard = CUSTOM_CRC32_CACHE
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap();
         #[cfg(all(not(feature = "std"), feature = "cache"))]
-        {
-            let cache = CUSTOM_CRC32_CACHE.call_once(|| Mutex::new(HashMap::new()));
-            let mut cache_guard = cache.lock();
+        let cache_guard = CUSTOM_CRC32_CACHE
+            .call_once(|| Mutex::new(HashMap::new()))
+            .lock();
 
-            cache_guard.entry(key).or_insert_with(|| {
-                Box::leak(boxed_table_u32(params.width, params.poly as u32, refin))
-            })
+        match cache_guard.get(&key) {
+            Some(&table) => table,
+            None => {
+                drop(cache_guard);
+                return update_crc32_custom_miss(state, data, params);
+            }
         }
     };
 
@@ -716,9 +836,49 @@ fn update_crc32_custom(state: u32, data: &[u8], params: &CrcParams) -> u32 {
     )
 }
 
+/// A custom table that is not cached yet: built and cached while the cache has room, and past
+/// its cap built for the call and freed when it returns. Out of line, so the cached path holds
+/// only the lookup.
+#[cfg(feature = "alloc")]
+#[cfg(any(feature = "std", feature = "cache"))]
+#[cold]
+#[inline(never)]
+fn update_crc32_custom_miss(state: u32, data: &[u8], params: &CrcParams) -> u32 {
+    use alloc::boxed::Box;
+
+    let refin = params.refin;
+    let key: Crc32Key = (params.poly as u32, refin);
+    let kernel = runtime_kernel(32, params, refin, data.len());
+
+    #[cfg(feature = "std")]
+    let mut cache_guard = CUSTOM_CRC32_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap();
+    #[cfg(all(not(feature = "std"), feature = "cache"))]
+    let mut cache_guard = CUSTOM_CRC32_CACHE
+        .call_once(|| Mutex::new(HashMap::new()))
+        .lock();
+
+    if !cache_guard.contains_key(&key) && cache_guard.len() >= MAX_CACHED_CUSTOM_TABLES {
+        drop(cache_guard);
+        let owned = boxed_table_u32(params.width, params.poly as u32, refin);
+        return table_update_u32(state, &owned, refin, data, kernel);
+    }
+    let table: &'static [[u32; 256]; 16] = cache_guard
+        .entry(key)
+        .or_insert_with(|| Box::leak(boxed_table_u32(params.width, params.poly as u32, refin)));
+    drop(cache_guard);
+    table_update_u32(state, table, refin, data, kernel)
+}
+
+/// Custom parameters without the `alloc` feature: a 16-entry table built on the stack for the
+/// call, two lookups per byte. Out of line, as the panic it replaces was, so the built-in path
+/// through `update` is unchanged.
 #[cfg(not(feature = "alloc"))]
-fn update_crc32_custom(_state: u32, _data: &[u8], _params: &CrcParams) -> u32 {
-    panic!("Custom CRC parameters require the 'alloc' feature")
+#[inline(never)]
+fn update_crc32_custom(state: u32, data: &[u8], params: &CrcParams) -> u32 {
+    nibble_update_u32(state, params.poly as u32, params.refin, data)
 }
 
 // ============================================================================
@@ -759,40 +919,28 @@ fn builtin_table_u64(algorithm: CrcAlgorithm) -> Option<(&'static [[u64; 256]; 1
 
 #[cfg(feature = "alloc")]
 fn update_crc64_custom(state: u64, data: &[u8], params: &CrcParams) -> u64 {
-    #[cfg(any(feature = "std", feature = "cache"))]
-    use alloc::boxed::Box;
-
     let refin = params.refin;
 
     #[cfg(any(feature = "std", feature = "cache"))]
     let table: &'static [[u64; 256]; 16] = {
-        let key: Crc64Key = (
-            params.poly,
-            params.init,
-            params.refin,
-            params.refout,
-            params.xorout,
-            params.check,
-        );
+        let key: Crc64Key = (params.poly, params.refin);
 
         #[cfg(feature = "std")]
-        {
-            let cache = CUSTOM_CRC64_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-            let mut cache_guard = cache.lock().unwrap();
-
-            cache_guard
-                .entry(key)
-                .or_insert_with(|| Box::leak(boxed_table_u64(params.width, params.poly, refin)))
-        }
-
+        let cache_guard = CUSTOM_CRC64_CACHE
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap();
         #[cfg(all(not(feature = "std"), feature = "cache"))]
-        {
-            let cache = CUSTOM_CRC64_CACHE.call_once(|| Mutex::new(HashMap::new()));
-            let mut cache_guard = cache.lock();
+        let cache_guard = CUSTOM_CRC64_CACHE
+            .call_once(|| Mutex::new(HashMap::new()))
+            .lock();
 
-            cache_guard
-                .entry(key)
-                .or_insert_with(|| Box::leak(boxed_table_u64(params.width, params.poly, refin)))
+        match cache_guard.get(&key) {
+            Some(&table) => table,
+            None => {
+                drop(cache_guard);
+                return update_crc64_custom_miss(state, data, params);
+            }
         }
     };
 
@@ -811,9 +959,49 @@ fn update_crc64_custom(state: u64, data: &[u8], params: &CrcParams) -> u64 {
     )
 }
 
+/// A custom table that is not cached yet: built and cached while the cache has room, and past
+/// its cap built for the call and freed when it returns. Out of line, so the cached path holds
+/// only the lookup.
+#[cfg(feature = "alloc")]
+#[cfg(any(feature = "std", feature = "cache"))]
+#[cold]
+#[inline(never)]
+fn update_crc64_custom_miss(state: u64, data: &[u8], params: &CrcParams) -> u64 {
+    use alloc::boxed::Box;
+
+    let refin = params.refin;
+    let key: Crc64Key = (params.poly, refin);
+    let kernel = runtime_kernel(64, params, refin, data.len());
+
+    #[cfg(feature = "std")]
+    let mut cache_guard = CUSTOM_CRC64_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap();
+    #[cfg(all(not(feature = "std"), feature = "cache"))]
+    let mut cache_guard = CUSTOM_CRC64_CACHE
+        .call_once(|| Mutex::new(HashMap::new()))
+        .lock();
+
+    if !cache_guard.contains_key(&key) && cache_guard.len() >= MAX_CACHED_CUSTOM_TABLES {
+        drop(cache_guard);
+        let owned = boxed_table_u64(params.width, params.poly, refin);
+        return table_update_u64(state, &owned, refin, data, kernel);
+    }
+    let table: &'static [[u64; 256]; 16] = cache_guard
+        .entry(key)
+        .or_insert_with(|| Box::leak(boxed_table_u64(params.width, params.poly, refin)));
+    drop(cache_guard);
+    table_update_u64(state, table, refin, data, kernel)
+}
+
+/// Custom parameters without the `alloc` feature: a 16-entry table built on the stack for the
+/// call, two lookups per byte. Out of line, as the panic it replaces was, so the built-in path
+/// through `update` is unchanged.
 #[cfg(not(feature = "alloc"))]
-fn update_crc64_custom(_state: u64, _data: &[u8], _params: &CrcParams) -> u64 {
-    panic!("Custom CRC parameters require the 'alloc' feature")
+#[inline(never)]
+fn update_crc64_custom(state: u64, data: &[u8], params: &CrcParams) -> u64 {
+    nibble_update_u64(state, params.poly, params.refin, data)
 }
 
 /// The built-in algorithms' tables, generated on first use rather than stored, under the
@@ -1264,6 +1452,127 @@ mod table_tests {
         assert!(builtin_table_u16(CrcAlgorithm::CrcCustom).is_none());
         assert!(builtin_table_u32(CrcAlgorithm::CrcCustom).is_none());
         assert!(builtin_table_u64(CrcAlgorithm::CrcCustom).is_none());
+    }
+
+    /// The table path's result for custom parameters, through a table built from scratch.
+    fn table_reference(state: u64, data: &[u8], params: &CrcParams) -> u64 {
+        match params.width {
+            16 => native_update_u16(
+                state as u16,
+                &boxed_table_u16(16, params.poly as u16, params.refin),
+                params.refin,
+                data,
+            ) as u64,
+            32 => native_update_u32(
+                state as u32,
+                &boxed_table_u32(32, params.poly as u32, params.refin),
+                params.refin,
+                data,
+            ) as u64,
+            _ => native_update_u64(
+                state,
+                &boxed_table_u64(64, params.poly, params.refin),
+                params.refin,
+                data,
+            ),
+        }
+    }
+
+    /// The allocation-free path for custom parameters, which a build without `alloc` uses,
+    /// computes what the table path does: every catalogued algorithm's parameters, both bit
+    /// orders, from the initial state and from a carried one.
+    #[test]
+    fn the_allocation_free_custom_path_matches_the_table_path() {
+        use rand::{rng, RngExt};
+        let mut data = [0u8; 300];
+        rng().fill(&mut data[..]);
+        let lengths: &[usize] = if cfg!(miri) {
+            &[0, 1, 17]
+        } else {
+            &[0, 1, 7, 8, 15, 16, 17, 64, 255, 300]
+        };
+        for config in TEST_ALL_CONFIGS {
+            let params = config.get_params();
+            for &len in lengths {
+                for state in [
+                    params.init_algorithm,
+                    0x0123_4567_89ab_cdef & (u64::MAX >> (64 - params.width)),
+                ] {
+                    let nibble = match params.width {
+                        16 => nibble_update_u16(
+                            state as u16,
+                            params.poly as u16,
+                            params.refin,
+                            &data[..len],
+                        ) as u64,
+                        32 => nibble_update_u32(
+                            state as u32,
+                            params.poly as u32,
+                            params.refin,
+                            &data[..len],
+                        ) as u64,
+                        _ => nibble_update_u64(state, params.poly, params.refin, &data[..len]),
+                    };
+                    assert_eq!(
+                        nibble,
+                        table_reference(state, &data[..len], params),
+                        "{:?} at {len} bytes",
+                        params.algorithm
+                    );
+                }
+            }
+        }
+    }
+
+    /// `init`, `xorout` and `check` do not change a table, so varying them reuses the one cached
+    /// for the polynomial and bit order. Other tests fill the cache concurrently, so a missing
+    /// entry is accepted only when the cache is full.
+    #[test]
+    #[cfg(feature = "std")]
+    fn the_custom_table_cache_ignores_init_xorout_and_check() {
+        // A polynomial no other test uses.
+        let poly = 0x3d65_u64 ^ 0x4000;
+        for i in 0..32u64 {
+            let params = CrcParams::new("custom", 16, poly, i, false, i << 3, i << 7);
+            let data = b"123456789";
+            assert_eq!(
+                update(params.init_algorithm, data, &params),
+                table_reference(params.init_algorithm, data, &params)
+            );
+        }
+        let entries = CUSTOM_CRC16_CACHE
+            .get()
+            .expect("the CRC-16 cache was used")
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|(cached, _)| *cached as u64 == poly)
+            .count();
+        assert!(
+            entries == 1 || cached_custom_tables()[0] >= MAX_CACHED_CUSTOM_TABLES,
+            "{entries} tables cached for one polynomial"
+        );
+    }
+
+    /// Past its cap the custom-table cache stops growing and the tables built for each call
+    /// still give the table path's results. Other tests may use the cache at the same time, so
+    /// only the bound is asserted.
+    #[test]
+    #[cfg(feature = "std")]
+    fn the_custom_table_cache_stops_growing_at_its_cap() {
+        let data = b"123456789abcdefghij";
+        let count = MAX_CACHED_CUSTOM_TABLES + if cfg!(miri) { 2 } else { 16 };
+        for i in 0..count as u64 {
+            // Distinct odd 32-bit polynomials no other test uses.
+            let poly = 0x5a00_0001 | (i << 1);
+            let params = CrcParams::new("custom", 32, poly, 0xffff_ffff, true, 0, 0);
+            assert_eq!(
+                update(params.init_algorithm, data, &params),
+                table_reference(params.init_algorithm, data, &params),
+                "polynomial {poly:#x}"
+            );
+            assert!(cached_custom_tables()[1] <= MAX_CACHED_CUSTOM_TABLES);
+        }
     }
 }
 

@@ -13,7 +13,7 @@ is upstream's. The public Rust API is upstream's, so migrating is the
 dependency line plus `crc_fast::` → `crc_turbo::`:
 
 ```toml
-crc-turbo = "1.11"
+crc-turbo = "1.12"
 ```
 
 What differs is recorded in the `## Fork` section of the
@@ -100,7 +100,7 @@ The library supports various feature flags for different environments:
 * `panic-handler` - provides a panic handler in a `no_std` build; an embedded application leaves it off and brings its own
 
 ### Optional Features
-* `alloc` - Heap allocation support (enables `Digest` trait, custom CRC params, checksum combining)
+* `alloc` - Heap allocation support (enables `Digest` trait, checksum combining)
 * `cache` - Caches generated constants for custom CRC parameters (requires `alloc`)
 * `generated-tables` - Builds each built-in algorithm's 16-slice lookup table on first use instead of storing all fifty in the binary (requires `alloc`); see [Binary size](#binary-size)
 * `digest-0-11` - Implements digest 0.11's `DynDigest` for `Digest`, alongside digest 0.10's (requires `alloc`)
@@ -134,7 +134,7 @@ For embedded targets without standard library:
 # Minimal no_std (core CRC only, no heap)
 cargo build --target thumbv7em-none-eabihf --no-default-features --lib
 
-# With heap allocation (enables Digest, custom params)
+# With heap allocation (enables Digest)
 cargo build --target thumbv7em-none-eabihf --no-default-features --features alloc --lib
 
 # With caching (requires alloc)
@@ -166,7 +166,7 @@ under Node. The tests that spawn threads are skipped there.
 
 ## Usage
 
-Add `crc-turbo = "1.11"` to your `Cargo.toml` dependencies, which will enable every available optimization for
+Add `crc-turbo = "1.12"` to your `Cargo.toml` dependencies, which will enable every available optimization for
 the `stable` toolchain.
 
 ### Fast helper functions

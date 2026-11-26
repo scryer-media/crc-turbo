@@ -8,7 +8,8 @@ name: release
 #   trusted publishing and creates the tag v<version> and the GitHub release.
 #   dry_run (the default) stops after the checks.
 # - Push a signed tag v<version> on main, as `cargo xtask release` does. The
-#   run tests the tag itself, then publishes the same way.
+#   run refuses unless the tagged commit is on main and already passed ci.yml,
+#   tests the tag itself, then publishes the same way.
 #
 # crates.io's trusted publisher is registered to this file's name and the
 # crates-io environment, so both ways have to stay in this one workflow.
@@ -51,6 +52,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # The whole history, so a tagged commit can be checked against main.
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -102,11 +105,20 @@ jobs:
             exit 1
           fi
           echo "tag v$VERSION: ${tagged:-not yet created}"
-      # A dispatched release does not rerun the platform matrix; it takes
-      # ci.yml's verdict on this exact commit, which covers every platform,
-      # wasm, the MSRV and the package.
+      # A pushed tag can name any commit; only one that is on main is
+      # released.
+      - name: The tagged commit is on main
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
+            echo "::error::$GITHUB_REF_NAME tags $GITHUB_SHA, which is not on origin/main"
+            exit 1
+          fi
+      # Neither way reruns the platform matrix here; both take ci.yml's verdict
+      # on this exact commit, which covers every platform, wasm, the MSRV and
+      # the package.
       - name: This commit already passed CI
-        if: github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

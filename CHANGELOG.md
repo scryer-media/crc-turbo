@@ -472,6 +472,89 @@ own changelog up to the fork point continues below, unchanged.
 - New `checksum_zeros` and `checksum_zeros_with_params`: the CRC of `len`
   zero bytes in O(log len), without touching memory.
 
+### Errors returned and memory bounded
+
+- `checksum_file` and `checksum_file_with_params` return a read error
+  instead of the checksum of the bytes read before it, retry an interrupted
+  read, reject a `chunk_size` of `Some(0)` with `InvalidInput`, and clamp
+  the read buffer to 64 MiB.
+- `CrcParams::try_new` rejects a polynomial with bits at or above its width
+  (`CrcError::PolyOutsideWidth`); `CrcParams::new` panics on it, and
+  `crc_turbo_get_custom_params` returns keyless parameters with the
+  `PolyOutsideWidth` C error.
+- The process-wide caches of custom parameters are bounded: folding keys,
+  software tables (keyed by polynomial and bit order alone) and the key sets
+  the C library hands out. The C library no longer keeps a copy of each
+  name passed to `crc_turbo_get_custom_params`.
+- Custom parameters work in a build without `alloc`, where crc-fast
+  panicked.
+- `Digest::combine` wraps the byte count instead of overflowing, and the
+  public table generators assert their width.
+
+## 1.12.0 - 2026-11-25
+
+Custom parameters, file checksums and the C library return errors where
+they panicked or returned a wrong value, and the caches that grow with
+distinct custom parameters are bounded. The kernels and tier dispatch are
+unchanged.
+
+### Behaviour changes
+
+- `checksum_file` and `checksum_file_with_params` return the error of a
+  failed read. They returned `Ok` with the checksum of the bytes read before
+  it. A read that fails with `ErrorKind::Interrupted` is retried. The C
+  functions `crc_turbo_checksum_file` and
+  `crc_turbo_checksum_file_with_params` report such a failure as `IoError`.
+- `chunk_size: Some(0)` is rejected with an `ErrorKind::InvalidInput`
+  error. It read nothing and returned the checksum of empty input. A
+  `chunk_size` above 64 MiB is clamped to 64 MiB, so `Some(usize::MAX)` no
+  longer tries to allocate that much. `None` is still 512 KiB.
+- `CrcParams::try_new` returns the new `CrcError::PolyOutsideWidth { width,
+  poly }` for a polynomial with a bit set at or above bit `width` (for
+  example `0x1_1021` at width 16). Such a value is not a polynomial of that
+  width; the bits above it were dropped without notice. `CrcParams::new`
+  panics on it, with the error's message, as it does for an unsupported
+  width. `CrcError` is `#[non_exhaustive]`, so the variant is
+  an addition.
+- `crc_turbo_get_custom_params` returns parameters without keys, which every
+  `_with_params` function rejects, for such a polynomial, and sets the new
+  `CrcTurboError` value `PolyOutsideWidth` (10).
+- The C library holds at most 1024 distinct key sets for the parameters it
+  returns. Past that, `crc_turbo_get_custom_params` returns parameters
+  without keys and sets the new `CrcTurboError` value `KeyStorageFull`
+  (11). Key sets are identified by their contents, and every pointer already
+  returned stays valid. `libcrc_turbo.h` gains both values and documentation
+  on `CrcTurboParams`.
+
+### Fixes
+
+- `crc_turbo_get_custom_params` no longer keeps a copy of every distinct
+  name passed to it; the name was never returned. A name that is not UTF-8
+  still sets `InvalidUtf8`.
+- The software path's cache of custom tables is keyed by polynomial and bit
+  order only. `init`, `xorout` and `check`, which do not change the table,
+  were part of the key, so each new value of them stored another table of up
+  to 32 KiB.
+- The process-wide caches of custom parameters are bounded: folding keys at
+  1024 parameter sets, and software tables at 64 per width. Parameters past
+  the cap are computed per call and not stored.
+- Custom parameters work in a build without the `alloc` feature, through a
+  16-entry table built on the stack per call. They panicked.
+- `Digest::combine` adds the byte counts with wrapping arithmetic in every
+  build profile. The checksum does not depend on the count.
+- `generate_table_u16`, `generate_table_u32` and `generate_table_u64` assert
+  that `width` is between 1 and the table's bit width, with the same panic
+  in every build profile, and document it.
+- `CrcParams`, `checksum_with_params`, `Digest::new_with_params` and the C
+  `CrcTurboParams` document that parameters must come from the constructors
+  unmodified: their fields are not validated on each call.
+
+### Release
+
+- A release started by a pushed tag is refused unless the tagged commit is
+  on `main` and its `ci-complete` check succeeded, as a dispatched release
+  already was.
+
 ## 1.11.2 - 2026-11-25
 
 Intel's E-core parts (family 6, models 0xaf, 0xb6, 0xdd and 0xbe) on the
