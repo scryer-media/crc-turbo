@@ -1781,7 +1781,7 @@ mod lib {
     #[test]
     #[cfg_attr(miri, ignore)] // Miri's isolation forbids opening files
     fn every_chunk_size_hashes_the_whole_file() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/crc-check.txt");
+        let path = "crc-check.txt";
         for chunk_size in [None, Some(1), Some(2), Some(4096), Some(usize::MAX)] {
             assert_eq!(
                 checksum_file(CrcAlgorithm::Crc32IsoHdlc, path, chunk_size).unwrap(),
@@ -1798,7 +1798,7 @@ mod lib {
     #[test]
     #[cfg_attr(miri, ignore)] // Miri's isolation forbids opening files
     fn a_path_that_cannot_be_read_is_an_error() {
-        let dir = env!("CARGO_MANIFEST_DIR");
+        let dir = ".";
         assert!(checksum_file(CrcAlgorithm::Crc32IsoHdlc, dir, None).is_err());
         let params = CrcParams::new("custom", 32, 0x04c11db7, 0xffffffff, true, 0xffffffff, 0);
         assert!(checksum_file_with_params(params, dir, None).is_err());

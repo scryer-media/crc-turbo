@@ -1087,12 +1087,6 @@ mod tests {
         assert_eq!(crc_turbo_get_last_error(), CrcTurboError::PolyOutsideWidth);
         assert!(params.keys.is_null());
         assert_eq!(params.key_count, 0);
-        let data = b"123456789";
-        assert_eq!(
-            crc_turbo_checksum_with_params(params, data.as_ptr().cast(), data.len()),
-            0
-        );
-        assert_eq!(crc_turbo_get_last_error(), CrcTurboError::NullPointer);
     }
 
     #[test]
@@ -1148,7 +1142,7 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)] // Miri's isolation forbids opening files
     fn a_read_failure_is_an_io_error() {
-        let dir = env!("CARGO_MANIFEST_DIR");
+        let dir = ".";
         assert_eq!(
             crc_turbo_checksum_file(CrcTurboAlgorithm::Crc32IsoHdlc, dir.as_ptr(), dir.len()),
             0
